@@ -1,0 +1,13 @@
+{
+  "name": "endless",
+  "summary": "Continue a completed winning run into Endless mode",
+  "description": "Dismisses Balatro's native win overlay only after the run is won and the overlay is paused.",
+  "params": [],
+  "result": {
+    "name": "gamestate",
+    "description": "Stable unpaused GameState for the continuing Endless run",
+    "schema": {
+      "$ref": "#/components/schemas/GameState"
+    }
+  }
+}

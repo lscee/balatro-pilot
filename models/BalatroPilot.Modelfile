@@ -1,0 +1,8 @@
+FROM qwen3.5:9b-q4_K_M
+
+# 16K covers the compact rule capsule, exact state, local candidates and the
+# persistent run plan without allocating the much larger upstream context.
+PARAMETER num_ctx 16384
+PARAMETER temperature 0.1
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.05

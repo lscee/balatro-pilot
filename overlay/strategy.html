@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN" data-overlay-version="stream-v15" data-game-theme="neutral">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Balatro Pilot · AI 策略讲解</title>
+    <link rel="stylesheet" href="/overlay/styles.css?v=stream-v15">
+  </head>
+  <body class="strategy-body">
+    <main class="strategy-shell" aria-live="polite">
+      <section class="decision-panel">
+        <div class="section-heading">
+          <span class="section-label">当前决策</span>
+          <span id="decision-source" class="source-chip">LOCAL</span>
+        </div>
+        <h2 id="decision-title">正在读取策略…</h2>
+        <p id="decision-explanation" class="decision-explanation">等待下一条结构化决策记录。</p>
+        <div id="action-line" class="action-line">尚未执行动作</div>
+      </section>
+
+      <section class="reason-panel">
+        <span class="section-label">AI 完整思路</span>
+        <p id="strategy-text">等待 AI 读取当前局面并解释决策依据。</p>
+      </section>
+
+      <section class="observation-panel">
+        <span class="section-label">本局构筑计划</span>
+        <dl id="run-plan-list" class="run-plan-list">
+          <div class="run-plan-row">
+            <dt>构筑状态</dt>
+            <dd>等待 AI 根据本局商品、持有物与手牌建立构筑计划。</dd>
+          </div>
+        </dl>
+      </section>
+    </main>
+    <script type="module" src="/overlay/strategy.js?v=stream-v15"></script>
+  </body>
+</html>

@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Balatro Pilot · 战绩观测站</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="noise" aria-hidden="true"></div>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">BALATRO PILOT / TELEMETRY</p>
+        <h1>战绩观测站</h1>
+        <p class="subtitle">从每一次出牌、弃牌与构筑选择中，观察智能体是否真的在进步。</p>
+      </div>
+      <div class="status-stack">
+        <div id="live-badge" class="live-badge"><span></span>正在连接</div>
+        <button id="refresh-button" class="refresh-button" type="button">立即刷新</button>
+        <p id="updated-at" class="updated-at">尚未读取</p>
+      </div>
+    </header>
+
+    <main>
+      <section id="live-strip" class="live-strip">
+        <div>
+          <span class="section-kicker">当前游戏</span>
+          <strong id="live-state">等待状态</strong>
+        </div>
+        <div class="live-facts">
+          <span>底注 <b id="live-ante">—</b></span>
+          <span>回合 <b id="live-round">—</b></span>
+          <span>分数 <b id="live-score">—</b></span>
+          <span>目标 <b id="live-target">—</b></span>
+          <span>资金 <b id="live-money">—</b></span>
+        </div>
+      </section>
+
+      <section class="panel health-panel" aria-label="项目组件健康检查">
+        <div class="health-heading">
+          <div>
+            <span class="section-kicker">SYSTEM HEALTH</span>
+            <h2>项目组件</h2>
+          </div>
+          <span id="component-summary" class="health-summary checking">正在检查…</span>
+        </div>
+        <div id="component-health" class="health-grid" aria-live="polite">
+          <div class="health-placeholder">正在读取游戏、模型和数据服务状态…</div>
+        </div>
+        <p id="component-note" class="health-note">健康检查不会调用 Kimi 或 DeepSeek。</p>
+      </section>
+
+      <section class="backend-switch" aria-label="高频推理后端">
+        <div class="backend-copy">
+          <span class="section-kicker">ROUTINE INFERENCE</span>
+          <strong>高频决策后端</strong>
+          <p id="backend-detail">正在读取本地模型状态…</p>
+        </div>
+        <div class="backend-actions" role="group" aria-label="切换高频模型">
+          <button id="backend-local" class="backend-button" type="button">
+            <span>本地模式</span><small>直播省 API · 占用约 7GB 显存</small>
+          </button>
+          <button id="backend-deepseek" class="backend-button" type="button">
+            <span>DeepSeek 模式</span><small>释放本地模型显存 · 方便使用电脑</small>
+          </button>
+        </div>
+        <span id="backend-status" class="backend-status">读取中</span>
+      </section>
+
+      <section class="backend-switch strategic-switch" aria-label="战略推理后端">
+        <div class="backend-copy">
+          <span class="section-kicker">STRATEGIC INFERENCE</span>
+          <strong>战略决策后端</strong>
+          <p id="strategic-detail">正在读取商店构筑与关键盲注模型…</p>
+        </div>
+        <div class="backend-actions" role="group" aria-label="切换战略模型">
+          <button id="strategic-kimi" class="backend-button" type="button">
+            <span>Kimi K3</span><small>更强的长线构筑推理 · 返回速度较慢</small>
+          </button>
+          <button id="strategic-deepseek" class="backend-button" type="button">
+            <span>DeepSeek Flash</span><small>商店与关键盲注响应更快 · 成本按量</small>
+          </button>
+        </div>
+        <span id="strategic-status" class="backend-status">读取中</span>
+      </section>
+
+      <section class="hero-grid" aria-label="核心战绩">
+        <article class="metric-card primary">
+          <span class="metric-label">历史最高单手分</span>
+          <strong id="highest-hand" class="metric-value">—</strong>
+          <span id="highest-hand-meta" class="metric-meta">精确 RPC 计分</span>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">最高盲注累计</span>
+          <strong id="highest-score" class="metric-value">—</strong>
+          <span id="highest-score-meta" class="metric-meta">精确状态记录</span>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">最深进度</span>
+          <strong id="deepest-progress" class="metric-value">—</strong>
+          <span id="deepest-meta" class="metric-meta">最高底注 / 回合</span>
+        </article>
+        <article class="metric-card">
+          <span class="metric-label">完整局胜率</span>
+          <strong id="win-rate" class="metric-value">—</strong>
+          <span id="record-summary" class="metric-meta">—</span>
+        </article>
+      </section>
+
+      <section class="hero-grid high-score-grid" aria-label="高分训练里程碑">
+        <article class="metric-card compact"><span class="metric-label">十万单手</span><strong id="hundred-thousand-games" class="metric-value">—</strong><span id="hundred-thousand-rate" class="metric-meta">—</span></article>
+        <article class="metric-card compact"><span class="metric-label">百万单手</span><strong id="million-games" class="metric-value">—</strong><span id="million-rate" class="metric-meta">—</span></article>
+        <article class="metric-card compact"><span class="metric-label">峰值预计 XMult</span><strong id="peak-xmult" class="metric-value">—</strong><span id="peak-retriggers" class="metric-meta">—</span></article>
+        <article class="metric-card compact"><span class="metric-label">三层引擎成型率</span><strong id="build-ready-rate" class="metric-value">—</strong><span id="build-ready-games" class="metric-meta">—</span></article>
+      </section>
+
+      <section class="panel improvement-panel">
+        <div class="panel-heading">
+          <div>
+            <span class="section-kicker">趋势判断</span>
+            <h2 id="improvement-label">正在计算</h2>
+          </div>
+          <span id="improvement-chip" class="trend-chip neutral">数据积累中</span>
+        </div>
+        <p id="improvement-description" class="panel-copy">比较近期与此前的完整精确游戏。</p>
+        <div class="comparison-grid">
+          <div><span>平均峰值分数</span><strong id="score-change">—</strong></div>
+          <div><span>平均底注变化</span><strong id="ante-change">—</strong></div>
+          <div><span>平均回合变化</span><strong id="round-change">—</strong></div>
+          <div><span>胜率变化</span><strong id="win-change">—</strong></div>
+        </div>
+      </section>
+
+      <section class="chart-grid">
+        <article class="panel chart-panel wide">
+          <div class="panel-heading">
+            <div>
+              <span class="section-kicker">GAME BY GAME</span>
+              <h2>每局最高单手分</h2>
+            </div>
+            <span class="chart-note">虚线为历史纪录 · 对数刻度</span>
+          </div>
+          <canvas id="score-chart" aria-label="每局峰值分数趋势"></canvas>
+        </article>
+        <article class="panel chart-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-kicker">PROGRESSION</span>
+              <h2>底注与回合</h2>
+            </div>
+          </div>
+          <canvas id="progress-chart" aria-label="底注和回合趋势"></canvas>
+        </article>
+        <article class="panel chart-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-kicker">DAILY</span>
+              <h2>每日表现</h2>
+            </div>
+          </div>
+          <canvas id="daily-chart" aria-label="每日平均与最高分"></canvas>
+        </article>
+      </section>
+
+      <section class="details-grid">
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-kicker">GAMEPLAY</span>
+              <h2>游戏行为</h2>
+            </div>
+          </div>
+          <div id="action-bars" class="bar-list"></div>
+          <div class="micro-grid">
+            <div><span>累计过盲</span><strong id="blinds-cleared">—</strong></div>
+            <div><span>峰值资金</span><strong id="peak-money">—</strong></div>
+            <div><span>最多小丑</span><strong id="peak-jokers">—</strong></div>
+            <div><span>平均每局出牌</span><strong id="hands-per-game">—</strong></div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <div>
+              <span class="section-kicker">MODEL</span>
+              <h2>决策效率</h2>
+            </div>
+          </div>
+          <div class="micro-grid model-grid">
+            <div><span>规划中位数</span><strong id="planning-median">—</strong></div>
+            <div><span>规划 P90</span><strong id="planning-p90">—</strong></div>
+            <div><span>缓存命中</span><strong id="cache-rate">—</strong></div>
+            <div><span>API 调用</span><strong id="api-calls">—</strong></div>
+            <div><span>战略 / 快速</span><strong id="strategy-split">—</strong></div>
+            <div><span>回退次数</span><strong id="fallbacks">—</strong></div>
+          </div>
+          <div class="token-line">
+            <span>累计 Token</span>
+            <strong id="total-tokens">—</strong>
+          </div>
+        </article>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-heading">
+          <div>
+            <span class="section-kicker">RECENT GAMES</span>
+            <h2>最近游戏</h2>
+          </div>
+          <span id="coverage-note" class="chart-note">—</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>结果</th>
+                <th>单手 / 盲注</th>
+                <th>底注</th>
+                <th>回合</th>
+                <th>过盲</th>
+                <th>出牌 / 弃牌</th>
+                <th>平均决策</th>
+                <th>Seed</th>
+              </tr>
+            </thead>
+            <tbody id="games-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <footer>
+        <span id="data-health">—</span>
+        <span>仅监听 127.0.0.1 · 不读取或展示 API Key</span>
+      </footer>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

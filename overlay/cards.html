@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN" data-overlay-version="stream-v15" data-game-theme="neutral">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Balatro Pilot · 当前牌组</title>
+    <link rel="stylesheet" href="/overlay/styles.css?v=stream-v15">
+  </head>
+  <body class="cards-body">
+    <main class="cards-shell" aria-live="polite">
+      <header class="overlay-header cards-header">
+        <div class="title-lockup">
+          <span class="eyebrow">CURRENT BUILD</span>
+          <h1>当前牌组</h1>
+        </div>
+        <div class="build-summary">
+          <span class="summary-pill joker-pill">小丑 <b id="joker-count">0 / 5</b></span>
+          <span class="summary-pill tarot-pill">塔罗 / 消耗牌 <b id="consumable-count">0 / 2</b></span>
+          <span id="cards-status" class="connection"><i></i>等待数据</span>
+        </div>
+      </header>
+      <section id="card-grid" class="card-grid" aria-label="当前使用的小丑牌和消耗牌">
+        <div class="empty-build">
+          <strong>正在读取当前牌组</strong>
+          <span>控制器开始记录后会自动显示</span>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/overlay/cards.js?v=stream-v15"></script>
+  </body>
+</html>
