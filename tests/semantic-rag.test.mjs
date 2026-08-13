@@ -359,8 +359,11 @@ test("resumeEpisode recovers an open episode left by a forced managed-process re
   let store;
   try {
     store = new SemanticRagStore(root, config("data/semantic.sqlite"));
-    const before = state({ seed: "forced-restart", ante_num: 6, round_num: 15, money: 8 });
-    const boundary = state({ seed: "forced-restart", ante_num: 6, round_num: 16, money: 8, state: "SHOP" });
+    // Ante 1 remains resumable only for an open episode whose exact boundary
+    // state survived a managed process restart.  The interrupted fixed-seed
+    // replay case above remains deliberately rejected.
+    const before = state({ seed: "forced-restart", ante_num: 1, round_num: 1, money: 8 });
+    const boundary = state({ seed: "forced-restart", ante_num: 1, round_num: 2, money: 8, state: "SHOP" });
     store.beginEpisode({ episodeId: "old-open", runId: "old-managed-run", state: before });
     store.recordTransition({
       runId: "old-managed-run", episodeId: "old-open", step: 1, state: before,

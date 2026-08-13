@@ -779,15 +779,19 @@ export class SemanticRagStore {
       for (const candidate of candidates) {
         const latest = semanticNormalizeFeatures(parseJson(candidate.next_features_json, null));
         if (!latest) continue;
-        // Ante 1 fixed-seed restarts are observationally indistinguishable
-        // from deliberate replays.  Start a new episode rather than merging.
-        if ((Number(latest.ante) || 0) <= 1) continue;
-        const notEarlier = ante > latest.ante || (ante === latest.ante && round >= latest.roundNumber);
-        if (!notEarlier) continue;
         const exactMatch = candidate.next_state_fingerprint &&
           candidate.next_state_fingerprint === currentExactFingerprint;
         const replayMatch = candidate.next_replay_fingerprint &&
           candidate.next_replay_fingerprint === currentReplayFingerprint;
+        // Completed/interrupted Ante 1 attempts may be deliberate fixed-seed
+        // replays, so never infer continuity for them.  A managed process kill
+        // can, however, leave the currently owned episode open.  Recover that
+        // narrow case only when the exact state fingerprint is unchanged;
+        // semantic/replay similarity is intentionally insufficient here.
+        const isForcedOpen = candidate.outcome == null;
+        if ((Number(latest.ante) || 0) <= 1 && !(isForcedOpen && exactMatch)) continue;
+        const notEarlier = ante > latest.ante || (ante === latest.ante && round >= latest.roundNumber);
+        if (!notEarlier) continue;
         if (!exactMatch && !replayMatch && !strictBoundarySignatureCompatible(latest, currentFeatures)) continue;
         matches.push({ candidate, latest });
       }
