@@ -392,10 +392,89 @@ test("shop risk forecast discounts rare hands and honors The Needle's one-hand l
     blinds: { boss: { name: "The Needle", status: "UPCOMING", score: 3_200 } },
   });
   assert.equal(normal.representativeHand, "Pair");
-  assert.equal(normal.effectiveHands, 5);
+  assert.equal(normal.effectiveHands, 4);
   assert.equal(needle.effectiveHands, 1);
   assert.ok(needle.pressure > normal.pressure * 4);
   assert.ok(needle.budget >= normal.budget);
+});
+
+test("shop pressure uses recent confirmed scoring and ignores stale previous-blind hands left", () => {
+  const exact = {
+    ...handState(),
+    state: "SHOP",
+    money: 40,
+    round: { ...handState().round, hands_left: 1, reroll_cost: 5 },
+    hands: { "Two Pair": { chips: 20, mult: 2, played: 12 } },
+    jokers: area([
+      card({ key: "j_jolly", set: "JOKER" }),
+      card({ key: "j_card_sharp", set: "JOKER" }),
+      card({ key: "j_cavendish", set: "JOKER" }),
+      card({ key: "j_blue_joker", set: "JOKER" }),
+      card({ key: "j_abstract", set: "JOKER" }),
+    ], 5),
+    shop: area([], 2),
+    vouchers: area([], 1),
+    packs: area([], 2),
+    blinds: { boss: { name: "The Wall", status: "UPCOMING", score: 44_000 } },
+  };
+  const budget = balatrobotShopRerollBudget(exact, {
+    benchmarks: [14_000, 16_000, 18_000, 20_000].map((actualScore) => ({ actualScore, state: exact })),
+  });
+  assert.equal(budget.effectiveHands, 4);
+  assert.equal(budget.estimatedPerHand, 14_000);
+  assert.equal(budget.scoreEvidenceSource, "recent_actual");
+  assert.equal(budget.shouldReroll, false);
+});
+
+test("shop score evidence rejects samples from a different Joker build and handles Black Deck", () => {
+  const exact = {
+    ...handState(),
+    state: "SHOP",
+    deck: "BLACK",
+    money: 40,
+    round: { ...handState().round, hands_left: 4, reroll_cost: 5 },
+    hands: { Pair: { chips: 10, mult: 2, played: 8 } },
+    jokers: area([card({ key: "j_jolly", set: "JOKER" })], 5),
+    shop: area([], 2), vouchers: area([], 1), packs: area([], 2),
+    blinds: { boss: { name: "The Wall", status: "UPCOMING", score: 10_000 } },
+  };
+  const oldBuild = { ...exact, jokers: area([card({ key: "j_cavendish", set: "JOKER" })], 5) };
+  const budget = balatrobotShopRerollBudget(exact, {
+    benchmarks: [{ state: oldBuild, actualScore: 50_000 }],
+  });
+  assert.equal(budget.effectiveHands, 3);
+  assert.equal(budget.scoreEvidenceSource, "hand_level_proxy");
+  assert.ok(budget.estimatedPerHand < 50_000);
+});
+
+test("shop score evidence does not reuse the same Joker key with stale effect, edition, or debuff state", () => {
+  const joker = ({ effect = "+4 Mult", edition = null, debuff = false } = {}) => ({
+    ...card({ key: "j_green_joker", set: "JOKER", edition }),
+    value: { effect },
+    state: { debuff },
+  });
+  const exact = {
+    ...handState(),
+    state: "SHOP",
+    money: 40,
+    round: { ...handState().round, reroll_cost: 5 },
+    hands: { Pair: { chips: 10, mult: 2, played: 8 } },
+    jokers: area([joker({ effect: "+18 Mult", edition: "POLYCHROME" })], 5),
+    shop: area([], 2), vouchers: area([], 1), packs: area([], 2),
+    blinds: { boss: { name: "The Wall", status: "UPCOMING", score: 10_000 } },
+  };
+  for (const staleJoker of [
+    joker({ effect: "+4 Mult", edition: "POLYCHROME" }),
+    joker({ effect: "+18 Mult", edition: "HOLO" }),
+    joker({ effect: "+18 Mult", edition: "POLYCHROME", debuff: true }),
+  ]) {
+    const staleState = { ...exact, jokers: area([staleJoker], 5) };
+    const budget = balatrobotShopRerollBudget(exact, {
+      benchmarks: [{ state: staleState, actualScore: 50_000 }],
+    });
+    assert.equal(budget.scoreEvidenceSource, "hand_level_proxy");
+    assert.ok(budget.estimatedPerHand < 50_000);
+  }
 });
 
 test("fallback uses a final-hand scoring consumable before a losing play", () => {

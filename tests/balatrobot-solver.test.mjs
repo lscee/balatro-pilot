@@ -3,13 +3,16 @@ import assert from "node:assert/strict";
 
 import {
   assertBalatrobotCandidateAction,
+  balatrobotMouthLockedHandType,
   balatrobotJokerOrderAction,
   balatrobotSurvivalAssessment,
   balatrobotThinkingMode,
   estimateBalatrobotCandidateScore,
   filterBalatrobotExecutableCandidates,
   generateBalatrobotCandidates,
+  generateBalatrobotPackCandidates,
 } from "../src/balatrobot-solver.mjs";
+import { fallbackBalatrobotAction } from "../src/balatrobot-policy.mjs";
 
 test("local Joker order puts Chips and additive Mult before XMult", () => {
   const exact = state([], {
@@ -345,6 +348,85 @@ test("Boss-local candidates enforce Psychic, Eye, and Mouth hand rules", () => {
   assert.ok(mouthPlays.every((candidate) => candidate.handType === "Pair"));
 });
 
+test("The Mouth reads the RPC pokerHands lock and emits only a forced-zero candidate when locked hand is impossible", () => {
+  const hand = [card("A", "S"), card("K", "H"), card("Q", "D"), card("8", "C"), card("3", "S")];
+  const mouth = state(hand, {
+    discards: 0,
+    blind: { type: "BOSS", status: "CURRENT", name: "The Mouth", score: 600 },
+  });
+  mouth.pokerHands = { "Full House": { chips: 40, mult: 4, playedThisRound: 1 } };
+  assert.equal(balatrobotMouthLockedHandType(mouth), "Full House");
+  const candidates = generateBalatrobotCandidates(mouth);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].forcedZero, true);
+  assert.equal(candidates[0].conservativeScore, 0);
+  assert.match(candidates[0].bossRule, /locked to Full House/u);
+  assert.throws(
+    () => assertBalatrobotCandidateAction({ method: "play", params: { cards: [0] } }, candidates, mouth),
+    /must exactly match one locally enumerated candidate/u,
+  );
+  assert.deepEqual(fallbackBalatrobotAction(mouth).params.cards, candidates[0].action.cards);
+});
+
+test("The Mouth discard candidates pursue only the locked hand type", () => {
+  const hand = [card("9", "D"), card("9", "C"), card("A", "S"), card("K", "S"), card("Q", "S"), card("4", "H")];
+  const mouth = state(hand, { blind: { type: "BOSS", status: "CURRENT", name: "The Mouth", score: 600 } });
+  mouth.pokerHands = { "Full House": { chips: 40, mult: 4, playedThisRound: 1 } };
+  const discards = generateBalatrobotCandidates(mouth).filter((candidate) => candidate.action.method === "discard");
+  assert.ok(discards.length > 0);
+  assert.ok(discards.every((candidate) => candidate.pursuesHandTypes.includes("Full House")));
+  assert.ok(discards.some((candidate) => candidate.target === "chase The Mouth locked Full House"));
+  assert.equal(discards.some((candidate) => candidate.target.includes("flush")), false);
+});
+
+test("The Mouth forced-zero play leaves an available locked rank core in hand and cycles only other cards", () => {
+  const hand = [
+    card("A", "S"), card("K", "H"), card("Q", "D"), card("J", "C"),
+    card("9", "D"), card("9", "C"), card("3", "H"), card("2", "S"),
+  ];
+  const mouth = state(hand, {
+    discards: 0,
+    blind: { type: "BOSS", status: "CURRENT", name: "The Mouth", score: 600 },
+  });
+  Object.defineProperty(mouth, "__mouthLockedHandType", { value: "Full House", configurable: true });
+  const forced = generateBalatrobotCandidates(mouth).find((candidate) => candidate.forcedZero);
+  assert.ok(forced);
+  assert.equal(forced.action.cards.includes(4), false);
+  assert.equal(forced.action.cards.includes(5), false);
+  assert.equal(forced.action.cards.length, 5);
+  assert.ok(forced.action.cards.includes(6));
+  assert.ok(forced.action.cards.includes(7));
+});
+
+test("The Mouth forced-zero play preserves a four-card Flush Five rank core", () => {
+  const hand = [
+    card("7", "S"), card("7", "H"), card("7", "D"), card("7", "C"),
+    card("A", "S"), card("K", "H"), card("Q", "D"), card("2", "C"),
+  ];
+  const mouth = state(hand, {
+    discards: 0,
+    blind: { type: "BOSS", status: "CURRENT", name: "The Mouth", score: 600 },
+  });
+  Object.defineProperty(mouth, "__mouthLockedHandType", { value: "Flush Five", configurable: true });
+  const forced = generateBalatrobotCandidates(mouth).find((candidate) => candidate.forcedZero);
+  assert.ok(forced);
+  assert.deepEqual(forced.action.cards, [4, 5, 6, 7]);
+  assert.equal(forced.conservativeScore, 0);
+});
+
+test("The Mouth conflicting RPC counters fail closed unless the runner latched the first hand", () => {
+  const hand = [card("A", "S"), card("A", "H"), card("K", "D"), card("Q", "C"), card("4", "S")];
+  const mouth = state(hand, { blind: { type: "BOSS", status: "CURRENT", name: "The Mouth", score: 600 } });
+  mouth.hands = { Pair: { played_this_round: 2 } };
+  mouth.pokerHands = { Flush: { playedThisRound: 1 } };
+  assert.equal(balatrobotMouthLockedHandType(mouth), "__AMBIGUOUS_MOUTH_LOCK__");
+  Object.defineProperty(mouth, "__mouthLockedHandType", { value: "Flush", configurable: true });
+  assert.equal(balatrobotMouthLockedHandType(mouth), "Flush");
+  const candidates = generateBalatrobotCandidates(mouth);
+  assert.ok(candidates.filter((candidate) => candidate.action.method === "play").every((candidate) => candidate.handType === "Flush"));
+  assert.equal(candidates.some((candidate) => candidate.handType === "Pair"), false);
+});
+
 test("Cerulean Bell candidates always include the forced highlighted card", () => {
   const hand = [card("A", "S"), card("A", "H"), card("K", "D"), card("7", "C"), card("2", "H")];
   hand[4].state.highlight = true;
@@ -380,6 +462,35 @@ test("score model handles Splash, Flower Pot, Bootstraps, and Bull together", ()
   // Flower Pot is left of Bootstraps, so its X3 applies before the later +4
   // Mult instead of multiplying that later addition too.
   assert.equal(pair.conservativeScore, 630);
+});
+
+test("Flower Pot assigns each Wild card to at most one missing suit", () => {
+  const exact = state([
+    card("J", "D"),
+    card("9", "D"),
+    card("9", "D"),
+    card("6", "H", { enhancement: "WILD" }),
+    card("3", "D"),
+  ], {
+    discards: 0,
+    jokers: [{ key: "j_splash" }, { key: "j_flower_pot" }],
+  });
+  const allFive = generateBalatrobotCandidates(exact).find(
+    (candidate) => candidate.action.method === "play" && candidate.action.cards.length === 5,
+  );
+  assert.equal(allFive.handType, "Flush");
+  assert.equal(allFive.xMult, 1);
+  assert.equal(allFive.conservativeScore, 288);
+});
+
+test("Flower Pot still triggers when four distinct cards cover the four suits", () => {
+  const exact = state([
+    card("9", "D"), card("9", "C"), card("6", "H"), card("3", "S"),
+  ], { discards: 0, jokers: [{ key: "j_splash" }, { key: "j_flower_pot" }] });
+  const pair = generateBalatrobotCandidates(exact).find(
+    (candidate) => candidate.handType === "Pair" && candidate.action.cards.length === 4,
+  );
+  assert.equal(pair.xMult, 3);
 });
 
 test("Verdant Leaf exposes a non-core Joker sale before a losing debuffed play", () => {
@@ -592,6 +703,58 @@ test("routine navigation and shop choices are exposed only as local candidate id
   assert.ok(candidates.some((candidate) => candidate.id === "reroll:shop" && candidate.requiresStrategic));
   assert.ok(candidates.some((candidate) => candidate.id === "next_round:shop" && candidate.requiresStrategic));
   assert.equal(candidates.some((candidate) => candidate.action.method === "sell"), false);
+});
+
+test("celestial pack fallback follows the committed hand route and skips unrelated planets", () => {
+  const exact = {
+    state: "SMODS_BOOSTER_OPENED",
+    hands: {
+      Pair: { level: 2, chips: 25, mult: 3, played: 8 },
+      "Two Pair": { level: 4, chips: 80, mult: 5, played: 14 },
+      "High Card": { level: 1, chips: 5, mult: 1, played: 2 },
+    },
+    jokers: { count: 1, limit: 5, cards: [] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    pack: {
+      cards: [
+        { key: "c_pluto", label: "Pluto", set: "PLANET" },
+        { key: "c_mercury", label: "Mercury", set: "PLANET" },
+        { key: "c_uranus", label: "Uranus", set: "PLANET" },
+      ],
+    },
+  };
+  const runPlan = { buildGoal: "以两对为稳定主线，优先升级 Two Pair" };
+  const choices = generateBalatrobotPackCandidates(exact, { runPlan, limit: 12 });
+  assert.equal(choices[0].card.key, "c_uranus");
+  assert.equal(choices[0].planRelevance, "primary");
+  assert.ok(choices.some((candidate) => candidate.card?.key === "c_mercury" && candidate.planRelevance === "support"));
+  assert.ok(choices.some((candidate) => candidate.card?.key === "c_pluto" && candidate.planRelevance === "unrelated"));
+
+  const fallbackOnly = generateBalatrobotPackCandidates({
+    ...exact,
+    pack: { cards: [{ key: "c_pluto", label: "Pluto", set: "PLANET" }] },
+  }, { runPlan });
+  assert.deepEqual(fallbackOnly.map((candidate) => candidate.id), ["pack:0", "pack:skip"]);
+});
+
+test("compound planet route names do not also promote their substring hands", () => {
+  const exact = {
+    state: "SMODS_BOOSTER_OPENED",
+    hands: {},
+    jokers: { count: 0, limit: 5, cards: [] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    pack: { cards: [
+      { key: "c_neptune", label: "Neptune", set: "PLANET" },
+      { key: "c_saturn", label: "Saturn", set: "PLANET" },
+      { key: "c_jupiter", label: "Jupiter", set: "PLANET" },
+    ] },
+  };
+  const choices = generateBalatrobotPackCandidates(exact, {
+    runPlan: { buildGoal: "Straight Flush / 同花顺主线" },
+  });
+  assert.equal(choices[0].card.key, "c_neptune");
+  assert.equal(choices.find((item) => item.card?.key === "c_saturn").planRelevance, "unrelated");
+  assert.equal(choices.find((item) => item.card?.key === "c_jupiter").planRelevance, "unrelated");
 });
 
 test("shop counterfactual values multiplicative engines and offers a verified full-slot replacement", () => {

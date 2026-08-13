@@ -43,6 +43,48 @@ const MODEL_STATES = new Set(["BLIND_SELECT", "SELECTING_HAND", "SHOP", "SMODS_B
 const SHOP_CHECKPOINT_STATES = new Set(["SHOP", "SMODS_BOOSTER_OPENED"]);
 const STRATEGIC_SHOP_METHODS = new Set(["buy", "sell", "reroll"]);
 
+function currentMouthBlind(state) {
+  const blinds = [state?.blinds?.small, state?.blinds?.big, state?.blinds?.boss].filter(Boolean);
+  const blind = blinds.find((item) => String(item?.status ?? "").toUpperCase().includes("CURRENT"));
+  return String(blind?.name ?? "").trim().toLowerCase() === "the mouth" ? blind : null;
+}
+
+export function latchBalatrobotMouthLock(state, cache) {
+  const blind = currentMouthBlind(state);
+  if (!blind) {
+    cache.blindKey = null;
+    cache.handType = null;
+    return null;
+  }
+  const blindKey = [state?.seed ?? "", state?.ante_num ?? state?.ante ?? "", state?.round_num ?? state?.roundNumber ?? "", "the-mouth"].join(":");
+  if (cache.blindKey !== blindKey) {
+    cache.blindKey = blindKey;
+    cache.handType = null;
+  }
+  const explicit = String(blind?.only_hand ?? blind?.onlyHand ?? "").trim();
+  if (!cache.handType && explicit) cache.handType = explicit;
+  if (!cache.handType) {
+    const hands = new Set([...Object.keys(state?.hands ?? {}), ...Object.keys(state?.pokerHands ?? {})]);
+    const positive = [...hands].filter((handType) => {
+      const legacy = state?.hands?.[handType];
+      const exact = state?.pokerHands?.[handType];
+      return Math.max(
+        Number(legacy?.played_this_round ?? legacy?.playedThisRound) || 0,
+        Number(exact?.played_this_round ?? exact?.playedThisRound) || 0,
+      ) > 0;
+    });
+    if (positive.length === 1) cache.handType = positive[0];
+  }
+  if (cache.handType) {
+    Object.defineProperty(state, "__mouthLockedHandType", {
+      value: cache.handType,
+      configurable: true,
+      enumerable: false,
+    });
+  }
+  return cache.handType;
+}
+
 function abortError(signal) {
   const error = new Error(signal?.reason?.message ?? "Stopped by Ctrl+C");
   error.name = "AbortError";
@@ -532,6 +574,7 @@ export async function runBalatrobot({
   let transitionStartedAt = 0;
   let transitionPolls = 0;
   let state = null;
+  const mouthLockCache = { blindKey: null, handType: null };
   let collectionKnowledge = null;
   let appearedThisRun = runCardTracker.snapshot();
   let scoreBenchmarks = [];
@@ -736,6 +779,7 @@ export async function runBalatrobot({
 
     for (let step = 1; step <= maxSteps; step++) {
       if (signal.aborted) throw abortError(signal);
+      latchBalatrobotMouthLock(state, mouthLockCache);
       const semanticState = refreshRunKnowledge(state);
       if (!runPlan && state?.seed) {
         runPlan = strategicCheckpointStore?.runPlan?.(state.seed) ?? null;
@@ -755,6 +799,10 @@ export async function runBalatrobot({
         });
       }
       const exactFingerprint = balatrobotStateFingerprint(state);
+      Object.defineProperties(state, {
+        __scoreBenchmarks: { value: scoreBenchmarks, configurable: true },
+        __runPlan: { value: runPlan, configurable: true },
+      });
       const compactState = compactBalatrobotState(state);
       Object.defineProperties(compactState, {
         collectionKnowledge: { value: collectionKnowledge, enumerable: false },
@@ -890,6 +938,7 @@ export async function runBalatrobot({
         const generatedCandidates = generateBalatrobotCandidates(state, {
           limit: config.balatrobotHandCandidateLimit,
           benchmarks: scoreBenchmarks,
+          runPlan,
         });
         if (state.state === "SELECTING_HAND") {
           for (const candidate of generatedCandidates.filter((item) => item.action?.method === "play").slice(0, 5)) {
@@ -1411,6 +1460,10 @@ export async function runBalatrobot({
           const actualScore = Number.isFinite(beforeChips) && Number.isFinite(afterChips)
             ? Math.max(0, afterChips - beforeChips)
             : null;
+          if (Number.isFinite(actualScore) && actualScore > 0) {
+            const benchmark = [...scoreBenchmarks].reverse().find((entry) => entry.candidate === scorePrediction);
+            if (benchmark) benchmark.actualScore = actualScore;
+          }
           log.event("bot_score_result", {
             step,
             predicted: scorePrediction.conservativeScore,

@@ -477,7 +477,55 @@ function finiteNumber(...values) {
 // estimates how far the current run is from the next blind and converts only
 // the affordable part of that gap into a shop-search budget. The strategist
 // remains free to buy a Joker, voucher or pack instead of rerolling.
-export function balatrobotShopRerollBudget(state) {
+function lowerQuartile(values) {
+  const sorted = values.filter((value) => Number.isFinite(value) && value > 0).toSorted((left, right) => left - right);
+  if (!sorted.length) return 0;
+  return sorted[Math.floor((sorted.length - 1) * 0.25)];
+}
+
+function jokerBuildSignature(state) {
+  return areaCards(state?.jokers)
+    .map((joker) => {
+      const identity = String(joker?.key ?? joker?.label ?? "").trim().toLowerCase();
+      const edition = String(joker?.modifier?.edition ?? joker?.edition ?? "").trim().toLowerCase();
+      const effect = String(joker?.value?.effect ?? joker?.effect ?? "").trim().toLowerCase();
+      const debuffed = Boolean(joker?.state?.debuff ?? joker?.debuff);
+      return `${identity}@${edition}:${debuffed ? "debuff" : "active"}:${effect}`;
+    })
+    .filter(Boolean)
+    .toSorted()
+    .join("|");
+}
+
+function shopScoreEvidence(state, benchmarks) {
+  const currentBuild = jokerBuildSignature(state);
+  const recent = (Array.isArray(benchmarks) ? benchmarks : Array.isArray(state?.__scoreBenchmarks) ? state.__scoreBenchmarks : [])
+    .filter((benchmark) => benchmark?.state && jokerBuildSignature(benchmark.state) === currentBuild)
+    .slice(-8);
+  const actual = recent.map((benchmark) => Number(benchmark?.actualScore)).filter((value) => value > 0);
+  if (actual.length) return { perHand: lowerQuartile(actual), source: "recent_actual", samples: actual.length };
+  const predicted = recent
+    .map((benchmark) => Number(benchmark?.candidate?.conservativeScore))
+    .filter((value) => value > 0);
+  return predicted.length
+    ? { perHand: lowerQuartile(predicted) * 0.7, source: "local_candidate", samples: predicted.length }
+    : { perHand: 0, source: "hand_level_proxy", samples: 0 };
+}
+
+function nextBlindHandCapacity(state, blindName) {
+  if (blindName === "the needle" || blindName === "needle") return 1;
+  let capacity = 4;
+  const deck = String(state?.deck?.key ?? state?.deck?.name ?? state?.deck ?? "").toLowerCase();
+  if (/(?:^|[_\s])blue(?:[_\s]|$)/u.test(deck)) capacity += 1;
+  if (/(?:^|[_\s])black(?:[_\s]|$)/u.test(deck)) capacity -= 1;
+  const voucherKeys = new Set(Object.keys(state?.used_vouchers ?? state?.usedVouchers ?? {}));
+  if (voucherKeys.has("v_grabber")) capacity += 1;
+  if (voucherKeys.has("v_nacho_tong")) capacity += 1;
+  if (areaCards(state?.jokers).some((joker) => String(joker?.key ?? "").toLowerCase() === "j_burglar")) capacity += 3;
+  return Math.max(1, capacity);
+}
+
+export function balatrobotShopRerollBudget(state, { benchmarks = null } = {}) {
   const blind = activeBlind(state);
   const target = Math.max(0, finiteNumber(blind?.score) ?? 0);
   const hands = state?.hands ?? state?.pokerHands ?? {};
@@ -512,16 +560,21 @@ export function balatrobotShopRerollBudget(state) {
   )[0] ?? { name: "High Card", chips: 5, mult: 1, played: 0 };
   const scoringJokers = balatrobotScoringJokerCount(state);
   const activeJokers = areaCards(state?.jokers).filter((joker) => !joker?.state?.debuff).length;
-  const normalHandCapacity = Math.max(1, finiteNumber(state?.round?.hands_left, state?.round?.handsLeft) ?? 4);
   const blindName = String(blind?.name ?? "").trim().toLowerCase();
-  const handCapacity = blindName === "the needle" || blindName === "needle" ? 1 : normalHandCapacity;
+  // SHOP.hands_left belongs to the blind that just ended. Forecast the next
+  // blind from the run's actual hand allowance instead of that stale value.
+  const handCapacity = nextBlindHandCapacity(state, blindName);
   const repeatability = repeatabilityOf(representative);
   const basePerHand = Math.max(35, (representative.chips + 30) * representative.mult * repeatability);
   // Recognized scoring cards improve the estimate smoothly. This is only a
   // capacity proxy; it does not require Chips/Mult/XMult slots or any named
   // archetype, and unknown effects remain a reason to let the model decide.
   const recognitionFactor = 1 + Math.min(5, scoringJokers) * 0.45 + Math.max(0, activeJokers - scoringJokers) * 0.08;
-  const estimatedPerHand = Math.max(50, Math.round(basePerHand * recognitionFactor));
+  const proxyPerHand = Math.max(50, Math.round(basePerHand * recognitionFactor));
+  const evidence = shopScoreEvidence(state, benchmarks);
+  // Recent confirmed scores are a conservative capacity floor. They prevent
+  // a partially modelled Joker engine from being mistaken for a 50-chip run.
+  const estimatedPerHand = Math.max(proxyPerHand, Math.round(evidence.perHand));
   const estimatedRoundCapacity = Math.max(1, estimatedPerHand * handCapacity);
   const pressure = target > 0 ? target / estimatedRoundCapacity : 0;
   const openSlots = Math.max(0, (finiteNumber(state?.jokers?.limit) ?? activeJokers) - activeJokers);
@@ -567,6 +620,8 @@ export function balatrobotShopRerollBudget(state) {
     repeatability,
     effectiveHands: handCapacity,
     estimatedPerHand,
+    scoreEvidenceSource: evidence.source,
+    scoreEvidenceSamples: evidence.samples,
     estimatedRoundCapacity,
     pressure: Math.round(pressure * 100) / 100,
     reserve,

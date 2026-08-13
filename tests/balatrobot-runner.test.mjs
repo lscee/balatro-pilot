@@ -2,7 +2,26 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { BalatrobotRpcError, BalatrobotTimeoutError } from "../src/balatrobot-client.mjs";
-import { runBalatrobot, strategicCheckpointScope } from "../src/balatrobot-runner.mjs";
+import { latchBalatrobotMouthLock, runBalatrobot, strategicCheckpointScope } from "../src/balatrobot-runner.mjs";
+
+test("runner latches The Mouth's first unique hand even after another counter grows larger", () => {
+  const cache = { blindKey: null, handType: null };
+  const first = handState();
+  first.seed = "MOUTH-LATCH";
+  first.round_num = 9;
+  first.blinds = { boss: { type: "BOSS", status: "CURRENT", name: "The Mouth", score: 600 } };
+  first.pokerHands = { "Full House": { playedThisRound: 1 }, Pair: { playedThisRound: 0 } };
+  assert.equal(latchBalatrobotMouthLock(first, cache), "Full House");
+
+  const later = structuredClone(first);
+  later.pokerHands.Pair.playedThisRound = 2;
+  assert.equal(latchBalatrobotMouthLock(later, cache), "Full House");
+  assert.equal(later.__mouthLockedHandType, "Full House");
+
+  const shop = { ...later, state: "SHOP", blinds: { boss: { type: "BOSS", status: "DEFEATED", name: "The Mouth" } } };
+  assert.equal(latchBalatrobotMouthLock(shop, cache), null);
+  assert.equal(cache.handType, null);
+});
 
 function card(rank, suit) {
   return {

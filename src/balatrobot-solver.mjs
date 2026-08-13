@@ -150,9 +150,43 @@ const PLANET_HAND_UPGRADES = new Map([
   ["c_ceres", { handType: "Flush House", chips: 40, mult: 4 }],
   ["c_eris", { handType: "Flush Five", chips: 50, mult: 3 }],
 ]);
+const PLANET_SUPPORT_HANDS = new Map([
+  ["Two Pair", new Set(["Pair"])],
+  ["Three of a Kind", new Set(["Pair"])],
+  ["Full House", new Set(["Three of a Kind", "Two Pair", "Pair"])],
+  ["Four of a Kind", new Set(["Three of a Kind", "Pair"])],
+  ["Five of a Kind", new Set(["Four of a Kind", "Three of a Kind", "Pair"])],
+  ["Flush House", new Set(["Full House", "Flush", "Three of a Kind", "Two Pair"])],
+  ["Flush Five", new Set(["Five of a Kind", "Flush", "Four of a Kind"])],
+]);
+const HAND_PLAN_ALIASES = new Map([
+  ["High Card", ["high card", "高牌"]],
+  ["Pair", ["pair", "对子"]],
+  ["Two Pair", ["two pair", "两对"]],
+  ["Three of a Kind", ["three of a kind", "三条"]],
+  ["Straight", ["straight", "顺子"]],
+  ["Flush", ["flush", "同花"]],
+  ["Full House", ["full house", "葫芦"]],
+  ["Four of a Kind", ["four of a kind", "四条"]],
+  ["Straight Flush", ["straight flush", "同花顺"]],
+  ["Five of a Kind", ["five of a kind", "五条"]],
+  ["Flush House", ["flush house", "同花葫芦"]],
+  ["Flush Five", ["flush five", "同花五条"]],
+]);
 const TARGETED_CONSUMABLE_SETS = new Set(["TAROT", "SPECTRAL"]);
 const HAND_ACTION_METHODS = new Set(["play", "discard"]);
 const SHOP_STRATEGY_STATES = new Set(["SHOP", "SMODS_BOOSTER_OPENED"]);
+const AMBIGUOUS_MOUTH_LOCK = "__AMBIGUOUS_MOUTH_LOCK__";
+const MOUTH_RANK_LOCKED_HANDS = new Set([
+  "Pair",
+  "Two Pair",
+  "Three of a Kind",
+  "Full House",
+  "Four of a Kind",
+  "Five of a Kind",
+  "Flush House",
+  "Flush Five",
+]);
 
 function cardBonusChips(card) {
   const values = [...cardEffect(card).matchAll(/\+(\d+(?:\.\d+)?)\s*(?:额外筹码|extra\s+chips?)/giu)]
@@ -731,7 +765,7 @@ export function estimateBalatrobotCandidateScore(state, candidate) {
     else if (key === "j_acrobat" && Number(state?.round?.hands_left) === 1) applyXMult(score, 3);
     else if (key === "j_flower_pot") {
       const activeCards = scoring.filter(({ card }) => !cardDebuffed(card)).map(({ card }) => card);
-      if (["S", "H", "D", "C"].every((suit) => activeCards.some((card) => balatroCardMatchesSuit(state, card, suit)))) {
+      if (cardsCanCoverDistinctSuits(state, activeCards, ["S", "H", "D", "C"])) {
         applyXMult(score, 3);
       }
     }
@@ -752,6 +786,32 @@ export function estimateBalatrobotCandidateScore(state, candidate) {
     knownRetriggerSources: [...score.knownRetriggerSources].toSorted(),
     totalActiveJokers: jokers.length,
   };
+}
+
+// Flower Pot needs four distinct scoring cards. A Wild card may stand in for
+// one missing suit, but the same physical card cannot satisfy several suits.
+function cardsCanCoverDistinctSuits(state, cards, suits) {
+  const options = suits
+    .map((suit) => ({
+      suit,
+      indices: cards
+        .map((card, index) => ({ card, index }))
+        .filter(({ card }) => balatroCardMatchesSuit(state, card, suit))
+        .map(({ index }) => index),
+    }))
+    .toSorted((left, right) => left.indices.length - right.indices.length);
+  const used = new Set();
+  const assign = (position) => {
+    if (position >= options.length) return true;
+    for (const index of options[position].indices) {
+      if (used.has(index)) continue;
+      used.add(index);
+      if (assign(position + 1)) return true;
+      used.delete(index);
+    }
+    return false;
+  };
+  return assign(0);
 }
 
 function combinations(count, maximum) {
@@ -846,7 +906,28 @@ function bestPlayCandidates(state, maximum) {
 }
 
 function playedThisRound(state, handType) {
-  return Number(state?.hands?.[handType]?.played_this_round ?? state?.pokerHands?.[handType]?.playedThisRound) || 0;
+  const values = [state?.hands?.[handType], state?.pokerHands?.[handType]]
+    .filter(Boolean)
+    .map((hand) => Number(hand?.played_this_round ?? hand?.playedThisRound) || 0);
+  return values.length ? Math.max(...values) : 0;
+}
+
+export function balatrobotMouthLockedHandType(state) {
+  const boss = String(activeBlind(state)?.name ?? "").trim().toLowerCase();
+  if (boss !== "the mouth") return null;
+  const explicit = String(
+    activeBlind(state)?.only_hand ?? activeBlind(state)?.onlyHand ?? state?.__mouthLockedHandType ?? "",
+  ).trim();
+  if (explicit) return explicit;
+  const handTypes = new Set([
+    ...Object.keys(state?.hands ?? {}),
+    ...Object.keys(state?.pokerHands ?? {}),
+  ]);
+  const positive = [...handTypes].filter((handType) => playedThisRound(state, handType) > 0);
+  // Without an explicit/latched value, multiple positives are ambiguous: a
+  // zero-score off-type play may have incremented another counter. Never infer
+  // the original lock from the largest cumulative count.
+  return positive.length === 1 ? positive[0] : positive.length > 1 ? AMBIGUOUS_MOUTH_LOCK : null;
 }
 
 function bossAllowsPlayCandidate(state, candidate) {
@@ -854,7 +935,7 @@ function bossAllowsPlayCandidate(state, candidate) {
   if (boss === "the psychic" && candidate.action.cards.length !== 5) return false;
   if (boss === "the eye" && playedThisRound(state, candidate.handType) > 0) return false;
   if (boss === "the mouth") {
-    const locked = Object.keys(state?.hands ?? state?.pokerHands ?? {}).find((handType) => playedThisRound(state, handType) > 0);
+    const locked = balatrobotMouthLockedHandType(state);
     if (locked && candidate.handType !== locked) return false;
   }
   if (boss === "the cerulean bell") {
@@ -885,7 +966,7 @@ function discardBuildBonus(state, target) {
   return bonus;
 }
 
-function discardCandidate(state, cards, indices, target, outs, keptCards) {
+function discardCandidate(state, cards, indices, target, outs, keptCards, pursuesHandTypes = []) {
   const sorted = [...indices].sort((left, right) => left - right);
   const kept = [...keptCards].sort((left, right) => left - right);
   const debuffedDiscarded = sorted.filter((index) => cardDebuffed(cards[index])).length;
@@ -907,6 +988,7 @@ function discardCandidate(state, cards, indices, target, outs, keptCards) {
     id: `discard:${sorted.join(",")}`,
     action: { method: "discard", cards: sorted },
     target,
+    pursuesHandTypes,
     keptCards: kept,
     survivalFloorScore: madeScore,
     exactRemainingDeckOuts: outs,
@@ -929,7 +1011,7 @@ function discardCandidates(state, maximum) {
     byRank.get(rank).push(index);
   }
   const result = [];
-  const addKeep = (keep, target, outs) => {
+  const addKeep = (keep, target, outs, pursuesHandTypes) => {
     const keepSet = new Set(keep);
     const discard = allIndices
       .filter((index) => !keepSet.has(index))
@@ -937,17 +1019,48 @@ function discardCandidates(state, maximum) {
         Number(cardDebuffed(cards[right])) - Number(cardDebuffed(cards[left])) ||
         rankNumber(cardRank(cards[left])) - rankNumber(cardRank(cards[right])))
       .slice(0, discardLimit);
-    if (discard.length) result.push(discardCandidate(state, cards, discard, target, outs, keep));
+    if (discard.length) result.push(discardCandidate(state, cards, discard, target, outs, keep, pursuesHandTypes));
   };
 
   const madeGroups = [...byRank.entries()]
     .filter(([, indices]) => indices.length >= 2)
     .sort(([leftRank, left], [rightRank, right]) => right.length - left.length || rightRank - leftRank);
+  const mouthLocked = balatrobotMouthLockedHandType(state);
+  const rankChaseGroups = {
+    Pair: 1,
+    "Two Pair": 2,
+    "Three of a Kind": 1,
+    "Full House": 2,
+    "Four of a Kind": 1,
+    "Five of a Kind": 1,
+    "Flush House": 2,
+    "Flush Five": 1,
+  };
+  const chaseGroupCount = rankChaseGroups[mouthLocked];
+  if (chaseGroupCount) {
+    const groups = [...byRank.entries()]
+      .toSorted(([leftRank, left], [rightRank, right]) =>
+        right.length - left.length || rightRank - leftRank)
+      .slice(0, chaseGroupCount);
+    const keep = groups.flatMap(([, indices]) => indices).slice(0, 5);
+    const ranks = new Set(groups.map(([rank]) => rank));
+    const outs = remaining.filter((card) => ranks.has(rankNumber(cardRank(card)))).length;
+    addKeep(keep, `chase The Mouth locked ${mouthLocked}`, outs, [mouthLocked]);
+  }
   if (madeGroups.length) {
     const keep = madeGroups.slice(0, madeGroups[0][1].length >= 3 ? 1 : 2).flatMap(([, indices]) => indices);
     const ranks = new Set(keep.map((index) => rankNumber(cardRank(cards[index]))));
     const outs = remaining.filter((card) => ranks.has(rankNumber(cardRank(card)))).length;
-    addKeep(keep, madeGroups.length >= 2 ? "improve two-pair/full-house core" : "improve pair/trips core", outs);
+    addKeep(
+      keep,
+      madeGroups.length >= 2 ? "improve two-pair/full-house core" : "improve pair/trips core",
+      outs,
+      madeGroups.length >= 2
+        ? ["Two Pair", "Full House"]
+        : madeGroups[0][1].length >= 3
+          ? ["Three of a Kind", "Full House", "Four of a Kind", "Five of a Kind"]
+          : ["Pair", "Two Pair", "Three of a Kind", "Full House", "Four of a Kind", "Five of a Kind"],
+    );
   }
 
   const straightSize = balatroStraightSize(state);
@@ -967,7 +1080,9 @@ function discardCandidates(state, maximum) {
     })
     .filter((draw) => draw.keep.length >= Math.max(2, straightSize - 2))
     .sort((left, right) => right.keep.length - left.keep.length || right.outs - left.outs || right.high - left.high);
-  if (straightDraws[0]) addKeep(straightDraws[0].keep, "complete a straight", straightDraws[0].outs);
+  if (straightDraws[0]) {
+    addKeep(straightDraws[0].keep, "complete a straight", straightDraws[0].outs, ["Straight", "Straight Flush"]);
+  }
 
   const flushSize = balatroFlushSize(state);
   const flushDraws = ["S", "H", "D", "C"]
@@ -980,6 +1095,7 @@ function discardCandidates(state, maximum) {
       keep,
       `complete a ${suit} flush`,
       remaining.filter((card) => balatroCardMatchesSuit(state, card, suit, { flush: true })).length,
+      ["Flush", "Straight Flush", "Flush House", "Flush Five"],
     );
   }
 
@@ -988,11 +1104,19 @@ function discardCandidates(state, maximum) {
       .toSorted((left, right) => rankNumber(cardRank(cards[right])) - rankNumber(cardRank(cards[left])))
       .slice(0, Math.max(1, cards.length - discardLimit));
     const genericRanks = new Set(genericKeep.map((index) => rankNumber(cardRank(cards[index]))));
-    addKeep(genericKeep, "pair high retained ranks", remaining.filter((card) => genericRanks.has(rankNumber(cardRank(card)))).length);
+    addKeep(
+      genericKeep,
+      "pair high retained ranks",
+      remaining.filter((card) => genericRanks.has(rankNumber(cardRank(card)))).length,
+      ["High Card", "Pair"],
+    );
   }
 
   const unique = new Map(result.map((candidate) => [candidate.id, candidate]));
-  return [...unique.values()]
+  const legal = mouthLocked
+    ? [...unique.values()].filter((candidate) => candidate.pursuesHandTypes.includes(mouthLocked))
+    : [...unique.values()];
+  return legal
     .toSorted(
       (left, right) =>
         right.expectedValue - left.expectedValue ||
@@ -1201,10 +1325,80 @@ function bestPackTargets(state, offeredCard) {
   return best;
 }
 
-export function generateBalatrobotPackCandidates(state, { limit = 12 } = {}) {
+function plannedHandTypes(runPlan) {
+  const text = Object.values(runPlan && typeof runPlan === "object" ? runPlan : {})
+    .map((value) => String(value ?? ""))
+    .join(" ")
+    .toLowerCase();
+  const matches = [];
+  for (const [handType, aliases] of HAND_PLAN_ALIASES) {
+    for (const alias of aliases.toSorted((left, right) => right.length - left.length)) {
+      let offset = 0;
+      while (offset < text.length) {
+        const index = text.indexOf(alias, offset);
+        if (index < 0) break;
+        const latin = /^[a-z ]+$/u.test(alias);
+        const before = index > 0 ? text[index - 1] : "";
+        const after = text[index + alias.length] ?? "";
+        if (!latin || (!/[a-z]/u.test(before) && !/[a-z]/u.test(after))) {
+          matches.push({ handType, index, end: index + alias.length, length: alias.length });
+        }
+        offset = index + 1;
+      }
+    }
+  }
+  // Resolve compound names before their substrings: "Straight Flush" must
+  // not also declare independent Straight and Flush routes.
+  const selected = [];
+  for (const match of matches.toSorted((left, right) => left.index - right.index || right.length - left.length)) {
+    if (selected.some((item) => match.index < item.end && match.end > item.index)) continue;
+    // Keep every non-overlapping occurrence as an occupied span, even if the
+    // same route also appeared in another language earlier in the sentence.
+    selected.push(match);
+  }
+  return selected
+    .toSorted((left, right) => left.index - right.index)
+    .map(({ handType }) => handType)
+    .filter((handType, index, all) => all.indexOf(handType) === index);
+}
+
+function planetPlanValue(state, upgrade, runPlan) {
+  const planned = plannedHandTypes(runPlan);
+  let relevance = "unrelated";
+  let planBonus = 0;
+  if (planned[0] === upgrade.handType) {
+    relevance = "primary";
+    planBonus = 700;
+  }
+  const supportIndex = planned.findIndex((target) => PLANET_SUPPORT_HANDS.get(target)?.has(upgrade.handType));
+  if (relevance === "unrelated" && supportIndex >= 0) {
+    relevance = "support";
+    planBonus = 350 - supportIndex * 20;
+  }
+  const secondaryIndex = planned.slice(1).indexOf(upgrade.handType);
+  if (relevance === "unrelated" && secondaryIndex >= 0) {
+    relevance = "secondary";
+    planBonus = 220 - secondaryIndex * 20;
+  }
+  const hand = state?.hands?.[upgrade.handType] ?? state?.pokerHands?.[upgrade.handType] ?? {};
+  const played = Math.max(0, Number(hand?.played) || 0);
+  if (!planned.length) relevance = played > 0 ? "observed" : "uncommitted";
+  const values = handValues(state, upgrade.handType);
+  const scoreDelta = Math.max(
+    0,
+    (values.chips + upgrade.chips) * (values.mult + upgrade.mult) - values.chips * values.mult,
+  );
+  // Upgrade yield and actual use frequency are primary. The plan is a bonus,
+  // so an unusually strong or established alternate remains visible.
+  const priority = scoreDelta * Math.max(1, Math.log2(played + 2)) + played * 45 + planBonus;
+  return { relevance, priority, planBonus, scoreDelta, played };
+}
+
+export function generateBalatrobotPackCandidates(state, { limit = 12, runPlan = null } = {}) {
   if (state?.state !== "SMODS_BOOSTER_OPENED") return [];
   const offered = cardsIn(state?.pack);
   const candidates = [];
+  const activeRunPlan = runPlan ?? state?.__runPlan ?? null;
   for (const [index, card] of offered.entries()) {
     const set = String(card?.set ?? "").toUpperCase();
     if (set === "JOKER" && Number(state?.jokers?.count) >= Number(state?.jokers?.limit)) continue;
@@ -1223,11 +1417,19 @@ export function generateBalatrobotPackCandidates(state, { limit = 12 } = {}) {
       });
       continue;
     }
+    const planetUpgrade = set === "PLANET" ? PLANET_HAND_UPGRADES.get(String(card?.key ?? "").toLowerCase()) : null;
+    const planetValue = planetUpgrade ? planetPlanValue(state, planetUpgrade, activeRunPlan) : null;
     candidates.push({
       id: `pack:${index}`,
       action: { method: "pack", card: index, targets: [] },
       card: { index, key: card?.key ?? "", label: card?.label ?? "", set },
-      expectedValue: set === "PLANET" ? 850 : set === "JOKER" && scoringJoker(card) ? 900 : 500,
+      handType: planetUpgrade?.handType ?? null,
+      planRelevance: planetValue?.relevance ?? null,
+      upgradeScoreDelta: planetValue?.scoreDelta ?? null,
+      handPlayed: planetValue?.played ?? null,
+      expectedValue: set === "PLANET"
+        ? 200 + (planetValue?.priority ?? 0)
+        : set === "JOKER" && scoringJoker(card) ? 900 : 500,
     });
   }
   candidates.push({
@@ -1261,11 +1463,11 @@ function emergencyBossCandidates(state) {
   }];
 }
 
-export function generateBalatrobotCandidates(state, { limit = 14, benchmarks = [] } = {}) {
+export function generateBalatrobotCandidates(state, { limit = 14, benchmarks = [], runPlan = null } = {}) {
   if (state?.state === "BLIND_SELECT") return generateBlindSelectCandidates(state);
   if (state?.state === "SHOP") return generateBalatrobotShopCandidates(state, { limit, benchmarks });
   if (state?.state === "SMODS_BOOSTER_OPENED") {
-    return generateBalatrobotPackCandidates(state, { limit });
+    return generateBalatrobotPackCandidates(state, { limit, runPlan });
   }
   if (state?.state !== "SELECTING_HAND") return [];
   const normalizedLimit = Math.max(2, Math.min(30, Number(limit) || 14));
@@ -1275,7 +1477,74 @@ export function generateBalatrobotCandidates(state, { limit = 14, benchmarks = [
   const consumables = emergencyConsumableCandidates(state, plays);
   const semanticActions = [...emergencyBossCandidates(state), ...consumables];
   const handActions = [...plays, ...discards].slice(0, Math.max(0, normalizedLimit - semanticActions.length));
-  const result = [...handActions, ...semanticActions].slice(0, normalizedLimit);
+  let result = [...handActions, ...semanticActions].slice(0, normalizedLimit);
+  const mouthLocked = balatrobotMouthLockedHandType(state);
+  if (
+    mouthLocked &&
+    Number(state?.round?.discards_left) <= 0 &&
+    !result.some((candidate) => candidate.action?.method === "play")
+  ) {
+    const cards = cardsIn(state?.hand);
+    const byRank = new Map();
+    for (const [index, card] of cards.entries()) {
+      const rank = rankNumber(cardRank(card));
+      if (!byRank.has(rank)) byRank.set(rank, []);
+      byRank.get(rank).push(index);
+    }
+    const coreLimit = /Two Pair|Full House|Flush House/u.test(mouthLocked) ? 2 : 1;
+    const core = [...byRank.entries()]
+      .toSorted(([leftRank, left], [rightRank, right]) => right.length - left.length || rightRank - leftRank)
+      .slice(0, coreLimit)
+      .flatMap(([, indices]) => indices)
+      .slice(0, 5);
+    const coreSet = new Set(MOUTH_RANK_LOCKED_HANDS.has(mouthLocked) ? core : []);
+    const cycle = cards
+      .map((card, index) => ({ card, index }))
+      .filter(({ index }) => !coreSet.has(index))
+      .toSorted((left, right) =>
+        Number(cardDebuffed(right.card)) - Number(cardDebuffed(left.card)) ||
+        rankNumber(cardRank(left.card)) - rankNumber(cardRank(right.card)) ||
+        left.index - right.index)
+      .slice(0, Math.min(5, Math.max(1, cards.length - coreSet.size)))
+      .map(({ index }) => index)
+    const lowestFallback = cards
+      .map((card, index) => ({ card, index }))
+      .toSorted((left, right) =>
+        Number(cardDebuffed(right.card)) - Number(cardDebuffed(left.card)) ||
+        rankNumber(cardRank(left.card)) - rankNumber(cardRank(right.card)) ||
+        left.index - right.index)
+      [0]?.index;
+    // The forced-zero play should cycle expendable cards while leaving any
+    // partial locked-hand rank core in the hand for a later draw. Only when
+    // every visible card is part of that core do we sacrifice one low card.
+    const indices = (cycle.length ? cycle : [lowestFallback].filter(Number.isInteger))
+      .toSorted((left, right) => left - right);
+    if (indices.length) {
+      const actual = classifyBalatroHand(state, cards, indices);
+      result = [{
+        id: `play:mouth-forced-zero:${indices.join(",")}`,
+        action: { method: "play", cards: indices },
+        handType: actual.handType,
+        scoringCards: [],
+        cycleFillers: indices,
+        rulesApplied: [...actual.rulesApplied, "the-mouth-forced-zero"],
+        bossRule: `The Mouth is locked to ${mouthLocked}; this off-type hand scores zero`,
+        forcedZero: true,
+        baseScoreBeforeEffects: 0,
+        conservativeScore: 0,
+        estimatedScore: 0,
+        optimisticScore: 0,
+        chips: 0,
+        mult: 0,
+        xMult: 1,
+        volatileXMult: 1,
+        knownScoringJokers: 0,
+        knownRetriggers: 0,
+        knownRetriggerSources: [],
+        totalActiveJokers: cardsIn(state?.jokers).length,
+      }, ...semanticActions].slice(0, normalizedLimit);
+    }
+  }
   const assessment = balatrobotSurvivalAssessment(state, result);
   return result.map((candidate) => candidate.id === assessment.bestPlay?.id
     ? {
@@ -1350,7 +1619,17 @@ export function balatrobotSurvivalAssessment(state, candidates) {
 }
 
 export function assertBalatrobotCandidateAction(action, candidates, state = null) {
-  if (!Array.isArray(candidates) || !candidates.length) return action;
+  if (!Array.isArray(candidates) || !candidates.length) {
+    if (state?.state === "SELECTING_HAND" && HAND_ACTION_METHODS.has(action?.method)) {
+      const locked = balatrobotMouthLockedHandType(state);
+      throw new Error(
+        locked
+          ? `The Mouth is locked to ${locked}, but no locally enumerated legal ${action.method} candidate exists`
+          : `no locally enumerated legal ${action.method} candidate exists`,
+      );
+    }
+    return action;
+  }
   if (state?.state === "SMODS_BOOSTER_OPENED" && action?.method === "pack" && action?.params?.skip === true) {
     const safeChoice = candidates.find((candidate) => candidate.action?.method === "pack" && !candidate.action.skip);
     if (safeChoice) {
