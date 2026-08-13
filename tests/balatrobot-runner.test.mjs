@@ -1010,18 +1010,110 @@ test("runner reuses one strategic package throughout the same Boss blind", async
   assert.deepEqual(efforts, ["high", "none"]);
 });
 
-test("shop purchases and opened packs share one strategic checkpoint", () => {
+test("opened pack contents have a strategic checkpoint independent from the shop", () => {
   const thinking = { strategic: true };
   const shop = { state: "SHOP", seed: "SHOP-CHECKPOINT", ante_num: 2, round_num: 5 };
   const changedShop = { ...shop, money: 2, jokers: { cards: [{ key: "j_blueprint" }] } };
-  const pack = { ...changedShop, state: "SMODS_BOOSTER_OPENED", pack: { cards: [{ key: "c_mercury" }] } };
+  const pack = {
+    ...changedShop,
+    state: "SMODS_BOOSTER_OPENED",
+    pack: { count: 3, limit: 3, cards: [
+      { index: 0, id: 101, key: "c_black_hole" },
+      { index: 1, id: 102, key: "c_jupiter" },
+      { index: 2, id: 103, key: "c_neptune" },
+    ] },
+  };
   assert.equal(strategicCheckpointScope(shop, thinking), "SHOP-CHECKPOINT:shop:2:5");
   assert.equal(strategicCheckpointScope(changedShop, thinking), strategicCheckpointScope(shop, thinking));
-  assert.equal(strategicCheckpointScope(pack, thinking), strategicCheckpointScope(shop, thinking));
+  assert.notEqual(strategicCheckpointScope(pack, thinking), strategicCheckpointScope(shop, thinking));
+  assert.match(strategicCheckpointScope(pack, thinking), /:pack:2:5:3:3:0_101_c_black_hole\|1_102_c_jupiter\|2_103_c_neptune$/u);
+  assert.equal(
+    strategicCheckpointScope({ ...pack, money: 99, round: { chips: 123 } }, thinking),
+    strategicCheckpointScope(pack, thinking),
+    "unrelated dynamic fields must not spend another strategic call",
+  );
+  const secondMegaChoice = {
+    ...pack,
+    pack: { count: 2, limit: 3, cards: pack.pack.cards.slice(1) },
+  };
+  assert.notEqual(
+    strategicCheckpointScope(secondMegaChoice, thinking),
+    strategicCheckpointScope(pack, thinking),
+    "changed Mega-pack contents require a fresh strategic decision",
+  );
   assert.notEqual(
     strategicCheckpointScope({ ...shop, round_num: 6 }, thinking),
     strategicCheckpointScope(shop, thinking),
   );
+});
+
+test("an existing shop checkpoint cannot downgrade new pack contents to the routine route", async () => {
+  const initial = {
+    ...handState(),
+    state: "SMODS_BOOSTER_OPENED",
+    seed: "PACK-AFTER-SHOP",
+    ante_num: 4,
+    round_num: 11,
+    hand: { count: 0, limit: 8, highlighted_limit: 5, cards: [] },
+    pack: { count: 3, limit: 3, cards: [
+      { index: 0, id: 201, key: "c_black_hole", set: "SPECTRAL", label: "Black Hole", value: { effect: "Upgrade every poker hand" }, modifier: {}, state: {}, cost: {} },
+      { index: 1, id: 202, key: "c_jupiter", set: "PLANET", label: "Jupiter", value: { effect: "Level up Flush" }, modifier: {}, state: {}, cost: {} },
+      { index: 2, id: 203, key: "c_neptune", set: "PLANET", label: "Neptune", value: { effect: "Level up Straight Flush" }, modifier: {}, state: {}, cost: {} },
+    ] },
+  };
+  const after = { ...initial, state: "SHOP", pack: { count: 0, limit: 0, cards: [] } };
+  const shopScope = "PACK-AFTER-SHOP:shop:4:11";
+  const checkedScopes = [];
+  let strategicInput;
+  const strategicPlanner = {
+    config: { provider: "kimi-chat", model: "k3-256k" },
+    async planState(input) {
+      strategicInput = input;
+      return modelPlan(semanticAction("pack", { card: 0, targets: [], reason: "Black Hole upgrades every poker hand" }));
+    },
+  };
+  const routinePlanner = {
+    config: { provider: "deepseek-chat", model: "deepseek-v4-flash" },
+    async rankCandidate() { throw new Error("new pack contents must not use routine ranking"); },
+    async planState() { throw new Error("new pack contents must not use routine planning"); },
+  };
+  const calls = [];
+  const log = fakeLog();
+  await runBalatrobot({
+    projectRoot: ".",
+    config: {
+      ...config,
+      balatrobotStrategicThinkingEnabled: true,
+      balatrobotStrategicReasoningEffort: "high",
+      balatrobotRoutineReasoningEffort: "none",
+    },
+    client: {
+      baseUrl: config.balatrobotUrl,
+      async gamestate() { return initial; },
+      async call(method, params) { calls.push({ method, params }); return after; },
+    },
+    planner: routinePlanner,
+    strategicPlanner,
+    strategicCheckpointStore: {
+      has(_seed, scope) { checkedScopes.push(scope); return scope === shopScope; },
+      runPlan() { return null; },
+      mark() {},
+    },
+    maxSteps: 1,
+    log,
+  });
+
+  assert.deepEqual(calls, [{ method: "pack", params: { card: 0 } }]);
+  assert.equal(strategicInput.reasoningEffort, "high");
+  assert.deepEqual(
+    JSON.parse(strategicInput.candidateContext)
+      .filter((candidate) => candidate.card)
+      .map((candidate) => candidate.card.key)
+      .toSorted(),
+    ["c_black_hole", "c_jupiter", "c_neptune"].toSorted(),
+  );
+  assert.ok(checkedScopes.some((scope) => scope.startsWith("PACK-AFTER-SHOP:pack:4:11:")));
+  assert.ok(log.events.some((event) => event.type === "bot_planner_route" && event.route === "strategic"));
 });
 
 test("blind strategic checkpoints are distinct for each offered blind and tag", () => {

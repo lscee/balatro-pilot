@@ -40,8 +40,24 @@ const LEARNABLE_METHODS = new Set([
   "pack",
 ]);
 const MODEL_STATES = new Set(["BLIND_SELECT", "SELECTING_HAND", "SHOP", "SMODS_BOOSTER_OPENED"]);
-const SHOP_CHECKPOINT_STATES = new Set(["SHOP", "SMODS_BOOSTER_OPENED"]);
 const STRATEGIC_SHOP_METHODS = new Set(["buy", "sell", "reroll"]);
+
+function checkpointSegment(value, fallback = "unknown") {
+  const normalized = String(value ?? "").trim().replaceAll(":", "_").replaceAll("|", "_");
+  return normalized || fallback;
+}
+
+function openedPackCheckpointIdentity(state) {
+  const cards = Array.isArray(state?.pack?.cards) ? state.pack.cards : [];
+  const offered = cards.map((card, arrayIndex) => [
+    Number.isInteger(card?.index) ? card.index : arrayIndex,
+    checkpointSegment(card?.id, "no-id"),
+    checkpointSegment(card?.key ?? card?.label, "unknown-card"),
+  ].join("_")).join("|") || "empty";
+  const count = Number.isFinite(Number(state?.pack?.count)) ? Number(state.pack.count) : cards.length;
+  const limit = Number.isFinite(Number(state?.pack?.limit)) ? Number(state.pack.limit) : cards.length;
+  return `${count}:${limit}:${offered}`;
+}
 
 function currentMouthBlind(state) {
   const blinds = [state?.blinds?.small, state?.blinds?.big, state?.blinds?.boss].filter(Boolean);
@@ -185,10 +201,19 @@ export function strategicCheckpointScope(state, thinkingMode) {
     // K3 cannot be called four times for the same Boss.
     return `${run}:hand:${ante}:${round}`;
   }
-  if (SHOP_CHECKPOINT_STATES.has(state?.state)) {
-    // One Kimi strategy package covers the whole shop visit. Purchases,
-    // opened packs, pack choices, and returning to the shop reuse it.
+  if (state?.state === "SHOP") {
+    // One Kimi strategy package covers ordinary purchase/sale/reroll choices
+    // for the whole shop visit. The contents of a purchased booster are not
+    // known yet and therefore deliberately get their own checkpoint below.
     return `${run}:shop:${ante}:${round}`;
+  }
+  if (state?.state === "SMODS_BOOSTER_OPENED") {
+    // A booster choice is a new strategic decision, independent from the shop
+    // decision that bought it. Key the scope only by the exact offered cards,
+    // not the whole dynamic state, so unrelated counters cannot cause repeated
+    // K3 calls. Mega packs naturally get a second checkpoint when the first
+    // selection changes their remaining contents.
+    return `${run}:pack:${ante}:${round}:${openedPackCheckpointIdentity(state)}`;
   }
   if (state?.state === "BLIND_SELECT") {
     const selectable = [state?.blinds?.small, state?.blinds?.big, state?.blinds?.boss]
