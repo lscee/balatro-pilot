@@ -106,13 +106,16 @@ test("local candidates classify full house and generate discard draws from exact
   assert.ok(candidates.some((candidate) => candidate.action.method === "discard" && candidate.exactRemainingDeckOuts > 0));
 });
 
-test("candidate guard rejects a hallucinated pair but allows non-hand semantic methods", () => {
+test("candidate guard rejects hallucinated hand and non-hand actions", () => {
   const candidates = generateBalatrobotCandidates(state([card("6", "H"), card("6", "S"), card("K", "D")]));
   assert.throws(
     () => assertBalatrobotCandidateAction({ method: "play", params: { cards: [1] } }, candidates),
     /locally enumerated candidate/,
   );
-  assert.doesNotThrow(() => assertBalatrobotCandidateAction({ method: "use", params: { consumable: 0 } }, candidates));
+  assert.throws(
+    () => assertBalatrobotCandidateAction({ method: "use", params: { consumable: 0 } }, candidates),
+    /must exactly match one locally enumerated candidate/,
+  );
 });
 
 test("conservative score reproduces Acrobat and debuff scoring instead of trusting model arithmetic", () => {
@@ -703,6 +706,15 @@ test("routine navigation and shop choices are exposed only as local candidate id
   assert.ok(candidates.some((candidate) => candidate.id === "reroll:shop" && candidate.requiresStrategic));
   assert.ok(candidates.some((candidate) => candidate.id === "next_round:shop" && candidate.requiresStrategic));
   assert.equal(candidates.some((candidate) => candidate.action.method === "sell"), false);
+  assert.doesNotThrow(() => assertBalatrobotCandidateAction(
+    { method: "buy", params: { card: 0 } },
+    candidates,
+    shop,
+  ));
+  assert.throws(
+    () => assertBalatrobotCandidateAction({ method: "buy", params: { card: 1 } }, candidates, shop),
+    /must exactly match one locally enumerated candidate/,
+  );
 });
 
 test("celestial pack fallback follows the committed hand route and skips unrelated planets", () => {
@@ -729,6 +741,15 @@ test("celestial pack fallback follows the committed hand route and skips unrelat
   assert.equal(choices[0].planRelevance, "primary");
   assert.ok(choices.some((candidate) => candidate.card?.key === "c_mercury" && candidate.planRelevance === "support"));
   assert.ok(choices.some((candidate) => candidate.card?.key === "c_pluto" && candidate.planRelevance === "unrelated"));
+  assert.doesNotThrow(() => assertBalatrobotCandidateAction(
+    { method: "pack", params: { card: 2, targets: [] } },
+    choices,
+    exact,
+  ));
+  assert.throws(
+    () => assertBalatrobotCandidateAction({ method: "pack", params: { card: 8, targets: [] } }, choices, exact),
+    /must exactly match one locally enumerated candidate/,
+  );
 
   const fallbackOnly = generateBalatrobotPackCandidates({
     ...exact,

@@ -11,7 +11,7 @@ Balatro Pilot 是一个面向 Windows Steam 版《Balatro》的自动游玩与�
 - 双模型边界：高频出牌 API 与战略 API 完全独立配置。
 - 本地高频模式：可用 Ollama/Qwen 替代云端高频模型，并从 Dashboard 热切换。
 - 战略审批：商店构筑、购买/出售/重掷、Boss 与关键盲注必须经过战略路由。
-- 自学习：只有已确认的精确状态转移才进入语义经验库；失败、超时和陈旧计划不会污染训练数据。
+- 自学习：原始 transition 记录不覆写，奖励可离线重算；跨种子语义先验只校准现有合法候选，不绕过战略审批。
 - 直播组件：Dashboard、牌组 Overlay、中文策略 Overlay，以及无需付费请求的组件 Health Check。
 - 安全执行：F8/Ctrl+C 急停、RPC 后对账、超时不盲目重放、失焦等待。
 
@@ -34,7 +34,10 @@ flowchart LR
   validate --> writer["单写者 RPC 执行与结果对账"]
   writer --> mod
   writer --> events["结构化事件"]
-  events --> learning["语义经验库与策略快路"]
+  events --> trajectory["不可变原始轨迹库"]
+  trajectory --> rewards["跨版本 Reward v6 离线标签"]
+  rewards --> prior["跨种子决策桶与动作先验"]
+  prior -. "有界校准现有候选" .-> rules
   events --> dashboard["Dashboard 与 Health Check"]
   events --> overlay["OBS 牌组与策略 Overlay"]
   vision["可选视觉兼容回退"] --> validate
@@ -195,19 +198,36 @@ OBS 推荐把游戏、牌组 Overlay 和策略 Overlay 分别作为三个源拼�
 
 ## 自学习数据
 
-学习数据库默认位于 `data/semantic-experience.sqlite`。只有 RPC 前后状态明确变化、且整局得到明确结果的动作才会获得回报。以下内容不会写入有效经验：
+学习数据库默认位于 `data/semantic-experience.sqlite`。这不是修改模型权重的训练，而是“记录轨迹 → 离线重算奖励 → 按抽象局面聚合 → 校准当前合法候选”的安全经验学习。
+
+- 原始 transition 与奖励标签分层保存。调整奖励公式时只生成新标签，不覆盖旧 transition，因此 v1–v5 的兼容历史都能继续使用；episode 元数据可在严格确认同一局续接时更新。
+- 失败局统一提供负面证据，不会再因为局中推进奖励而被误标成成功经验；高分和后期失败仍在负面样本内部保留质量排序。
+- 决策按阶段、Boss、经济压力、构筑角色、手牌形状和语义动作聚合，不包含随机 seed 或精确牌序。每局最多一票，至少 3 个独立 episode 且置信区间足够明确时才影响排序。
+- 经验混合权重默认最多 30%，只能重排本地已经生成的候选；它不能发明动作、绕过本地 validator，也不能替商店购买/出售/重掷跳过战略模型审批。
+- 精确状态自动重放默认关闭。控制器重启后会保守续接同一局；历史中可可靠证明连续的中断段也会在奖励层关联到最终结果，原始记录保持不变。
+
+只有 RPC 前后状态明确变化的动作才会进入原始轨迹。以下内容不会成为有效经验：
 
 - dry-run；
 - RPC 拒绝；
 - 超时后无法确认；
 - 陈旧计划；
-- 未完成或被中断的整局。
+- 无法可靠关联到后续终局的中断段。
 
 查看统计：
 
 ```powershell
 npm run memory
+npm run learning:report
 ```
+
+`learning:report` 会只读输出历史覆盖率、奖励完整性、抽象决策桶支持度、经验先验可应用度和实际影响率，不会启动游戏或调用付费模型。还可以生成固定 seed/deck 的成对、反平衡 A/B 评测清单：
+
+```powershell
+npm run learning:report -- --seeds SEED_A,SEED_B --decks RED,BLUE --repeats 2 --output learning-report.json
+```
+
+该命令只生成评测计划；不会自行重放固定 seed，也不会修改游戏存档。
 
 `data/`、`runs/`、`config.json` 和密钥都被 Git 忽略。换机器时可选择单独备份数据库；删除数据库会从空经验重新训练，不影响代码运行。
 

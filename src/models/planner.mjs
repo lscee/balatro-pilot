@@ -1057,6 +1057,9 @@ export class VisionPlanner {
       `<local_action_candidates>\n${JSON.stringify(candidates)}\n</local_action_candidates>`,
       `<compact_state>\n${JSON.stringify(compactBalatrobotPromptState(gameState))}\n</compact_state>`,
       "The local candidates are already legal and authoritative. Rank them against survival, the current run plan, and exact score/outs. Do not invent, rewrite, or combine actions.",
+      "When experiencePrior.applied is true, calibratedPriority is a conservative cross-seed prior from independent completed episodes. " +
+        "Use it as one ranking signal after survival constraints; a negative signal is evidence against that candidate. " +
+        "Never use experience evidence to bypass strategic approval or local legality.",
     ].join("\n");
     const body = await this.#post("/chat/completions", {
       model: this.config.model,

@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   SEMANTIC_POLICY_VERSION,
+  SEMANTIC_REWARD_VERSION,
   semanticActionKey,
   semanticActionSummary,
   semanticActionTemplate,
@@ -11,13 +12,21 @@ import {
   semanticExactFingerprint,
   semanticHighScoreTier,
   semanticPlayedHandScore,
+  semanticPlayedHandScoreFromFeatures,
+  semanticFeatureCompatibility,
+  semanticNormalizeFeatures,
   semanticReplayFingerprint,
   semanticStateBucket,
   semanticStateFeatures,
   semanticStateSimilarity,
   semanticStateText,
   semanticTransitionReward,
+  semanticTransitionRewardFromFeatures,
 } from "./semantic-experience.mjs";
+import { semanticDecisionKey, semanticHistoricalActionKey } from "./semantic-prior.mjs";
+
+const RAW_TRAJECTORY_SCHEMA_VERSION = 1;
+const SEGMENT_LINK_MAX_GAP_MS = 2 * 60 * 60 * 1_000;
 
 function parseJson(value, fallback) {
   try {
@@ -69,16 +78,129 @@ function durablePlanText(plan) {
   return String(plan?.memory ?? "");
 }
 
+function progression(features) {
+  return [Number(features?.ante) || 0, Number(features?.roundNumber) || 0];
+}
+
+function progressionNotAfter(left, right) {
+  const [leftAnte, leftRound] = progression(left);
+  const [rightAnte, rightRound] = progression(right);
+  return leftAnte < rightAnte || (leftAnte === rightAnte && leftRound <= rightRound);
+}
+
+function baseJokerSignature(features) {
+  return (features?.jokers ?? []).map((value) => String(value)).sort().join("\u0000");
+}
+
+function identityListSignature(values) {
+  return (values ?? []).map((value) => String(value)).sort().join("\u0000");
+}
+
+function numericObjectSubset(subset, superset) {
+  for (const [key, value] of Object.entries(subset ?? {})) {
+    if ((Number(value) || 0) > (Number(superset?.[key]) || 0)) return false;
+  }
+  return true;
+}
+
+function sameNumericTuple(left, right) {
+  return (left ?? []).length === (right ?? []).length &&
+    (left ?? []).every((value, index) => (Number(value) || 0) === (Number(right?.[index]) || 0));
+}
+
+function pokerLevelSignature(features) {
+  return (features?.pokerHands ?? [])
+    // A restart can expose the last scored hand with `played` already
+    // incremented on one side of the boundary but not the other.  Build
+    // strength is unchanged, so compare the durable hand values and ignore
+    // that one-frame counter.
+    .map((hand) => [
+      String(hand?.name ?? "?"),
+      Number(hand?.level) || 0,
+      Number(hand?.chips) || 0,
+      Number(hand?.mult) || 0,
+    ].join(":"))
+    .sort()
+    .join("\u0000");
+}
+
+function remainingDeckBoundaryCompatible(last, first) {
+  const left = last?.remainingDeck ?? {};
+  const right = first?.remainingDeck ?? {};
+  const sameScreen = last?.screen === first?.screen;
+  if (sameScreen) {
+    return Number(left.count) === Number(right.count) &&
+      JSON.stringify(left.rankCounts ?? {}) === JSON.stringify(right.rankCounts ?? {}) &&
+      JSON.stringify(left.suitCounts ?? {}) === JSON.stringify(right.suitCounts ?? {}) &&
+      JSON.stringify(left.modifiers ?? {}) === JSON.stringify(right.modifiers ?? {});
+  }
+  // On ROUND_EVAL the mod reports the reset/full deck, while the first
+  // SELECTING_HAND frame already excludes every card drawn so far.  The latter
+  // must therefore be a multiset subset, not an unrelated deck.
+  if (last?.screen === "ROUND_EVAL" && first?.screen === "SELECTING_HAND") {
+    return (Number(right.count) || 0) <= (Number(left.count) || 0) &&
+      numericObjectSubset(right.rankCounts, left.rankCounts) &&
+      numericObjectSubset(right.suitCounts, left.suitCounts) &&
+      numericObjectSubset(right.modifiers, left.modifiers);
+  }
+  return false;
+}
+
+function strictBoundarySignatureCompatible(last, first) {
+  if (!last || !first) return false;
+  if (!(last.screen === first.screen || (last.screen === "ROUND_EVAL" && first.screen === "SELECTING_HAND"))) {
+    return false;
+  }
+  if ((Number(last.money) || 0) !== (Number(first.money) || 0)) return false;
+  if (!sameNumericTuple(last.slots?.jokers, first.slots?.jokers)) return false;
+  if (!sameNumericTuple(last.slots?.consumables, first.slots?.consumables)) return false;
+  if (baseJokerSignature(last) !== baseJokerSignature(first)) return false;
+  if (identityListSignature(last.consumables) !== identityListSignature(first.consumables)) return false;
+  if (identityListSignature(last.usedVouchers) !== identityListSignature(first.usedVouchers)) return false;
+  // appearedJokers is observation history, not game state. A controller
+  // restart can reconstruct all durable state yet miss one prior shop offer;
+  // requiring exact equality would reject the verified 5964A4PN continuation.
+  if (pokerLevelSignature(last) !== pokerLevelSignature(first)) return false;
+  const leftPool = String(last.collectionSignature ?? "");
+  const rightPool = String(first.collectionSignature ?? "");
+  if (leftPool && rightPool && leftPool !== rightPool) return false;
+  return remainingDeckBoundaryCompatible(last, first);
+}
+
+function segmentBoundaryCompatible(segment, successor) {
+  const last = segment.lastFeatures;
+  const first = successor.firstFeatures;
+  if (!last || !first) return false;
+  const lastTime = Date.parse(segment.endedAt ?? "");
+  const nextTime = Date.parse(successor.startedAt ?? "");
+  if (!Number.isFinite(lastTime) || !Number.isFinite(nextTime) || nextTime < lastTime) return false;
+  if (nextTime - lastTime > SEGMENT_LINK_MAX_GAP_MS) return false;
+  const [lastAnte, lastRound] = progression(last);
+  const [nextAnte, nextRound] = progression(first);
+  // Ante-1 seeds are often deliberately replayed and are therefore ambiguous.
+  if (lastAnte <= 1) return false;
+  if (!progressionNotAfter(last, first)) return false;
+  if (nextAnte - lastAnte > 1 || nextRound - lastRound > 1) return false;
+  const exactBoundary = segment.lastExactFingerprint && successor.firstExactFingerprint &&
+    segment.lastExactFingerprint === successor.firstExactFingerprint;
+  const replayBoundary = segment.lastReplayFingerprint && successor.firstReplayFingerprint &&
+    segment.lastReplayFingerprint === successor.firstReplayFingerprint;
+  return Boolean(exactBoundary || replayBoundary || strictBoundarySignatureCompatible(last, first));
+}
+
 function hotEntry(row) {
+  const rawFeatures = parseJson(row.features_json, null);
+  const features = semanticNormalizeFeatures(rawFeatures, { canonicalVersion: true }) ?? {};
   return {
     id: Number(row.id),
-    episodeId: row.episode_id,
+    episodeId: row.credit_episode_id || row.episode_id,
+    trajectoryEpisodeId: row.episode_id,
     screen: row.screen,
     stateFingerprint: row.state_fingerprint,
-    replayFingerprint: row.replay_fingerprint,
+    replayFingerprint: Object.keys(features).length ? semanticReplayFingerprint(features) : row.replay_fingerprint,
     stateBucket: row.state_bucket,
     stateText: row.state_text,
-    features: parseJson(row.features_json, {}),
+    features,
     actionKey: row.action_key,
     actionMethod: row.action_method,
     action: parseJson(row.action_json, null),
@@ -91,6 +213,9 @@ function hotEntry(row) {
     returnReward: Number(row.return_reward) || 0,
     outcome: row.terminal_outcome,
     nextStateText: row.next_state_text,
+    compatibility: row.reward_compatibility,
+    trajectoryPolicyVersion: Number(row.trajectory_policy_version) || 0,
+    rewardVersion: Number(row.reward_version) || 0,
   };
 }
 
@@ -173,6 +298,33 @@ export class SemanticRagStore {
       CREATE INDEX IF NOT EXISTS idx_semantic_bucket ON semantic_experiences(state_bucket, action_key);
       CREATE INDEX IF NOT EXISTS idx_semantic_episode ON semantic_experiences(episode_id, id);
       CREATE INDEX IF NOT EXISTS idx_semantic_return ON semantic_experiences(return_reward, id DESC);
+      CREATE TABLE IF NOT EXISTS semantic_reward_labels (
+        experience_id INTEGER NOT NULL,
+        reward_version INTEGER NOT NULL,
+        immediate_reward REAL NOT NULL,
+        return_reward REAL NOT NULL,
+        terminal_outcome TEXT NOT NULL,
+        compatibility TEXT NOT NULL,
+        credit_episode_id TEXT NOT NULL DEFAULT '',
+        relabeled_at TEXT NOT NULL,
+        PRIMARY KEY(experience_id, reward_version),
+        FOREIGN KEY(experience_id) REFERENCES semantic_experiences(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_semantic_reward_hot
+        ON semantic_reward_labels(reward_version, terminal_outcome, experience_id DESC);
+      CREATE TABLE IF NOT EXISTS semantic_reward_migrations (
+        reward_version INTEGER PRIMARY KEY,
+        reward_signature TEXT NOT NULL,
+        completed_at TEXT NOT NULL,
+        episodes INTEGER NOT NULL,
+        transitions INTEGER NOT NULL,
+        exact_transitions INTEGER NOT NULL,
+        semantic_transitions INTEGER NOT NULL,
+        incompatible_transitions INTEGER NOT NULL,
+        corrected_outcomes INTEGER NOT NULL DEFAULT 0,
+        linked_segments INTEGER NOT NULL DEFAULT 0,
+        linked_transitions INTEGER NOT NULL DEFAULT 0
+      );
     `);
     const episodeColumns = new Set(
       this.db.prepare("PRAGMA table_info(semantic_episodes)").all().map((column) => String(column.name)),
@@ -180,28 +332,392 @@ export class SemanticRagStore {
     if (!episodeColumns.has("max_hand_score")) {
       this.db.exec("ALTER TABLE semantic_episodes ADD COLUMN max_hand_score REAL NOT NULL DEFAULT 0");
     }
+    const migrationColumns = new Set(
+      this.db.prepare("PRAGMA table_info(semantic_reward_migrations)").all().map((column) => String(column.name)),
+    );
+    if (!migrationColumns.has("reward_signature")) {
+      this.db.exec("ALTER TABLE semantic_reward_migrations ADD COLUMN reward_signature TEXT NOT NULL DEFAULT ''");
+    }
+    if (!migrationColumns.has("corrected_outcomes")) {
+      this.db.exec("ALTER TABLE semantic_reward_migrations ADD COLUMN corrected_outcomes INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!migrationColumns.has("linked_segments")) {
+      this.db.exec("ALTER TABLE semantic_reward_migrations ADD COLUMN linked_segments INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!migrationColumns.has("linked_transitions")) {
+      this.db.exec("ALTER TABLE semantic_reward_migrations ADD COLUMN linked_transitions INTEGER NOT NULL DEFAULT 0");
+    }
+    const labelColumns = new Set(
+      this.db.prepare("PRAGMA table_info(semantic_reward_labels)").all().map((column) => String(column.name)),
+    );
+    if (!labelColumns.has("credit_episode_id")) {
+      this.db.exec("ALTER TABLE semantic_reward_labels ADD COLUMN credit_episode_id TEXT NOT NULL DEFAULT ''");
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_semantic_reward_credit
+        ON semantic_reward_labels(reward_version, credit_episode_id, experience_id)
+    `);
+    this.rewardMigration = this.migrateRewards();
     this.#loadHot();
   }
 
   #loadHot() {
     if (!this.db) return;
     const rows = this.db.prepare(`
-      SELECT id, episode_id, screen, state_fingerprint, replay_fingerprint, state_bucket, state_text, features_json,
+      SELECT e.id, e.episode_id, e.screen, e.state_fingerprint, e.replay_fingerprint, e.state_bucket, e.state_text, e.features_json,
              action_key, action_method, action_json, action_template_json, action_summary, policy_source,
-             strategy, memory, immediate_reward, return_reward, terminal_outcome, next_state_text
-      FROM semantic_experiences
-      WHERE return_reward IS NOT NULL
-        AND terminal_outcome IN ('won', 'lost')
-        AND policy_version = ?
-      ORDER BY id DESC
+             strategy, memory, labels.immediate_reward, labels.return_reward, labels.terminal_outcome, next_state_text,
+             labels.compatibility AS reward_compatibility, labels.credit_episode_id,
+             e.policy_version AS trajectory_policy_version,
+             labels.reward_version
+      FROM semantic_experiences e
+      JOIN semantic_reward_labels labels ON labels.experience_id = e.id
+      WHERE labels.reward_version = ?
+        AND labels.terminal_outcome IN ('won', 'lost')
+        AND labels.compatibility IN ('exact', 'semantic')
+      ORDER BY e.id DESC
       LIMIT ?
-    `).all(SEMANTIC_POLICY_VERSION, this.hotLimit);
+    `).all(SEMANTIC_REWARD_VERSION, this.hotLimit);
     this.hot = rows.map(hotEntry);
     this.cache.clear();
   }
 
   get size() {
     return this.hot.length;
+  }
+
+  migrateRewards({ force = false } = {}) {
+    if (!this.db) return { enabled: false, rewardVersion: SEMANTIC_REWARD_VERSION };
+    const completedEpisodes = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM semantic_episodes WHERE outcome IN ('won', 'lost')
+    `).get().count) || 0;
+    const allEpisodes = this.db.prepare(`
+      SELECT episodes.episode_id, episodes.seed, episodes.deck, episodes.stake,
+             episodes.started_at, episodes.ended_at, episodes.outcome,
+             episodes.max_ante, episodes.max_round, episodes.max_hand_score,
+             first.features_json AS first_features_json,
+             first.state_fingerprint AS first_exact_fingerprint,
+             first.replay_fingerprint AS first_replay_fingerprint,
+             last.next_features_json AS last_features_json,
+             last.next_state_fingerprint AS last_exact_fingerprint,
+             last.next_replay_fingerprint AS last_replay_fingerprint
+      FROM semantic_episodes episodes
+      LEFT JOIN semantic_experiences first ON first.id = (
+        SELECT id FROM semantic_experiences WHERE episode_id = episodes.episode_id ORDER BY id LIMIT 1
+      )
+      LEFT JOIN semantic_experiences last ON last.id = (
+        SELECT id FROM semantic_experiences WHERE episode_id = episodes.episode_id ORDER BY id DESC LIMIT 1
+      )
+      ORDER BY episodes.started_at, episodes.episode_id
+    `).all().map((episode) => ({
+      ...episode,
+      firstFeatures: semanticNormalizeFeatures(parseJson(episode.first_features_json, null)),
+      lastFeatures: semanticNormalizeFeatures(parseJson(episode.last_features_json, null)),
+      startedAt: episode.started_at,
+      endedAt: episode.ended_at,
+      firstExactFingerprint: episode.first_exact_fingerprint,
+      firstReplayFingerprint: episode.first_replay_fingerprint,
+      lastExactFingerprint: episode.last_exact_fingerprint,
+      lastReplayFingerprint: episode.last_replay_fingerprint,
+    }));
+    const creditByEpisode = new Map();
+    const completed = allEpisodes.filter((episode) => new Set(["won", "lost"]).has(episode.outcome));
+    const linkCandidates = [];
+    for (const segment of allEpisodes.filter((episode) => episode.outcome === "interrupted")) {
+      for (const successor of completed.filter((successor) =>
+        successor.seed && successor.seed === segment.seed &&
+        successor.deck === segment.deck && successor.stake === segment.stake &&
+        segmentBoundaryCompatible(segment, successor)
+      )) {
+        linkCandidates.push({
+          segment,
+          successor,
+          gapMs: Date.parse(successor.startedAt) - Date.parse(segment.endedAt),
+        });
+      }
+    }
+    // Enforce a one-to-one restart boundary.  Greedy nearest-neighbour is
+    // deterministic and prevents several interrupted attempts from voting as
+    // prefixes of one later terminal run.
+    const assignedSegments = new Set();
+    const assignedSuccessors = new Set();
+    for (const candidate of linkCandidates.sort((left, right) =>
+      left.gapMs - right.gapMs ||
+      left.segment.episode_id.localeCompare(right.segment.episode_id) ||
+      left.successor.episode_id.localeCompare(right.successor.episode_id)
+    )) {
+      if (assignedSegments.has(candidate.segment.episode_id) ||
+          assignedSuccessors.has(candidate.successor.episode_id)) continue;
+      assignedSegments.add(candidate.segment.episode_id);
+      assignedSuccessors.add(candidate.successor.episode_id);
+      creditByEpisode.set(candidate.segment.episode_id, candidate.successor.episode_id);
+    }
+    const eligibleEpisodeIds = new Set([...completed.map((episode) => episode.episode_id), ...creditByEpisode.keys()]);
+    const eligibleTransitions = eligibleEpisodeIds.size
+      ? Number(this.db.prepare(`SELECT COUNT(*) AS count FROM semantic_experiences WHERE episode_id IN (${[...eligibleEpisodeIds].map(() => "?").join(",")})`).get(...eligibleEpisodeIds).count) || 0
+      : 0;
+    const existingLabels = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM semantic_reward_labels WHERE reward_version = ?
+    `).get(SEMANTIC_REWARD_VERSION).count) || 0;
+    const rewardSignature = `v${SEMANTIC_REWARD_VERSION}:outcome-anchor-2:segment-link-3:gamma=${this.discount}`;
+    const previous = this.db.prepare(`
+      SELECT * FROM semantic_reward_migrations WHERE reward_version = ?
+    `).get(SEMANTIC_REWARD_VERSION);
+    const staleLabels = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM semantic_reward_labels labels
+      JOIN semantic_experiences e ON e.id = labels.experience_id
+      JOIN semantic_episodes episodes ON episodes.episode_id = e.episode_id
+      WHERE labels.reward_version = ? AND (
+        (episodes.outcome IN ('won', 'lost') AND labels.credit_episode_id <> episodes.episode_id) OR
+        (episodes.outcome = 'lost' AND labels.terminal_outcome <> 'lost') OR
+        (episodes.outcome = 'interrupted' AND labels.credit_episode_id = episodes.episode_id)
+      )
+    `).get(SEMANTIC_REWARD_VERSION).count) || 0;
+    const currentCredits = this.db.prepare(`
+      SELECT e.episode_id,
+             MIN(labels.credit_episode_id) AS minimum_credit,
+             MAX(labels.credit_episode_id) AS maximum_credit
+      FROM semantic_reward_labels labels
+      JOIN semantic_experiences e ON e.id = labels.experience_id
+      WHERE labels.reward_version = ?
+      GROUP BY e.episode_id
+    `).all(SEMANTIC_REWARD_VERSION);
+    const completedEpisodeIds = new Set(completed.map((episode) => episode.episode_id));
+    const staleCreditAssignments = currentCredits.filter((row) => {
+      const expected = completedEpisodeIds.has(row.episode_id)
+        ? row.episode_id
+        : creditByEpisode.get(row.episode_id);
+      return !expected || row.minimum_credit !== expected || row.maximum_credit !== expected;
+    }).length;
+    const fullRelabel = force || staleLabels > 0 || staleCreditAssignments > 0 ||
+      existingLabels > eligibleTransitions || (previous && previous.reward_signature !== rewardSignature);
+    if (!fullRelabel && existingLabels === eligibleTransitions && previous?.reward_signature === rewardSignature) {
+      return {
+        rewardVersion: SEMANTIC_REWARD_VERSION,
+        episodes: completedEpisodes,
+        transitions: existingLabels,
+        exactTransitions: Number(previous?.exact_transitions) || 0,
+        semanticTransitions: Number(previous?.semantic_transitions) || 0,
+        incompatibleTransitions: Number(previous?.incompatible_transitions) || 0,
+        correctedOutcomes: Number(previous?.corrected_outcomes) || 0,
+        linkedSegments: Number(previous?.linked_segments) || 0,
+        linkedTransitions: Number(previous?.linked_transitions) || 0,
+        changed: false,
+      };
+    }
+
+    const episodes = this.db.prepare(`
+      SELECT episode_id, outcome, max_ante, max_round, max_hand_score,
+             COALESCE((SELECT MAX(money) FROM (
+               SELECT CAST(json_extract(features_json, '$.money') AS REAL) AS money
+               FROM semantic_experiences e2 WHERE e2.episode_id = semantic_episodes.episode_id
+               ORDER BY id DESC LIMIT 1
+             )), 0) AS final_money
+      FROM semantic_episodes
+      WHERE outcome IN ('won', 'lost')
+      ORDER BY started_at, episode_id
+    `).all();
+    for (const [segmentEpisodeId, creditEpisodeId] of creditByEpisode) {
+      const segment = allEpisodes.find((episode) => episode.episode_id === segmentEpisodeId);
+      const successor = allEpisodes.find((episode) => episode.episode_id === creditEpisodeId);
+      episodes.push({
+        episode_id: segmentEpisodeId,
+        outcome: successor.outcome,
+        max_ante: successor.max_ante,
+        max_round: successor.max_round,
+        // The best hand can live in the interrupted prefix (5964A4PN is a
+        // production example: 100565 in the prefix vs 53955 in the tail).
+        max_hand_score: Math.max(
+          Number(segment?.max_hand_score) || 0,
+          Number(successor.max_hand_score) || 0,
+        ),
+        final_money: Number(successor.lastFeatures?.money) || 0,
+        credit_episode_id: creditEpisodeId,
+        linked: true,
+      });
+    }
+    const groups = new Map();
+    for (const episode of episodes) {
+      const creditEpisodeId = episode.credit_episode_id || episode.episode_id;
+      const group = groups.get(creditEpisodeId) ?? {
+        creditEpisodeId,
+        trajectories: [],
+      };
+      group.trajectories.push(episode);
+      groups.set(creditEpisodeId, group);
+    }
+    for (const group of groups.values()) {
+      group.trajectories.sort((left, right) => {
+        const leftTerminal = left.episode_id === group.creditEpisodeId ? 1 : 0;
+        const rightTerminal = right.episode_id === group.creditEpisodeId ? 1 : 0;
+        if (leftTerminal !== rightTerminal) return leftTerminal - rightTerminal;
+        const leftAt = allEpisodes.find((episode) => episode.episode_id === left.episode_id)?.startedAt ?? "";
+        const rightAt = allEpisodes.find((episode) => episode.episode_id === right.episode_id)?.startedAt ?? "";
+        return leftAt.localeCompare(rightAt) || left.episode_id.localeCompare(right.episode_id);
+      });
+    }
+    const transitionQuery = this.db.prepare(`
+      SELECT id, action_json, features_json, next_features_json
+      FROM semantic_experiences WHERE episode_id = ? ORDER BY id
+    `);
+    const upsert = this.db.prepare(`
+      INSERT INTO semantic_reward_labels (
+        experience_id, reward_version, immediate_reward, return_reward,
+        terminal_outcome, compatibility, credit_episode_id, relabeled_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(experience_id, reward_version) DO UPDATE SET
+        immediate_reward=excluded.immediate_reward,
+        return_reward=excluded.return_reward,
+        terminal_outcome=excluded.terminal_outcome,
+        compatibility=excluded.compatibility,
+        credit_episode_id=excluded.credit_episode_id,
+        relabeled_at=excluded.relabeled_at
+    `);
+    const now = new Date().toISOString();
+    let transitions = 0;
+    let exactTransitions = 0;
+    let semanticTransitions = 0;
+    let incompatibleTransitions = 0;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // Any changed migration is recomputed as whole canonical trajectories.
+      // This keeps a linked prefix and terminal tail in one backward return
+      // pass instead of granting the prefix a second, standalone terminal.
+      this.db.prepare("DELETE FROM semantic_reward_labels WHERE reward_version = ?").run(SEMANTIC_REWARD_VERSION);
+      for (const group of groups.values()) {
+        const terminalEpisode = group.trajectories.find((episode) => episode.episode_id === group.creditEpisodeId);
+        if (!terminalEpisode) continue;
+        const rewardable = [];
+        let reconstructedMaxHandScore = 0;
+        let lastFeatures = null;
+        for (const trajectory of group.trajectories) {
+          for (const row of transitionQuery.all(trajectory.episode_id)) {
+            const before = parseJson(row.features_json, null);
+            const after = parseJson(row.next_features_json, null);
+            lastFeatures = semanticNormalizeFeatures(after);
+            const beforeCompatibility = semanticFeatureCompatibility(before);
+            const afterCompatibility = semanticFeatureCompatibility(after);
+            const compatibility = beforeCompatibility === "incompatible" || afterCompatibility === "incompatible"
+              ? "incompatible"
+              : beforeCompatibility === "exact" && afterCompatibility === "exact" ? "exact" : "semantic";
+            const action = parseJson(row.action_json, null);
+            reconstructedMaxHandScore = Math.max(
+              reconstructedMaxHandScore,
+              semanticPlayedHandScoreFromFeatures(before, action, after),
+            );
+            const immediateReward = compatibility === "incompatible"
+              ? 0
+              : semanticTransitionRewardFromFeatures(before, action, after);
+            rewardable.push({ id: Number(row.id), immediateReward: Number(immediateReward) || 0, compatibility });
+          }
+        }
+        const finalState = {
+          ante_num: Number(terminalEpisode.max_ante) || 0,
+          round_num: Number(terminalEpisode.max_round) || 0,
+          trainingMaxHandScore: Math.max(...group.trajectories.map((episode) => Number(episode.max_hand_score) || 0)),
+          money: Number(terminalEpisode.final_money) || 0,
+        };
+        finalState.trainingMaxHandScore = Math.max(finalState.trainingMaxHandScore, reconstructedMaxHandScore);
+        const lastScore = Number(lastFeatures?.round?.score) || 0;
+        const lastTarget = Number(lastFeatures?.blind?.target) || 0;
+        const provenWin = terminalEpisode.outcome === "won" && (
+          Number(terminalEpisode.max_ante) > 8 ||
+          (lastFeatures?.screen === "ROUND_EVAL" && lastFeatures?.won === true && lastTarget > 0 && lastScore >= lastTarget)
+        );
+        const rewardOutcome = terminalEpisode.outcome === "won" && !provenWin ? "lost" : terminalEpisode.outcome;
+        const returns = semanticDiscountedReturns(rewardable, rewardOutcome, finalState, this.discount);
+        for (const transition of rewardable) {
+          const returnReward = returns.get(transition.id) ?? 0;
+          upsert.run(
+            transition.id,
+            SEMANTIC_REWARD_VERSION,
+            transition.immediateReward,
+            returnReward,
+            rewardOutcome,
+            transition.compatibility,
+            group.creditEpisodeId,
+            now,
+          );
+          transitions += 1;
+          if (transition.compatibility === "exact") exactTransitions += 1;
+          else if (transition.compatibility === "semantic") semanticTransitions += 1;
+          else incompatibleTransitions += 1;
+        }
+      }
+      const totals = this.db.prepare(`
+        SELECT COUNT(*) AS transitions,
+               SUM(CASE WHEN compatibility = 'exact' THEN 1 ELSE 0 END) AS exact_transitions,
+               SUM(CASE WHEN compatibility = 'semantic' THEN 1 ELSE 0 END) AS semantic_transitions,
+               SUM(CASE WHEN compatibility = 'incompatible' THEN 1 ELSE 0 END) AS incompatible_transitions
+        FROM semantic_reward_labels WHERE reward_version = ?
+      `).get(SEMANTIC_REWARD_VERSION);
+      const correctedOutcomeTotal = Number(this.db.prepare(`
+        SELECT COUNT(DISTINCT e.episode_id) AS count
+        FROM semantic_reward_labels labels
+        JOIN semantic_experiences e ON e.id = labels.experience_id
+        JOIN semantic_episodes episodes ON episodes.episode_id = e.episode_id
+        WHERE labels.reward_version = ? AND episodes.outcome = 'won'
+          AND labels.terminal_outcome = 'lost'
+      `).get(SEMANTIC_REWARD_VERSION).count) || 0;
+      const linkedTotals = this.db.prepare(`
+        SELECT COUNT(DISTINCT e.episode_id) AS segments, COUNT(*) AS transitions
+        FROM semantic_reward_labels labels
+        JOIN semantic_experiences e ON e.id = labels.experience_id
+        WHERE labels.reward_version = ? AND labels.credit_episode_id <> e.episode_id
+      `).get(SEMANTIC_REWARD_VERSION);
+      this.db.prepare(`
+        INSERT INTO semantic_reward_migrations (
+          reward_version, reward_signature, completed_at, episodes, transitions, exact_transitions,
+          semantic_transitions, incompatible_transitions, corrected_outcomes,
+          linked_segments, linked_transitions
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(reward_version) DO UPDATE SET
+          reward_signature=excluded.reward_signature, completed_at=excluded.completed_at, episodes=excluded.episodes,
+          transitions=excluded.transitions, exact_transitions=excluded.exact_transitions,
+          semantic_transitions=excluded.semantic_transitions,
+          incompatible_transitions=excluded.incompatible_transitions,
+          corrected_outcomes=excluded.corrected_outcomes,
+          linked_segments=excluded.linked_segments,
+          linked_transitions=excluded.linked_transitions
+      `).run(
+        SEMANTIC_REWARD_VERSION, rewardSignature, now, completedEpisodes, Number(totals.transitions) || 0,
+        Number(totals.exact_transitions) || 0, Number(totals.semantic_transitions) || 0,
+        Number(totals.incompatible_transitions) || 0, correctedOutcomeTotal,
+        Number(linkedTotals.segments) || 0, Number(linkedTotals.transitions) || 0,
+      );
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    const migrationTotals = this.db.prepare(`
+      SELECT transitions, exact_transitions, semantic_transitions, incompatible_transitions, corrected_outcomes,
+             linked_segments, linked_transitions
+      FROM semantic_reward_migrations WHERE reward_version = ?
+    `).get(SEMANTIC_REWARD_VERSION);
+    return {
+      rewardVersion: SEMANTIC_REWARD_VERSION,
+      episodes: completedEpisodes,
+      transitions: Number(migrationTotals.transitions) || 0,
+      exactTransitions: Number(migrationTotals.exact_transitions) || 0,
+      semanticTransitions: Number(migrationTotals.semantic_transitions) || 0,
+      incompatibleTransitions: Number(migrationTotals.incompatible_transitions) || 0,
+      correctedOutcomes: Number(migrationTotals.corrected_outcomes) || 0,
+      linkedSegments: Number(migrationTotals.linked_segments) || 0,
+      linkedTransitions: Number(migrationTotals.linked_transitions) || 0,
+      relabeledTransitions: transitions,
+      changed: true,
+    };
+  }
+
+  rewardMigrationStatus() {
+    if (!this.db) return { enabled: false, rewardVersion: SEMANTIC_REWARD_VERSION };
+    return {
+      ...this.rewardMigration,
+      rawTrajectorySchemaVersion: RAW_TRAJECTORY_SCHEMA_VERSION,
+      rawTrajectoriesImmutable: true,
+    };
   }
 
   beginEpisode({ episodeId, runId, state }) {
@@ -223,6 +739,148 @@ export class SemanticRagStore {
       SEMANTIC_POLICY_VERSION,
     );
     return episodeId;
+  }
+
+  resumeEpisode({ runId, state }) {
+    if (!this.db || !runId || !state) return null;
+    const seed = String(state.seed ?? "");
+    if (!seed) return null;
+    const deck = String(state.deck ?? "");
+    const stake = String(state.stake ?? "");
+    const ante = Number(state.ante_num) || 0;
+    const round = Number(state.round_num) || 0;
+    const currentFeatures = semanticStateFeatures(state);
+    const currentExactFingerprint = semanticExactFingerprint(state);
+    const currentReplayFingerprint = semanticReplayFingerprint(currentFeatures);
+    const earliestEndedAt = new Date(Date.now() - SEGMENT_LINK_MAX_GAP_MS).toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const candidates = this.db.prepare(`
+        SELECT episodes.episode_id, episodes.run_id, episodes.ended_at,
+               latest.next_features_json, latest.next_state_fingerprint,
+               latest.next_replay_fingerprint
+        FROM semantic_episodes episodes
+        LEFT JOIN semantic_experiences latest ON latest.id = (
+          SELECT id FROM semantic_experiences
+          WHERE episode_id = episodes.episode_id ORDER BY id DESC LIMIT 1
+        )
+        WHERE episodes.outcome = 'interrupted'
+          AND episodes.seed = ? AND episodes.deck = ? AND episodes.stake = ?
+          AND episodes.ended_at >= ?
+        ORDER BY episodes.ended_at DESC, episodes.started_at DESC
+      `).all(seed, deck, stake, earliestEndedAt);
+      const matches = [];
+      for (const candidate of candidates) {
+        const latest = semanticNormalizeFeatures(parseJson(candidate.next_features_json, null));
+        if (!latest) continue;
+        // Ante 1 fixed-seed restarts are observationally indistinguishable
+        // from deliberate replays.  Start a new episode rather than merging.
+        if ((Number(latest.ante) || 0) <= 1) continue;
+        const notEarlier = ante > latest.ante || (ante === latest.ante && round >= latest.roundNumber);
+        if (!notEarlier) continue;
+        const exactMatch = candidate.next_state_fingerprint &&
+          candidate.next_state_fingerprint === currentExactFingerprint;
+        const replayMatch = candidate.next_replay_fingerprint &&
+          candidate.next_replay_fingerprint === currentReplayFingerprint;
+        if (!exactMatch && !replayMatch && !strictBoundarySignatureCompatible(latest, currentFeatures)) continue;
+        matches.push({ candidate, latest });
+      }
+      // Multiple indistinguishable historical attempts are ambiguous.  Never
+      // pick one merely because it happens to sort first.
+      if (matches.length !== 1) {
+        this.db.exec("COMMIT");
+        return null;
+      }
+      const selected = matches[0];
+      const updated = this.db.prepare(`
+        UPDATE semantic_episodes
+        SET run_id = ?, outcome = NULL, ended_at = NULL,
+            max_ante = MAX(max_ante, ?), max_round = MAX(max_round, ?)
+        WHERE episode_id = ? AND outcome = 'interrupted'
+      `).run(runId, ante, round, selected.candidate.episode_id);
+      if (Number(updated.changes) !== 1) {
+        this.db.exec("ROLLBACK");
+        return null;
+      }
+      this.db.exec("COMMIT");
+      return {
+        episodeId: selected.candidate.episode_id,
+        previousRunId: selected.candidate.run_id,
+        runId,
+        lastAnte: selected.latest.ante,
+        lastRound: selected.latest.roundNumber,
+      };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  allRewardEvidence({ includeFeatures = true } = {}) {
+    if (!this.db) return [];
+    return this.db.prepare(`
+      SELECT e.episode_id, labels.credit_episode_id, labels.terminal_outcome, labels.return_reward,
+             e.policy_source, e.action_key, e.action_template_json,
+             e.features_json, labels.compatibility, e.policy_version
+      FROM semantic_experiences e
+      JOIN semantic_reward_labels labels ON labels.experience_id = e.id
+      WHERE labels.reward_version = ? AND labels.compatibility IN ('exact', 'semantic')
+      ORDER BY e.id
+    `).all(SEMANTIC_REWARD_VERSION).map((row) => {
+      const features = semanticNormalizeFeatures(parseJson(row.features_json, null), { canonicalVersion: true });
+      const actionTemplate = parseJson(row.action_template_json, {});
+      const evidence = {
+        episodeId: row.credit_episode_id || row.episode_id,
+        trajectoryEpisodeId: row.episode_id,
+        outcome: row.terminal_outcome,
+        returnReward: Number(row.return_reward) || 0,
+        source: row.policy_source,
+        decisionKey: features ? semanticDecisionKey(features) : null,
+        actionKey: features ? semanticHistoricalActionKey({ features, actionTemplate }) : row.action_key,
+        actionTemplate,
+        compatibility: row.compatibility,
+        trajectoryPolicyVersion: Number(row.policy_version) || 0,
+      };
+      if (includeFeatures) evidence.features = features;
+      return evidence;
+    });
+  }
+
+  /**
+   * Return only the rows whose current reward migration credits the completed
+   * canonical episode. This is the episode-boundary delta consumed by the
+   * in-memory semantic-prior index; it avoids re-reading and JSON-parsing the
+   * entire historical table after every game.
+   */
+  rewardEvidenceForCreditEpisode(episodeId, { includeFeatures = true } = {}) {
+    if (!this.db || !episodeId) return [];
+    return this.db.prepare(`
+      SELECT e.episode_id, labels.credit_episode_id, labels.terminal_outcome, labels.return_reward,
+             e.policy_source, e.action_key, e.action_template_json,
+             e.features_json, labels.compatibility, e.policy_version
+      FROM semantic_reward_labels labels
+      JOIN semantic_experiences e ON e.id = labels.experience_id
+      WHERE labels.reward_version = ? AND labels.credit_episode_id = ?
+        AND labels.compatibility IN ('exact', 'semantic')
+      ORDER BY e.id
+    `).all(SEMANTIC_REWARD_VERSION, episodeId).map((row) => {
+      const features = semanticNormalizeFeatures(parseJson(row.features_json, null), { canonicalVersion: true });
+      const actionTemplate = parseJson(row.action_template_json, {});
+      const evidence = {
+        episodeId: row.credit_episode_id || row.episode_id,
+        trajectoryEpisodeId: row.episode_id,
+        outcome: row.terminal_outcome,
+        returnReward: Number(row.return_reward) || 0,
+        source: row.policy_source,
+        decisionKey: features ? semanticDecisionKey(features) : null,
+        actionKey: features ? semanticHistoricalActionKey({ features, actionTemplate }) : row.action_key,
+        actionTemplate,
+        compatibility: row.compatibility,
+        trajectoryPolicyVersion: Number(row.policy_version) || 0,
+      };
+      if (includeFeatures) evidence.features = features;
+      return evidence;
+    });
   }
 
   recordTransition({ runId, episodeId, step, state, action, nextState, source, plan, usage, handScore: measuredHandScore }) {
@@ -310,6 +968,7 @@ export class SemanticRagStore {
       this.db.exec("ROLLBACK");
       throw error;
     }
+    this.rewardMigration = this.migrateRewards();
     this.#loadHot();
     return {
       episodeId,
@@ -340,10 +999,11 @@ export class SemanticRagStore {
         searched: 0,
         truncated: false,
         cached: false,
+        evidence: [],
         policyVersion: SEMANTIC_POLICY_VERSION,
       };
     }
-    const features = semanticStateFeatures(state);
+    const features = semanticNormalizeFeatures(semanticStateFeatures(state), { canonicalVersion: true });
     const replayFingerprint = semanticReplayFingerprint(features);
     const cacheKey = `${replayFingerprint}\u0000${topK}`;
     const cached = this.cache.get(cacheKey);
@@ -369,9 +1029,30 @@ export class SemanticRagStore {
       candidates.push({ entry, similarity });
     }
     candidates.sort((left, right) => right.similarity - left.similarity || right.entry.id - left.entry.id);
+    const evidence = candidates.slice(0, 256).map(({ entry, similarity }) => ({
+      episodeId: entry.episodeId,
+      outcome: entry.outcome,
+      returnReward: entry.returnReward,
+      similarity: Math.round(similarity * 1_000) / 1_000,
+      actionTemplate: entry.actionTemplate,
+      source: entry.source,
+      features: entry.features,
+    }));
+
+    // A restarted run can contribute transitions on both sides of the
+    // boundary.  Keep transition-level evidence for inspection above, but let
+    // each canonical episode cast at most one vote for an action group.
+    const votingCandidates = [];
+    const seenEpisodeActions = new Set();
+    for (const candidate of candidates) {
+      const voteKey = `${candidate.entry.episodeId}\u0000${candidate.entry.actionKey}`;
+      if (seenEpisodeActions.has(voteKey)) continue;
+      seenEpisodeActions.add(voteKey);
+      votingCandidates.push(candidate);
+    }
 
     const groupMap = new Map();
-    for (const candidate of candidates) {
+    for (const candidate of votingCandidates) {
       const entry = candidate.entry;
       const group = groupMap.get(entry.actionKey) ?? {
         actionKey: entry.actionKey,
@@ -411,9 +1092,9 @@ export class SemanticRagStore {
       group.losses += entry.outcome === "lost" ? 1 : 0;
       if (entry.outcome === "won") group.winningEpisodeIds.add(entry.episodeId);
       if (entry.outcome === "lost") group.losingEpisodeIds.add(entry.episodeId);
-      if (entry.replayFingerprint === replayFingerprint) {
+      if (entry.compatibility === "exact" && entry.replayFingerprint === replayFingerprint) {
         group.exactReplaySamples += 1;
-        group.exactReplayTrustedSamples += trustedSource(entry.source) ? 1 : 0;
+        group.exactReplayTrustedSamples += trustedSource(entry.source) && entry.compatibility === "exact" ? 1 : 0;
         group.exactReturnWeight += weight;
         group.exactReturnSum += entry.returnReward * weight;
         group.exactPositive += entry.returnReward > 0 ? 1 : 0;
@@ -467,6 +1148,8 @@ export class SemanticRagStore {
       truncated,
       cached: false,
       policyVersion: SEMANTIC_POLICY_VERSION,
+      rewardVersion: SEMANTIC_REWARD_VERSION,
+      evidence,
     };
     if (items.length) this.retrievalStats.hits += 1;
     this.cache.set(cacheKey, result);
@@ -556,20 +1239,27 @@ export class SemanticRagStore {
              SUM(CASE WHEN outcome IN ('won', 'lost') AND max_hand_score >= 100000 THEN 1 ELSE 0 END) AS hundred_thousand,
              SUM(CASE WHEN outcome IN ('won', 'lost') AND max_hand_score >= 1000000 THEN 1 ELSE 0 END) AS million
       FROM semantic_episodes
-      WHERE policy_version = ?
-    `).get(SEMANTIC_POLICY_VERSION);
+    `).get();
     const transitions = this.db.prepare(`
       SELECT COUNT(*) AS total,
              SUM(CASE WHEN return_reward IS NOT NULL THEN 1 ELSE 0 END) AS learned,
              SUM(CASE WHEN terminal_outcome = 'won' THEN 1 ELSE 0 END) AS won,
              SUM(CASE WHEN terminal_outcome = 'lost' THEN 1 ELSE 0 END) AS lost,
              SUM(CASE WHEN terminal_outcome = 'lost' AND return_reward > 0 THEN 1 ELSE 0 END) AS positiveLosses
-      FROM semantic_experiences
-      WHERE policy_version = ?
-    `).get(SEMANTIC_POLICY_VERSION);
+      FROM semantic_reward_labels
+      WHERE reward_version = ?
+    `).get(SEMANTIC_REWARD_VERSION);
+    const trajectoryVersions = this.db.prepare(`
+      SELECT policy_version AS policyVersion, COUNT(*) AS transitions
+      FROM semantic_experiences GROUP BY policy_version ORDER BY policy_version
+    `).all().map((row) => ({
+      policyVersion: Number(row.policyVersion),
+      transitions: Number(row.transitions) || 0,
+    }));
     return {
       enabled: true,
       policyVersion: SEMANTIC_POLICY_VERSION,
+      rewardVersion: SEMANTIC_REWARD_VERSION,
       episodes: Number(episodes.total) || 0,
       completedEpisodes: Number(episodes.completed) || 0,
       wonEpisodes: Number(episodes.won) || 0,
@@ -587,6 +1277,8 @@ export class SemanticRagStore {
       hot: this.hot.length,
       retrievals: { ...this.retrievalStats },
       databasePath: this.databasePath,
+      trajectoryVersions,
+      rewardMigration: { ...this.rewardMigration },
     };
   }
 
@@ -600,13 +1292,12 @@ export class SemanticRagStore {
              AVG(max_ante) AS average_ante,
              AVG(max_round) AS average_round
       FROM semantic_episodes
-      WHERE policy_version = ?
-        AND outcome IN ('won', 'lost')
+      WHERE outcome IN ('won', 'lost')
         AND deck <> ''
         AND (? = '' OR UPPER(stake) = ?)
       GROUP BY UPPER(deck)
       ORDER BY UPPER(deck)
-    `).all(SEMANTIC_POLICY_VERSION, normalizedStake, normalizedStake);
+    `).all(normalizedStake, normalizedStake);
     return rows.map((row) => ({
       deck: row.deck,
       trials: Number(row.trials) || 0,
@@ -621,15 +1312,16 @@ export class SemanticRagStore {
     return this.db.prepare(`
       SELECT screen, action_method AS method, action_summary AS action,
              COUNT(*) AS samples,
-             ROUND(AVG(return_reward), 3) AS averageReturn,
-             SUM(CASE WHEN terminal_outcome = 'won' THEN 1 ELSE 0 END) AS wins,
-             SUM(CASE WHEN terminal_outcome = 'lost' THEN 1 ELSE 0 END) AS losses
-      FROM semantic_experiences
-      WHERE return_reward IS NOT NULL AND policy_version = ?
-      GROUP BY screen, action_key
+             ROUND(AVG(labels.return_reward), 3) AS averageReturn,
+             SUM(CASE WHEN labels.terminal_outcome = 'won' THEN 1 ELSE 0 END) AS wins,
+             SUM(CASE WHEN labels.terminal_outcome = 'lost' THEN 1 ELSE 0 END) AS losses
+      FROM semantic_experiences e
+      JOIN semantic_reward_labels labels ON labels.experience_id = e.id
+      WHERE labels.reward_version = ? AND labels.compatibility IN ('exact', 'semantic')
+      GROUP BY e.screen, e.action_key
       ORDER BY samples DESC, averageReturn DESC
       LIMIT ?
-    `).all(SEMANTIC_POLICY_VERSION, limit);
+    `).all(SEMANTIC_REWARD_VERSION, limit);
   }
 
   close() {

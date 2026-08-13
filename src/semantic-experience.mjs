@@ -2,11 +2,11 @@ import { createHash } from "node:crypto";
 
 import { balatrobotStateFingerprint } from "./balatrobot-policy.mjs";
 
-// Version 5 changes the objective from merely clearing blinds to a staged
-// survival -> scaling -> high-score objective. Older returns remain on disk,
-// but must not be mixed with this policy because they flatten every score above
-// the blind target into almost the same reward.
+// Policy/trajectory versions describe how a state and action were captured.
+// Reward versions are deliberately independent: changing credit assignment
+// must not make an otherwise compatible historical trajectory disappear.
 export const SEMANTIC_POLICY_VERSION = 5;
+export const SEMANTIC_REWARD_VERSION = 6;
 const ROUND_COMPLETION_STATES = new Set(["ROUND_EVAL", "SHOP"]);
 
 function cards(area) {
@@ -129,6 +129,92 @@ function pokerTargets(pokerHands) {
     .sort((left, right) => right.level - left.level || right.played - left.played || right.mult - left.mult)
     .slice(0, 4)
     .map((hand) => `${hand.name}:L${hand.level}`);
+}
+
+// Old trajectories are immutable and intentionally keep their original
+// feature version.  This adapter supplies fields introduced by later policies
+// so v1-v5 trajectories can still participate in semantic retrieval and reward
+// relabelling without rewriting their raw JSON.
+export function semanticNormalizeFeatures(value, { canonicalVersion = false } = {}) {
+  if (!value || typeof value !== "object" || typeof value.screen !== "string") return null;
+  const features = structuredClone(value);
+  features.version = canonicalVersion ? SEMANTIC_POLICY_VERSION : finite(features.version, 1);
+  features.ante = finite(features.ante, 0);
+  features.roundNumber = finite(features.roundNumber, 0);
+  features.money = finite(features.money, 0);
+  features.deck = String(features.deck ?? "");
+  features.stake = String(features.stake ?? "");
+  features.blind = features.blind && typeof features.blind === "object" ? features.blind : {};
+  features.blind = {
+    type: String(features.blind.type ?? ""),
+    name: String(features.blind.name ?? ""),
+    target: finite(features.blind.target, 0),
+  };
+  features.round = features.round && typeof features.round === "object" ? features.round : {};
+  const score = finite(features.round.score, 0);
+  features.round = {
+    score,
+    pressure: finite(
+      features.round.pressure,
+      features.blind.target > 0 ? clamp(score / features.blind.target, 0, 3) : 0,
+    ),
+    handsLeft: finite(features.round.handsLeft, 0),
+    discardsLeft: finite(features.round.discardsLeft, 0),
+    rerollCost: finite(features.round.rerollCost, 0),
+  };
+  for (const field of [
+    "hand", "jokers", "consumables", "shop", "voucherOffers", "packOffers", "openedPack",
+    "usedVouchers", "appearedJokers", "pokerHands", "tokens",
+  ]) {
+    features[field] = Array.isArray(features[field]) ? features[field] : [];
+  }
+  features.collectionSignature = String(features.collectionSignature ?? "");
+  features.remainingDeck = features.remainingDeck && typeof features.remainingDeck === "object"
+    ? features.remainingDeck
+    : {};
+  features.remainingDeck = {
+    count: finite(features.remainingDeck.count, 0),
+    rankCounts: features.remainingDeck.rankCounts && typeof features.remainingDeck.rankCounts === "object"
+      ? features.remainingDeck.rankCounts
+      : {},
+    suitCounts: features.remainingDeck.suitCounts && typeof features.remainingDeck.suitCounts === "object"
+      ? features.remainingDeck.suitCounts
+      : {},
+    modifiers: features.remainingDeck.modifiers && typeof features.remainingDeck.modifiers === "object"
+      ? features.remainingDeck.modifiers
+      : {},
+  };
+  const oldStrategy = features.strategy && typeof features.strategy === "object" ? features.strategy : {};
+  features.strategy = {
+    phase: String(oldStrategy.phase ?? strategyPhase(features.ante)),
+    economy: String(oldStrategy.economy ?? economyBand(features.money)),
+    jokerKeys: Array.isArray(oldStrategy.jokerKeys)
+      ? oldStrategy.jokerKeys
+      : features.jokers.map((entry) => String(entry).split("+")[0]).sort(),
+    pokerTargets: Array.isArray(oldStrategy.pokerTargets)
+      ? oldStrategy.pokerTargets
+      : pokerTargets(features.pokerHands),
+    handShape: oldStrategy.handShape && typeof oldStrategy.handShape === "object"
+      ? oldStrategy.handShape
+      : { rankGroups: [], suitGroups: [], distinctRanks: 0, distinctSuits: 0 },
+  };
+  for (const field of ["rankGroups", "suitGroups"]) {
+    features.strategy.handShape[field] = Array.isArray(features.strategy.handShape[field])
+      ? features.strategy.handShape[field]
+      : [];
+  }
+  return features;
+}
+
+export function semanticFeatureCompatibility(value) {
+  const normalized = semanticNormalizeFeatures(value);
+  if (!normalized || !normalized.screen || !Number.isFinite(normalized.ante)) return "incompatible";
+  const sourceVersion = finite(value?.version, 1);
+  const hasExactSafetyFields = sourceVersion >= 4 &&
+    Object.hasOwn(value, "collectionSignature") &&
+    Object.hasOwn(value, "appearedJokers") &&
+    value.strategy && typeof value.strategy === "object";
+  return hasExactSafetyFields ? "exact" : "semantic";
 }
 
 function objectTokens(prefix, value) {
@@ -432,19 +518,41 @@ function scorePressure(state) {
 }
 
 export function semanticTransitionReward(before, action, after) {
+  return semanticTransitionRewardFromFeatures(
+    semanticStateFeatures(before),
+    action,
+    semanticStateFeatures(after),
+  );
+}
+
+export function semanticPlayedHandScoreFromFeatures(beforeValue, action, afterValue) {
+  const before = semanticNormalizeFeatures(beforeValue);
+  const after = semanticNormalizeFeatures(afterValue);
+  if (!before || !after) return 0;
+  if (action?.method !== "play") return 0;
+  const beforeScore = finite(before?.round?.score, 0);
+  const afterScore = finite(after?.round?.score, 0);
+  const sameRound = finite(before?.roundNumber, -1) === finite(after?.roundNumber, -2);
+  return sameRound && afterScore > beforeScore ? afterScore - beforeScore : 0;
+}
+
+export function semanticTransitionRewardFromFeatures(beforeValue, action, afterValue) {
+  const before = semanticNormalizeFeatures(beforeValue);
+  const after = semanticNormalizeFeatures(afterValue);
+  if (!before || !after) return null;
   let reward = 0;
-  const beforeAnte = finite(before?.ante_num, 0);
-  const afterAnte = finite(after?.ante_num, beforeAnte);
-  const beforeRound = finite(before?.round_num, 0);
-  const afterRound = finite(after?.round_num, beforeRound);
+  const beforeAnte = finite(before.ante, 0);
+  const afterAnte = finite(after.ante, beforeAnte);
+  const beforeRound = finite(before.roundNumber, 0);
+  const afterRound = finite(after.roundNumber, beforeRound);
   reward += Math.max(0, afterAnte - beforeAnte) * 1.25;
   reward += Math.max(0, afterRound - beforeRound) * 0.45;
 
-  if (before?.state === "SELECTING_HAND") {
-    reward += (scorePressure(after) - scorePressure(before)) * 1.5;
-    if (ROUND_COMPLETION_STATES.has(after?.state)) reward += 0.8;
+  if (before.screen === "SELECTING_HAND") {
+    reward += (after.round.pressure - before.round.pressure) * 1.5;
+    if (ROUND_COMPLETION_STATES.has(after.screen)) reward += 0.8;
   }
-  const handScore = semanticPlayedHandScore(before, action, after);
+  const handScore = semanticPlayedHandScoreFromFeatures(before, action, after);
   if (handScore > 0) {
     // Give the learner a small, smooth signal for better hands without letting
     // one hand overwhelm survival. The episode peak supplies the long-horizon
@@ -508,7 +616,13 @@ export function semanticTerminalBonus(outcome, finalState) {
   if (outcome === "lost") {
     const unspentMoneyPenalty = Math.min(3, Math.max(0, finite(finalState?.money, 0)) / 20);
     const earlyCollapsePenalty = Math.max(0, 5 - ante) * 0.75;
-    return -10 + Math.min(12, ante) * 0.3 + scoreBonus - unspentMoneyPenalty - earlyCollapsePenalty;
+    // A failed run stays negative. High-score milestones make it less bad (and
+    // therefore preserve useful ordering) but must not turn thousands of steps
+    // from a losing trajectory into positive demonstrations.
+    return Math.min(
+      -0.5,
+      -10 + Math.min(12, ante) * 0.3 + Math.min(8, scoreBonus) - unspentMoneyPenalty - earlyCollapsePenalty,
+    );
   }
   return 0;
 }
@@ -517,11 +631,25 @@ export function semanticDiscountedReturns(transitions, outcome, finalState, disc
   const result = new Map();
   const terminal = semanticTerminalBonus(outcome, finalState);
   const gamma = clamp(discount, 0, 1);
-  let futureReturn = terminal;
+  let localFuture = 0;
   for (let index = transitions.length - 1; index >= 0; index--) {
     const transition = transitions[index];
-    futureReturn = finite(transition.immediateReward, 0) + gamma * futureReturn;
-    result.set(Number(transition.id), Math.round(clamp(futureReturn, -24, 30) * 1_000) / 1_000);
+    // Dense per-click rewards are deliberately a bounded ranking signal. The
+    // terminal outcome is propagated separately with a non-vanishing weight,
+    // so a 200-step loss cannot forget that it lost merely because gamma^200
+    // is tiny. Later actions receive more terminal credit/blame than early ones.
+    localFuture = clamp(
+      finite(transition.immediateReward, 0) * 0.12 + gamma * localFuture,
+      -0.9,
+      0.9,
+    );
+    const proximity = transitions.length <= 1 ? 1 : index / (transitions.length - 1);
+    const terminalWeight = 0.5 + 0.5 * proximity;
+    const denseScale = outcome === "lost" ? 0.18 : 1;
+    let value = terminal * terminalWeight + localFuture * denseScale;
+    if (outcome === "lost") value = Math.min(-0.05, value);
+    if (outcome === "won") value = Math.max(0.05, value);
+    result.set(Number(transition.id), Math.round(clamp(value, -24, 30) * 1_000) / 1_000);
   }
   return result;
 }

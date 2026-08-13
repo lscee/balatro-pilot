@@ -82,11 +82,24 @@ function createFixture() {
     }),
   ]);
   writeRun("2026-08-02T00-00-00-000Z-bot-run", [
-    event("2026-08-02T00:00:00.000Z", "semantic_episode_started", { episodeId: "episode-2" }),
+    event("2026-08-02T00:00:00.000Z", "semantic_episode_resumed", {
+      episodeId: "episode-2",
+      previousRunId: "previous-controller",
+    }),
     event("2026-08-02T00:00:01.000Z", "bot_state", {
       state: compactState("SEED2", { ante: 2, round: 4 }),
     }),
     event("2026-08-02T00:00:02.000Z", "bot_strategy_mode", { strategic: false }),
+    event("2026-08-02T00:00:02.100Z", "semantic_retrieval", {
+      candidates: 2,
+      injected: 1,
+      decisionPrior: { evidence: 4, matchedCandidates: 2, appliedCandidates: 1 },
+    }),
+    event("2026-08-02T00:00:02.200Z", "semantic_prior_decision", {
+      available: true,
+      applied: true,
+      influenced: true,
+    }),
     event("2026-08-02T00:00:03.000Z", "plan", {
       planningMs: 3_000,
       usage: { apiCalls: 1, inputTokens: 900, cachedInputTokens: 800, outputTokens: 100, totalTokens: 1000 },
@@ -142,6 +155,13 @@ test("DashboardStats aggregates exact games, outcomes, score deltas, actions, an
     assert.equal(stats.model.usage.apiCalls, 3);
     assert.equal(stats.model.cacheRate, 1500 / 1900);
     assert.equal(stats.model.medianPlanningMs, 7500);
+    assert.equal(stats.learning.retrieval.requests, 1);
+    assert.equal(stats.learning.retrieval.hitRate, 1);
+    assert.equal(stats.learning.retrieval.injectionRate, 1);
+    assert.equal(stats.learning.actionInfluence.applied, 1);
+    assert.equal(stats.learning.actionInfluence.influenceRate, 1);
+    assert.equal(stats.learning.episodeStitching.resumed, 1);
+    assert.equal(stats.learning.durable.available, false);
     assert.equal(stats.live.gameId, "SEED2");
     assert.equal(stats.live.state, "GAME_OVER");
   } finally {
@@ -216,6 +236,11 @@ test("DashboardStats merges time-overlapping controller logs for the same seed",
 
 test("dashboard server exposes loopback-ready health, stats, and static page endpoints", async () => {
   const fixture = createFixture();
+  fs.writeFileSync(path.join(fixture.root, "config.json"), JSON.stringify({
+    semanticRagDatabasePath: "custom-data/learning.sqlite",
+    semanticPriorMinimumEpisodes: 5,
+    semanticPriorConfidenceZ: 1.64,
+  }));
   const componentHealth = {
     async refresh() {
       return { ok: true, overall: { status: "healthy" }, components: [{ id: "dashboard", status: "healthy" }] };
@@ -243,6 +268,10 @@ test("dashboard server exposes loopback-ready health, stats, and static page end
     assert.equal(JSON.parse(components.body).components[0].id, "dashboard");
     assert.equal(components.headers["cache-control"], "no-store");
     assert.equal(JSON.parse(stats.body).overview.highestScore, 100_000);
+    assert.equal(
+      JSON.parse(stats.body).learning.durable.databasePath,
+      path.resolve(fixture.root, "custom-data/learning.sqlite"),
+    );
     assert.equal(stats.headers["cache-control"], "no-store");
     assert.equal(page.status, 200);
     assert.match(page.body, /<title>test<\/title>/);

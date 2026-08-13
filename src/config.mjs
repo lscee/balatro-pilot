@@ -89,11 +89,16 @@ const DEFAULTS = Object.freeze({
   semanticRagSearchBudgetMs: 15,
   semanticRagMinimumSimilarity: 0.72,
   semanticRagMaxContextChars: 1_600,
-  semanticFastPathEnabled: true,
+  // Exact replay is evidence only. Cross-seed experience calibrates the local
+  // candidate list and can never bypass the routine/strategic planner.
+  semanticFastPathEnabled: false,
   semanticFastPathMinimumSamples: 3,
   semanticFastPathMinimumWinningEpisodes: 3,
   semanticFastPathMinimumAverageReturn: 1,
   semanticFastPathMinimumPositiveRate: 0.75,
+  semanticPriorMinimumEpisodes: 3,
+  semanticPriorConfidenceZ: 1.28,
+  semanticPriorMaximumBlend: 0.3,
   semanticEpisodeDiscount: 0.97,
 });
 
@@ -416,6 +421,7 @@ export function loadConfig(projectRoot, env = process.env) {
   asInteger(config.semanticRagMaxContextChars, "semanticRagMaxContextChars", 200, 5_000);
   asInteger(config.semanticFastPathMinimumSamples, "semanticFastPathMinimumSamples", 1, 10_000);
   asInteger(config.semanticFastPathMinimumWinningEpisodes, "semanticFastPathMinimumWinningEpisodes", 1, 10_000);
+  asInteger(config.semanticPriorMinimumEpisodes, "semanticPriorMinimumEpisodes", 2, 10_000);
   asInteger(config.balatrobotHandCandidateLimit, "balatrobotHandCandidateLimit", 2, 30);
   for (const name of [
     "minimumConfidence",
@@ -453,8 +459,11 @@ export function loadConfig(projectRoot, env = process.env) {
     "balatrobotStrategicThinkingEnabled",
   ]) assertBoolean(config[name], name);
   assertNonEmpty(config.semanticRagDatabasePath, "semanticRagDatabasePath");
-  for (const name of ["semanticRagMinimumSimilarity", "semanticFastPathMinimumPositiveRate", "semanticEpisodeDiscount"]) {
+  for (const name of ["semanticRagMinimumSimilarity", "semanticFastPathMinimumPositiveRate", "semanticPriorMaximumBlend", "semanticEpisodeDiscount"]) {
     assertUnitInterval(config[name], name);
+  }
+  if (!Number.isFinite(config.semanticPriorConfidenceZ) || config.semanticPriorConfidenceZ < 0.5 || config.semanticPriorConfidenceZ > 3) {
+    throw new Error("semanticPriorConfidenceZ must be between 0.5 and 3");
   }
   if (!Number.isFinite(config.semanticFastPathMinimumAverageReturn)) {
     throw new Error("semanticFastPathMinimumAverageReturn must be a finite number");

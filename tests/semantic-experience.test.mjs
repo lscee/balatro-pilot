@@ -15,6 +15,9 @@ import {
   semanticStateText,
   semanticTerminalOutcome,
   semanticTransitionReward,
+  semanticFeatureCompatibility,
+  semanticNormalizeFeatures,
+  SEMANTIC_REWARD_VERSION,
 } from "../src/semantic-experience.mjs";
 
 function card(key, { set = "DEFAULT", buy = 1 } = {}) {
@@ -57,11 +60,40 @@ test("semantic state separates exact safety fingerprints from reusable visible-s
   const second = state({ seed: "another-seed" });
   const features = semanticStateFeatures(first);
   assert.equal(SEMANTIC_POLICY_VERSION, 5);
+  assert.equal(SEMANTIC_REWARD_VERSION, 6);
   assert.equal(features.screen, "SELECTING_HAND");
   assert.deepEqual(features.hand, ["H_A", "S_A", "C_2"]);
   assert.equal(semanticReplayFingerprint(first), semanticReplayFingerprint(second));
   assert.match(semanticStateBucket(first), /SELECTING_HAND/);
   assert.match(semanticStateText(first), /score=100\/600/);
+});
+
+test("legacy semantic features normalize without pretending to be exact evidence", () => {
+  const legacy = semanticStateFeatures(state());
+  legacy.version = 1;
+  delete legacy.strategy;
+  delete legacy.collectionSignature;
+  delete legacy.appearedJokers;
+  const normalized = semanticNormalizeFeatures(legacy, { canonicalVersion: true });
+  assert.equal(normalized.version, SEMANTIC_POLICY_VERSION);
+  assert.equal(normalized.strategy.phase, "early");
+  assert.deepEqual(normalized.appearedJokers, []);
+  assert.equal(semanticFeatureCompatibility(legacy), "semantic");
+  assert.equal(semanticFeatureCompatibility(semanticStateFeatures(state())), "exact");
+  assert.equal(semanticFeatureCompatibility({ broken: true }), "incompatible");
+});
+
+test("long losing trajectories remain negative while preserving useful ordering", () => {
+  const transitions = Array.from({ length: 400 }, (_, index) => ({ id: index + 1, immediateReward: 6 }));
+  const returns = semanticDiscountedReturns(transitions, "lost", {
+    ante_num: 8,
+    money: 0,
+    trainingMaxHandScore: 1_000_000,
+  });
+  assert.ok([...returns.values()].every((value) => value < 0));
+  const late = returns.get(400);
+  const early = returns.get(1);
+  assert.ok(late < early, "actions close to a loss should receive more blame");
 });
 
 test("semantic replay separates unlock pools and remembers Jokers seen in the run", () => {
@@ -144,7 +176,7 @@ test("high-score learning distinguishes a million-point hand from merely clearin
     "lost",
     { ante_num: 8, money: 0, trainingMaxHandScore: 1_100_000 },
   ).get(1);
-  assert.ok(million > ordinary + 5);
+  assert.ok(million > ordinary + 4.5);
   assert.equal(
     semanticPlayedHandScore(before, action, { ...after, round_num: after.round_num + 1, round: { ...after.round, chips: 0 } }),
     0,

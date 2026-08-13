@@ -375,11 +375,22 @@ test("runner discards a plan when exact state changes during cloud planning", as
     async call(method, params) { calls.push({ method, params }); return changed; },
   };
   const planner = { async planState() { return modelPlan(semanticAction("play", { cards: [0, 1] })); } };
+  const experienceStore = {
+    enabled: true,
+    allRewardEvidence() { return []; },
+    beginEpisode() {},
+    retrieve() { return { items: [], groups: [], evidence: [], searched: 0, elapsedMs: 0, truncated: false, cached: false }; },
+    contextItems() { return []; },
+    formatContext() { return ""; },
+    markEpisodeInterrupted() {},
+  };
   const log = fakeLog();
-  const result = await runBalatrobot({ projectRoot: ".", config, client, planner, maxSteps: 1, log });
+  const result = await runBalatrobot({ projectRoot: ".", config, client, planner, experienceStore, maxSteps: 1, log });
   assert.deepEqual(calls, []);
   assert.equal(result.state.money, 5);
   assert.ok(log.events.some((event) => event.type === "bot_stale_plan_skipped"));
+  assert.ok(log.events.some((event) => event.type === "semantic_prior_proposed"));
+  assert.equal(log.events.some((event) => event.type === "semantic_prior_decision"), false);
 });
 
 test("runner backs off and uses a legal fallback when exact-state planning is unavailable", async () => {
@@ -1251,9 +1262,11 @@ test("runner does not mislabel GAME_OVER won history as a confirmed victory", as
   const initial = handState();
   const won = { ...initial, state: "GAME_OVER", won: true, ante_num: 8, round_num: 24 };
   const lifecycle = [];
+  let fullPriorReads = 0;
   let plannerInput;
   const experienceStore = {
     enabled: true,
+    allRewardEvidence() { fullPriorReads += 1; return []; },
     beginEpisode(input) { lifecycle.push({ type: "begin", ...input }); },
     retrieve() { return { items: [{ actionKey: "play" }], groups: [], searched: 7, elapsedMs: 0.4, truncated: false, cached: false }; },
     contextItems(retrieval) { return retrieval.items; },
@@ -1263,6 +1276,10 @@ test("runner does not mislabel GAME_OVER won history as a confirmed victory", as
     finalizeEpisode(episodeId, outcome, finalState) {
       lifecycle.push({ type: "finalize", episodeId, outcome, finalState });
       return { episodeId, outcome, transitions: 1 };
+    },
+    rewardEvidenceForCreditEpisode(episodeId, options) {
+      lifecycle.push({ type: "prior-delta", episodeId, options });
+      return [];
     },
     markEpisodeInterrupted(episodeId) { lifecycle.push({ type: "interrupt", episodeId }); },
   };
@@ -1282,14 +1299,145 @@ test("runner does not mislabel GAME_OVER won history as a confirmed victory", as
   await runBalatrobot({ projectRoot: ".", config, client, planner, experienceStore, maxSteps: 1, log });
 
   assert.equal(plannerInput.experienceContext, "similar completed run preferred playing the pair");
-  assert.deepEqual(lifecycle.map((item) => item.type), ["begin", "record", "finalize"]);
+  assert.deepEqual(lifecycle.map((item) => item.type), ["begin", "record", "finalize", "prior-delta"]);
+  assert.equal(fullPriorReads, 1);
   assert.equal(lifecycle[1].source, "balatrobot_model");
   assert.equal(lifecycle[2].outcome, "lost");
+  assert.deepEqual(lifecycle[3].options, { includeFeatures: false });
   assert.ok(log.events.some((event) => event.type === "semantic_transition_recorded"));
   assert.ok(log.events.some((event) => event.type === "semantic_episode_completed"));
 });
 
-test("runner uses an exact semantic fast path without calling the planner", async () => {
+test("runner resumes a progressed interrupted episode so its earlier transitions receive the terminal result", async () => {
+  const initial = {
+    ...handState(),
+    state: "ROUND_EVAL",
+    won: true,
+    seed: "RESUME-WIN",
+    deck: "RED",
+    stake: "WHITE",
+    ante_num: 8,
+    round_num: 24,
+  };
+  const won = {
+    ...initial,
+    state: "GAME_OVER",
+    won: true,
+    ante_num: 8,
+    round_num: 24,
+    round: { ...initial.round, chips: 1_000_000 },
+  };
+  const lifecycle = [];
+  const experienceStore = {
+    enabled: true,
+    resumeEpisode(input) {
+      lifecycle.push({ type: "resume", ...input });
+      return {
+        episodeId: "old-run:1",
+        previousRunId: "old-run",
+        lastAnte: 8,
+        lastRound: 24,
+      };
+    },
+    beginEpisode(input) { lifecycle.push({ type: "begin", ...input }); },
+    retrieve() { return { items: [], groups: [], evidence: [], searched: 0, elapsedMs: 0, truncated: false, cached: false }; },
+    contextItems() { return []; },
+    formatContext() { return ""; },
+    recordTransition(input) { lifecycle.push({ type: "record", ...input }); return { id: 99, immediateReward: 1 }; },
+    finalizeEpisode(episodeId, outcome, finalState) {
+      lifecycle.push({ type: "finalize", episodeId, outcome, finalState });
+      return { episodeId, outcome, transitions: 42 };
+    },
+    markEpisodeInterrupted(episodeId) { lifecycle.push({ type: "interrupt", episodeId }); },
+  };
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() { return initial; },
+    async call() { return won; },
+  };
+  const planner = { async planState() { throw new Error("victory settlement must be local"); } };
+  const log = fakeLog();
+
+  await runBalatrobot({ projectRoot: ".", config, client, planner, experienceStore, maxSteps: 1, log });
+
+  assert.deepEqual(lifecycle.map((entry) => entry.type), ["resume", "finalize"]);
+  assert.equal(lifecycle[1].episodeId, "old-run:1");
+  assert.equal(lifecycle[1].outcome, "won");
+  assert.ok(log.events.some((event) =>
+    event.type === "semantic_episode_resumed" &&
+    event.episodeId === "old-run:1" &&
+    event.previousRunId === "old-run"));
+});
+
+test("runner can attach an already terminal progressed startup state to its interrupted episode", async () => {
+  const terminal = {
+    ...handState(),
+    state: "GAME_OVER",
+    won: false,
+    seed: "RESUME-LOSS",
+    deck: "RED",
+    stake: "WHITE",
+    ante_num: 3,
+    round_num: 8,
+  };
+  const lifecycle = [];
+  const experienceStore = {
+    enabled: true,
+    resumeEpisode(input) {
+      lifecycle.push({ type: "resume", ...input });
+      return { episodeId: "lost-run:1", previousRunId: "lost-run", lastAnte: 3, lastRound: 8 };
+    },
+    beginEpisode(input) { lifecycle.push({ type: "begin", ...input }); },
+    finalizeEpisode(episodeId, outcome) {
+      lifecycle.push({ type: "finalize", episodeId, outcome });
+      return { episodeId, outcome, transitions: 17 };
+    },
+    markEpisodeInterrupted() {},
+  };
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() { return terminal; },
+    async call() { return { ...terminal, state: "MENU" }; },
+  };
+  const planner = { async planState() { throw new Error("GAME_OVER is locally controlled"); } };
+
+  await runBalatrobot({ projectRoot: ".", config, client, planner, experienceStore, maxSteps: 1, log: fakeLog() });
+
+  assert.deepEqual(lifecycle.map((entry) => entry.type), ["resume", "finalize"]);
+  assert.equal(lifecycle[1].episodeId, "lost-run:1");
+  assert.equal(lifecycle[1].outcome, "lost");
+});
+
+test("runner never resumes an Ante 1 same-seed attempt", async () => {
+  const initial = { ...handState(), seed: "REPLAYED-SEED", deck: "RED", stake: "WHITE" };
+  const after = { ...initial, state: "ROUND_EVAL", round: { ...initial.round, chips: 120 } };
+  const lifecycle = [];
+  const experienceStore = {
+    enabled: true,
+    resumeEpisode() { lifecycle.push("resume"); throw new Error("fresh run must not query resume"); },
+    beginEpisode(input) { lifecycle.push({ type: "begin", ...input }); },
+    retrieve() { return { items: [], groups: [], evidence: [], searched: 0, elapsedMs: 0, truncated: false, cached: false }; },
+    contextItems() { return []; },
+    formatContext() { return ""; },
+    recordTransition() { return { id: 1, immediateReward: 0 }; },
+    finalizeEpisode() { return null; },
+    markEpisodeInterrupted(episodeId) { lifecycle.push({ type: "interrupt", episodeId }); },
+  };
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() { return initial; },
+    async call() { return after; },
+  };
+  const planner = { async planState() { return modelPlan(semanticAction("play", { cards: [0, 1] })); } };
+
+  await runBalatrobot({ projectRoot: ".", config, client, planner, experienceStore, maxSteps: 1, log: fakeLog() });
+
+  assert.equal(lifecycle.some((entry) => entry === "resume"), false);
+  assert.equal(lifecycle[0].type, "begin");
+  assert.match(lifecycle[0].episodeId, /balatrobot-test:1$/u);
+});
+
+test("exact semantic replay remains evidence and never bypasses the planner", async () => {
   const initial = handState();
   const after = { ...initial, state: "ROUND_EVAL", round: { ...initial.round, chips: 120 } };
   let plannerCalls = 0;
@@ -1316,15 +1464,23 @@ test("runner uses an exact semantic fast path without calling the planner", asyn
     async gamestate() { return initial; },
     async call(method, params) { calls.push({ method, params }); return after; },
   };
-  const planner = { async planState() { plannerCalls += 1; throw new Error("should not plan"); } };
+  const planner = {
+    async planState() {
+      plannerCalls += 1;
+      return modelPlan(semanticAction("play", { cards: [0, 1] }));
+    },
+  };
   const log = fakeLog();
 
   await runBalatrobot({ projectRoot: ".", config, client, planner, experienceStore, maxSteps: 1, log });
 
-  assert.equal(plannerCalls, 0);
+  assert.equal(plannerCalls, 1);
   assert.deepEqual(calls, [{ method: "play", params: { cards: [0, 1] } }]);
-  assert.equal(writes[0].source, "semantic_fast_path");
-  assert.ok(log.events.some((event) => event.type === "semantic_fast_path"));
+  assert.equal(writes[0].source, "balatrobot_model");
+  assert.equal(log.events.some((event) => event.type === "semantic_fast_path"), false);
+  assert.equal(log.events.find((event) => event.type === "semantic_retrieval").fastEvidence, null);
+  assert.ok(log.events.some((event) => event.type === "semantic_prior_proposed"));
+  assert.ok(log.events.some((event) => event.type === "semantic_prior_decision" && event.committed === true));
 });
 
 test("dry-run semantic retrieval never writes episode or transition data", async () => {

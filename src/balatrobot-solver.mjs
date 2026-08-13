@@ -175,6 +175,7 @@ const HAND_PLAN_ALIASES = new Map([
 ]);
 const TARGETED_CONSUMABLE_SETS = new Set(["TAROT", "SPECTRAL"]);
 const HAND_ACTION_METHODS = new Set(["play", "discard"]);
+const CANDIDATE_ACTION_STATES = new Set(["BLIND_SELECT", "SHOP", "SMODS_BOOSTER_OPENED", "SELECTING_HAND"]);
 const SHOP_STRATEGY_STATES = new Set(["SHOP", "SMODS_BOOSTER_OPENED"]);
 const AMBIGUOUS_MOUTH_LOCK = "__AMBIGUOUS_MOUTH_LOCK__";
 const MOUTH_RANK_LOCKED_HANDS = new Set([
@@ -1646,7 +1647,7 @@ export function balatrobotSurvivalAssessment(state, candidates) {
 
 export function assertBalatrobotCandidateAction(action, candidates, state = null) {
   if (!Array.isArray(candidates) || !candidates.length) {
-    if (state?.state === "SELECTING_HAND" && HAND_ACTION_METHODS.has(action?.method)) {
+    if (CANDIDATE_ACTION_STATES.has(state?.state)) {
       const locked = balatrobotMouthLockedHandType(state);
       throw new Error(
         locked
@@ -1663,7 +1664,6 @@ export function assertBalatrobotCandidateAction(action, candidates, state = null
         `do not skip a pack with a locally safe choice: ${safeChoice.card?.label || safeChoice.card?.key || safeChoice.id}`,
       );
     }
-    return action;
   }
   if (state?.state === "SELECTING_HAND") {
     const assessment = balatrobotSurvivalAssessment(state, candidates);
@@ -1683,10 +1683,46 @@ export function assertBalatrobotCandidateAction(action, candidates, state = null
           `use lifesaving emergency consumable ${expected?.consumable} on [${expectedCards.join(",")}] before any weaker action`,
         );
       }
-      return action;
     }
   }
-  if (!HAND_ACTION_METHODS.has(action?.method)) return action;
+  if (!HAND_ACTION_METHODS.has(action?.method)) {
+    const normalizedValue = (value, key = "") => {
+      if (Array.isArray(value)) {
+        const items = value.map((item) => normalizedValue(item));
+        return key === "cards" || key === "targets"
+          ? items.toSorted((left, right) => Number(left) - Number(right))
+          : items;
+      }
+      if (!value || typeof value !== "object") return value;
+      return Object.fromEntries(
+        Object.entries(value)
+          .filter(([itemKey, item]) =>
+            item !== undefined &&
+            !(Array.isArray(item) && item.length === 0 && (itemKey === "cards" || itemKey === "targets")))
+          .toSorted(([left], [right]) => left.localeCompare(right))
+          .map(([itemKey, item]) => [itemKey, normalizedValue(item, itemKey)]),
+      );
+    };
+    const signature = JSON.stringify({
+      method: action?.method,
+      params: normalizedValue(action?.params ?? {}),
+    });
+    const allowed = candidates.some((candidate) => {
+      const { method, ...params } = candidate.action ?? {};
+      return JSON.stringify({ method, params: normalizedValue(params) }) === signature;
+    });
+    if (!allowed) {
+      const allowedIds = candidates
+        .filter((candidate) => candidate.action?.method === action?.method)
+        .map((candidate) => candidate.id)
+        .join(", ");
+      throw new Error(
+        `${action?.method || "action"}.params must exactly match one locally enumerated candidate` +
+          (allowedIds ? `: ${allowedIds}` : ""),
+      );
+    }
+    return action;
+  }
   const signature = `${action.method}:${[...(action.params?.cards ?? [])].sort((left, right) => left - right).join(",")}`;
   const allowed = candidates.some((candidate) => {
     const cards = [...(candidate.action?.cards ?? [])].sort((left, right) => left - right);

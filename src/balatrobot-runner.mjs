@@ -25,6 +25,11 @@ import { selectBalatroDeck } from "./balatro-deck-selector.mjs";
 import { mergeUsage } from "./planner.mjs";
 import { RunLog } from "./run-log.mjs";
 import { semanticPlayedHandScore, semanticTerminalOutcome } from "./semantic-experience.mjs";
+import {
+  appendSemanticPriorEvidence,
+  applySemanticCandidatePriors,
+  buildSemanticPriorIndex,
+} from "./semantic-prior.mjs";
 
 const LEARNABLE_METHODS = new Set([
   "select",
@@ -624,6 +629,23 @@ export async function runBalatrobot({
   let victoryCheckpointSeen = false;
   let victoryOverlayDismissed = false;
   let approvedShopContinuation = null;
+  let semanticPriorIndex = new Map();
+  const refreshSemanticPriorIndex = ({ announce = false } = {}) => {
+    if (dryRun || !experienceStore?.enabled || typeof experienceStore.allRewardEvidence !== "function") return;
+    try {
+      semanticPriorIndex = buildSemanticPriorIndex(
+        experienceStore.allRewardEvidence({ includeFeatures: false }),
+      );
+      if (announce) {
+        console.log(
+          `  Learning: indexed ${semanticPriorIndex.size} cross-seed decision bucket(s) from all compatible history.`,
+        );
+      }
+    } catch (error) {
+      console.warn(`[warn] Full-history semantic prior index could not be built: ${error.message}`);
+    }
+  };
+  refreshSemanticPriorIndex({ announce: true });
 
   const stopAfterUncertainRpc = async ({ step, method, fingerprint, reason, params = null }) => {
     log.event("rpc_uncertain_safe_stop", {
@@ -643,11 +665,53 @@ export async function runBalatrobot({
     return contextualBalatrobotState(currentState, collectionKnowledge, appearedThisRun);
   };
 
-  const beginEpisode = (episodeState) => {
+  const beginEpisode = (episodeState, { allowResume = false } = {}) => {
     if (!episodeState) return;
-    if (episodeState.state === "MENU" || semanticTerminalOutcome(episodeState, { victoryCheckpointSeen })) return;
+    const terminalOutcome = semanticTerminalOutcome(episodeState, { victoryCheckpointSeen });
+    if (episodeState.state === "MENU" || (terminalOutcome && !allowResume)) return;
     if (!episodeId) strategicCheckpointScopes.clear();
     if (dryRun || !experienceStore?.enabled || episodeId) return;
+    // A controller restart can split one real Balatro run across multiple log
+    // directories. Resume only when startup finds an unmistakably progressed
+    // game. Ante 1 is intentionally excluded: a user may legitimately replay
+    // the same seed/deck/stake, and merging that fresh attempt would leak a
+    // previous terminal result into an unrelated trajectory.
+    const ante = Number(episodeState?.ante_num) || 0;
+    const round = Number(episodeState?.round_num) || 0;
+    const resumableProgress = ante > 1 || round > 1;
+    if (allowResume && resumableProgress && typeof experienceStore.resumeEpisode === "function") {
+      try {
+        const resumed = experienceStore.resumeEpisode({ runId, state: episodeState });
+        if (resumed?.episodeId) {
+          episodeId = resumed.episodeId;
+          log.event("semantic_episode_resumed", {
+            episodeId,
+            previousRunId: resumed.previousRunId ?? null,
+            runId,
+            state: episodeState.state,
+            ante,
+            round,
+            lastAnte: resumed.lastAnte ?? null,
+            lastRound: resumed.lastRound ?? null,
+          });
+          console.log(
+            `  Learning: resumed interrupted episode ${episodeId} from Ante ${resumed.lastAnte ?? "?"}, ` +
+              `Round ${resumed.lastRound ?? "?"}; its earlier transitions will receive this run's terminal result.`,
+          );
+          return;
+        }
+      } catch (error) {
+        // Learning continuity must never block game control. Fall through to a
+        // fresh episode while retaining the failed resume in the append-only log.
+        log.event("semantic_episode_resume_error", { error: error.message, ante, round });
+        console.warn(`[warn] Interrupted semantic episode could not be resumed: ${error.message}`);
+      }
+    }
+    // A terminal screen observed at startup may belong to an interrupted
+    // episode and was eligible for the resume lookup above, but it must never
+    // create a brand-new, zero-transition terminal episode when no match was
+    // found.
+    if (terminalOutcome) return;
     episodeId = `${runId}:${episodeIndex}`;
     try {
       experienceStore.beginEpisode({ episodeId, runId, state: episodeState });
@@ -667,6 +731,24 @@ export async function runBalatrobot({
       if (completed) {
         log.event("semantic_episode_completed", completed);
         console.log(`  Learning: finalized ${outcome} episode with ${completed.transitions} confirmed transition(s).`);
+        // Startup builds the full-history index once. Thereafter append only
+        // the completed canonical trajectory (including any linked restart
+        // segments) so long-running controllers do not reparse the whole DB
+        // after every game.
+        if (typeof experienceStore.rewardEvidenceForCreditEpisode === "function") {
+          const delta = experienceStore.rewardEvidenceForCreditEpisode(completed.episodeId, { includeFeatures: false });
+          appendSemanticPriorEvidence(semanticPriorIndex, delta);
+          log.event("semantic_prior_index_updated", {
+            episodeId: completed.episodeId,
+            evidence: delta.length,
+            decisionBuckets: semanticPriorIndex.size,
+            mode: "incremental",
+          });
+        } else {
+          // Compatibility for injected/older stores. Production
+          // SemanticRagStore always implements the incremental API.
+          refreshSemanticPriorIndex();
+        }
       }
     } catch (error) {
       console.warn(`[warn] Semantic episode finalization failed: ${error.message}`);
@@ -698,13 +780,36 @@ export async function runBalatrobot({
     }
   };
 
-  const commitAppliedAction = ({ step, beforeState, action, afterState, source, plan, usage, checkpointScope, selectedCandidate }) => {
+  const commitAppliedAction = ({
+    step,
+    beforeState,
+    action,
+    afterState,
+    source,
+    plan,
+    usage,
+    checkpointScope,
+    selectedCandidate,
+    semanticPriorDecision,
+  }) => {
     const afterSemanticState = refreshRunKnowledge(afterState);
     if (afterState?.state === "ROUND_EVAL" && afterState?.won === true) victoryCheckpointSeen = true;
     if (action.method === "endless") victoryOverlayDismissed = true;
     if (action.method === "start") beginEpisode(afterSemanticState);
     const handScore = semanticPlayedHandScore(beforeState, action, afterSemanticState);
     recordTransition({ step, beforeState, action, afterState: afterSemanticState, source, plan, usage, handScore });
+    // This is the actual-impact metric. It is deliberately emitted only from
+    // the commit path, after a fresh-state RPC (or reconciliation) proved that
+    // the action changed the game. Proposed, stale, rejected and failed
+    // actions must never inflate the dashboard's learning-influence rate.
+    if (semanticPriorDecision) {
+      log.event("semantic_prior_decision", {
+        ...semanticPriorDecision,
+        step,
+        method: action.method,
+        committed: true,
+      });
+    }
     finalizeEpisode(afterSemanticState);
     memory = String(plan.memory || memory).slice(0, 350);
     runPlan = plan.runPlan ?? runPlan;
@@ -825,7 +930,7 @@ export async function runBalatrobot({
     } else if (profileReader) {
       console.warn(`[warn] Balatro collection knowledge unavailable: ${collectionKnowledge?.error ?? "unknown error"}`);
     }
-    beginEpisode(initialSemanticState);
+    beginEpisode(initialSemanticState, { allowResume: true });
 
     for (let step = 1; step <= maxSteps; step++) {
       if (signal.aborted) throw abortError(signal);
@@ -1001,6 +1106,7 @@ export async function runBalatrobot({
       let actionCandidates = [];
       let approvedCheckpointScope = null;
       let selectedActionCandidate = null;
+      let semanticPriorDecision = null;
 
       const failureKeyPrefix = `${exactFingerprint}:`;
       if (!action && repeatedRpcFailures >= 2 && repeatedRpcFailureKey.startsWith(failureKeyPrefix)) {
@@ -1063,7 +1169,7 @@ export async function runBalatrobot({
             }
           }
         }
-        const candidates = filterBalatrobotExecutableCandidates(state, generatedCandidates);
+        let candidates = filterBalatrobotExecutableCandidates(state, generatedCandidates);
         if (candidates.length !== generatedCandidates.length) {
           log.event("bot_candidate_filter", {
             step,
@@ -1073,6 +1179,53 @@ export async function runBalatrobot({
               .filter((candidate) => !candidates.some((kept) => kept.id === candidate.id))
               .map((candidate) => candidate.id),
           });
+        }
+        let experienceContext = "";
+        let semanticPriorResult = null;
+        if (experienceStore?.enabled) {
+          try {
+            const retrieval = experienceStore.retrieve(semanticState);
+            experienceContext = experienceStore.formatContext(retrieval);
+            const priorResult = applySemanticCandidatePriors(state, candidates, {
+              ...retrieval,
+              priorIndex: semanticPriorIndex,
+            }, {
+              minimumEpisodes: config.semanticPriorMinimumEpisodes,
+              confidenceZ: config.semanticPriorConfidenceZ,
+              maximumBlend: config.semanticPriorMaximumBlend,
+            });
+            semanticPriorResult = priorResult;
+            candidates = priorResult.candidates;
+            const injected = experienceStore.contextItems?.(retrieval)?.length ?? 0;
+            log.event("semantic_retrieval", {
+              step,
+              candidates: retrieval.items.length,
+              injected,
+              searched: retrieval.searched,
+              elapsedMs: retrieval.elapsedMs,
+              truncated: retrieval.truncated,
+              cached: retrieval.cached,
+              policyVersion: retrieval.policyVersion,
+              decisionPrior: {
+                evidence: priorResult.evidenceCount,
+                matchedCandidates: priorResult.matchedCandidates,
+                appliedCandidates: priorResult.appliedCandidates,
+              },
+              // Exact replay fingerprints are retained by the store for
+              // diagnostics and legality reconciliation only. They no longer
+              // authorize an action or bypass the routine/strategic planner.
+              fastEvidence: null,
+            });
+            if (retrieval.items.length || priorResult.evidenceCount) {
+              console.log(
+                `  Semantic RAG: ${retrieval.items.length} context candidate(s), ` +
+                  `${priorResult.appliedCandidates} calibrated prior(s), searched ${retrieval.searched} in ` +
+                  `${retrieval.elapsedMs.toFixed(1)}ms${retrieval.cached ? " (cache)" : retrieval.truncated ? " (budget reached)" : ""}.`,
+              );
+            }
+          } catch (error) {
+            console.warn(`[warn] Semantic RAG retrieval failed and was skipped: ${error.message}`);
+          }
         }
         actionCandidates = candidates;
         let thinkingMode = applyStrategicCheckpoint(
@@ -1110,69 +1263,6 @@ export async function runBalatrobot({
           `  Model route: ${selectedRoute} -> ` +
             `${selectedPlannerConfig.provider ?? "configured planner"} / ${selectedPlannerConfig.model ?? "unknown model"}.`,
         );
-        let experienceContext = "";
-        if (experienceStore?.enabled) {
-          try {
-            const retrieval = experienceStore.retrieve(semanticState);
-            experienceContext = experienceStore.formatContext(retrieval);
-            const fastCandidate = experienceStore.chooseFastAction(retrieval);
-            log.event("semantic_retrieval", {
-              step,
-              candidates: retrieval.items.length,
-              injected: experienceStore.contextItems(retrieval).length,
-              searched: retrieval.searched,
-              elapsedMs: retrieval.elapsedMs,
-              truncated: retrieval.truncated,
-              cached: retrieval.cached,
-              policyVersion: retrieval.policyVersion,
-              fastEvidence: fastCandidate?.evidence ?? null,
-            });
-            if (retrieval.items.length) {
-              console.log(
-                `  Semantic RAG: ${retrieval.items.length} candidate(s), searched ${retrieval.searched} in ` +
-                  `${retrieval.elapsedMs.toFixed(1)}ms${retrieval.cached ? " (cache)" : retrieval.truncated ? " (budget reached)" : ""}.`,
-              );
-            }
-            if (fastCandidate) {
-              try {
-                const fastPlan = validateBalatrobotPlan(
-                  {
-                    observation: "Exact semantic state matches the same action across multiple independent winning runs.",
-                    strategy: "Reuse a locally learned exact-state action after legality validation.",
-                    memory,
-                    runPlan,
-                    confidence: 1,
-                    actions: [fastCandidate.action],
-                  },
-                  state,
-                  {
-                    minimumConfidence: config.minimumConfidence,
-                    collectionKnowledge,
-                    appearedThisRun,
-                  },
-                );
-                assertBalatrobotCandidateAction(fastPlan.actions[0], candidates, state);
-                planned = {
-                  plan: fastPlan,
-                  usage: mergeUsage(),
-                  attempts: [],
-                  planningMs: performance.now() - planningStartedAt,
-                };
-                action = fastPlan.actions[0];
-                planDetails = fastPlan;
-                source = "semantic_fast_path";
-                log.event("semantic_fast_path", { step, action, evidence: fastCandidate.evidence });
-                console.log(
-                  `  Semantic fast path: ${actionLabel(action)} from ${fastCandidate.evidence.trustedSamples} trusted sample(s).`,
-                );
-              } catch (error) {
-                log.event("semantic_fast_path_rejected", { step, error: error.message, candidate: fastCandidate.action });
-              }
-            }
-          } catch (error) {
-            console.warn(`[warn] Semantic RAG retrieval failed and was skipped: ${error.message}`);
-          }
-        }
         if (!action && approvedShopContinuation) {
           if (approvedShopContinuation.scope !== approvedCheckpointScope) {
             log.event("bot_shop_sequence_invalidated", {
@@ -1473,6 +1563,35 @@ export async function runBalatrobot({
         transitionStartedAt = 0;
         transitionPolls = 0;
         selectedActionCandidate ??= candidateForAction(action, actionCandidates);
+        if (semanticPriorResult) {
+          const selectedPrior = selectedActionCandidate?.experiencePrior ?? null;
+          const selectedIsChangedTop = Boolean(
+            selectedActionCandidate?.id &&
+            selectedActionCandidate.id === semanticPriorResult.calibratedTopCandidateId &&
+            semanticPriorResult.calibratedTopCandidateId !== semanticPriorResult.baselineTopCandidateId,
+          );
+          semanticPriorDecision = {
+            step,
+            available: semanticPriorResult.matchedCandidates > 0,
+            applied: Boolean(selectedPrior?.applied),
+            // Conservative attribution: call the decision influenced only
+            // when experience changed the top local rank and that promoted
+            // candidate was selected. This avoids claiming every model choice
+            // that merely had prior metadata was caused by learning.
+            influenced: Boolean(selectedPrior?.applied && selectedIsChangedTop),
+            candidateId: selectedActionCandidate?.id ?? null,
+            baselineRank: selectedActionCandidate?.baselineRank ?? null,
+            calibratedRank: selectedActionCandidate?.calibratedRank ?? null,
+            baselineTopCandidateId: semanticPriorResult.baselineTopCandidateId,
+            calibratedTopCandidateId: semanticPriorResult.calibratedTopCandidateId,
+            independentEpisodes: selectedPrior?.independentEpisodes ?? 0,
+            signal: selectedPrior?.signal ?? 0,
+          };
+          // Proposal telemetry is useful for diagnosing stale/rejected plans,
+          // but dashboard actual-influence metrics consume only the committed
+          // `semantic_prior_decision` event emitted by commitAppliedAction.
+          log.event("semantic_prior_proposed", semanticPriorDecision);
+        }
         cumulativeUsage = mergeUsage(cumulativeUsage, planned.usage);
 
         const current = assertGameState(await client.gamestate({ signal }), "gamestate");
@@ -1615,6 +1734,7 @@ export async function runBalatrobot({
           usage: planned.usage,
           checkpointScope: approvedCheckpointScope,
           selectedCandidate: selectedActionCandidate,
+          semanticPriorDecision,
         });
       } catch (error) {
         if (isAbort(error, signal)) throw error;
@@ -1721,6 +1841,7 @@ export async function runBalatrobot({
               usage: planned.usage,
               checkpointScope: approvedCheckpointScope,
               selectedCandidate: selectedActionCandidate,
+              semanticPriorDecision,
             });
             uncertainAction = null;
             console.warn("  State changed, so the action is treated as applied; it will not be sent again.");

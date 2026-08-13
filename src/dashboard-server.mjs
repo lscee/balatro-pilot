@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { DashboardStats } from "./dashboard-stats.mjs";
 import { ProjectHealthMonitor } from "./component-health.mjs";
 import { loadConfig, plannerConfigForBackend } from "./config.mjs";
+import { LearningDatabaseMetrics } from "./learning-metrics.mjs";
 import { RoutineBackendController } from "./models/routine-router.mjs";
 import { StrategicBackendController, strategicModeForProvider } from "./models/strategic-router.mjs";
 
@@ -81,8 +82,14 @@ export function createDashboardServer({
   componentHealth = null,
 } = {}) {
   const dashboardDirectory = path.join(projectRoot, "dashboard");
-  const stats = new DashboardStats(projectRoot);
   const config = loadConfig(projectRoot);
+  const stats = new DashboardStats(projectRoot, {
+    learningMetrics: new LearningDatabaseMetrics(projectRoot, {
+      databasePath: path.resolve(projectRoot, config.semanticRagDatabasePath),
+      minimumIndependentEpisodes: config.semanticPriorMinimumEpisodes,
+      confidenceZ: config.semanticPriorConfidenceZ,
+    }),
+  });
   if (!routineBackend) {
     const local = plannerConfigForBackend(config, "balatrobot-local");
     routineBackend = new RoutineBackendController({

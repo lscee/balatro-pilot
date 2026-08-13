@@ -334,12 +334,20 @@ function memoryStats(config) {
       return;
     }
     console.log(`Semantic policy: v${stats.policyVersion}`);
+    console.log(`Reward labels: v${stats.rewardVersion} (raw trajectory versions kept: ${stats.trajectoryVersions.map((item) => `v${item.policyVersion}:${item.transitions}`).join(", ") || "none"})`);
     console.log(
       `Episodes: ${stats.episodes} total, ${stats.completedEpisodes} completed ` +
         `(won ${stats.wonEpisodes}, lost ${stats.lostEpisodes}, interrupted ${stats.interruptedEpisodes})`,
     );
     console.log(`Transitions: ${stats.transitions} recorded, ${stats.learnedTransitions} finalized`);
     console.log(`Reward integrity: ${stats.positiveLossTransitions} losing transition(s) incorrectly positive`);
+    console.log(
+      `Reward migration: ${stats.rewardMigration.transitions} compatible transition(s) ` +
+        `(${stats.rewardMigration.exactTransitions} exact, ${stats.rewardMigration.semanticTransitions} semantic, ` +
+        `${stats.rewardMigration.incompatibleTransitions} incompatible, ` +
+        `${stats.rewardMigration.correctedOutcomes ?? 0} historical false-win outcome(s) corrected for learning, ` +
+        `${stats.rewardMigration.linkedSegments ?? 0} interrupted segment(s)/${stats.rewardMigration.linkedTransitions ?? 0} transition(s) linked)`
+    );
     console.log(`Hot semantic index: ${stats.hot}/${config.semanticRagHotLimit}`);
     console.log(`Database: ${stats.databasePath}`);
     const top = store.topActions(10);

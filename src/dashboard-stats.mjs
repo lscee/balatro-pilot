@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { LearningDatabaseMetrics } from "./learning-metrics.mjs";
+
 function number(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -227,9 +229,13 @@ function improvementSummary(completed) {
 }
 
 export class DashboardStats {
-  constructor(projectRoot, { runsDirectory = path.join(projectRoot, "runs") } = {}) {
+  constructor(projectRoot, {
+    runsDirectory = path.join(projectRoot, "runs"),
+    learningMetrics = new LearningDatabaseMetrics(projectRoot),
+  } = {}) {
     this.projectRoot = projectRoot;
     this.runsDirectory = runsDirectory;
+    this.learningMetrics = learningMetrics;
     this.reset();
   }
 
@@ -252,6 +258,16 @@ export class DashboardStats {
     this.fallbacks = 0;
     this.strategicPlans = 0;
     this.routinePlans = 0;
+    this.semanticRetrievalRequests = 0;
+    this.semanticRetrievalHits = 0;
+    this.semanticRetrievalInjected = 0;
+    this.semanticRetrievalContextItems = 0;
+    this.semanticPriorDecisions = 0;
+    this.semanticPriorAvailable = 0;
+    this.semanticPriorApplied = 0;
+    this.semanticPriorInfluenced = 0;
+    this.semanticEpisodeResumes = 0;
+    this.semanticEpisodeResumeErrors = 0;
   }
 
   runFor(runId) {
@@ -353,8 +369,24 @@ export class DashboardStats {
     if (run.dryRun) return;
 
     if (event.type === "bot_session") run.exact = true;
-    if (event.type === "semantic_episode_started") {
+    if (event.type === "semantic_episode_started" || event.type === "semantic_episode_resumed") {
       run.currentEpisodeId = event.episodeId ?? null;
+    }
+    if (event.type === "semantic_episode_resumed") this.semanticEpisodeResumes += 1;
+    if (event.type === "semantic_episode_resume_error") this.semanticEpisodeResumeErrors += 1;
+    if (event.type === "semantic_retrieval") {
+      this.semanticRetrievalRequests += 1;
+      const evidence = number(event.decisionPrior?.evidence);
+      if (number(event.candidates) > 0 || evidence > 0) this.semanticRetrievalHits += 1;
+      const injected = number(event.injected);
+      this.semanticRetrievalContextItems += injected;
+      if (injected > 0) this.semanticRetrievalInjected += 1;
+    }
+    if (event.type === "semantic_prior_decision") {
+      this.semanticPriorDecisions += 1;
+      if (event.available) this.semanticPriorAvailable += 1;
+      if (event.applied) this.semanticPriorApplied += 1;
+      if (event.influenced) this.semanticPriorInfluenced += 1;
     }
 
     if (event.type === "bot_state" && event.state?.seed) {
@@ -520,6 +552,7 @@ export class DashboardStats {
   }
 
   snapshot() {
+    const durableLearning = this.learningMetrics?.refresh?.() ?? null;
     const exact = [...this.games.values()]
       .filter((game) => game.source === "exact")
       .map(serializeGame)
@@ -664,6 +697,37 @@ export class DashboardStats {
         routinePlans: this.routinePlans,
         plannerErrors: this.plannerErrors,
         fallbacks: this.fallbacks,
+      },
+      learning: {
+        retrieval: {
+          requests: this.semanticRetrievalRequests,
+          hits: this.semanticRetrievalHits,
+          hitRate: this.semanticRetrievalRequests
+            ? this.semanticRetrievalHits / this.semanticRetrievalRequests
+            : 0,
+          injectedRequests: this.semanticRetrievalInjected,
+          injectionRate: this.semanticRetrievalRequests
+            ? this.semanticRetrievalInjected / this.semanticRetrievalRequests
+            : 0,
+          contextItems: this.semanticRetrievalContextItems,
+        },
+        actionInfluence: {
+          decisions: this.semanticPriorDecisions,
+          available: this.semanticPriorAvailable,
+          applied: this.semanticPriorApplied,
+          influenced: this.semanticPriorInfluenced,
+          influenceRate: this.semanticPriorApplied
+            ? this.semanticPriorInfluenced / this.semanticPriorApplied
+            : 0,
+          decisionInfluenceRate: this.semanticPriorDecisions
+            ? this.semanticPriorInfluenced / this.semanticPriorDecisions
+            : 0,
+        },
+        episodeStitching: {
+          resumed: this.semanticEpisodeResumes,
+          resumeErrors: this.semanticEpisodeResumeErrors,
+        },
+        durable: durableLearning,
       },
       reliability: {
         legacyInputAcknowledged: this.legacyInputAcknowledged,

@@ -95,9 +95,12 @@
   "semanticRagSearchBudgetMs": 15,
   "semanticRagMinimumSimilarity": 0.72,
   "semanticRagMaxContextChars": 1600,
-  "semanticFastPathEnabled": true,
+  "semanticFastPathEnabled": false,
   "semanticFastPathMinimumSamples": 3,
   "semanticFastPathMinimumAverageReturn": 0.25,
   "semanticFastPathMinimumPositiveRate": 0.67,
+  "semanticPriorMinimumEpisodes": 3,
+  "semanticPriorConfidenceZ": 1.28,
+  "semanticPriorMaximumBlend": 0.3,
   "semanticEpisodeDiscount": 0.97
 }
