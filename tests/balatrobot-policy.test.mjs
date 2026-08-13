@@ -543,6 +543,25 @@ test("targeted pack cards cannot omit their game-level target contract", () => {
   assert.ok(fallback.params.targets.length >= 1 && fallback.params.targets.length <= expectedMaximum);
 });
 
+test("fallback skips destructive Spectral offers instead of using them without strategic approval", () => {
+  const state = {
+    state: "SMODS_BOOSTER_OPENED",
+    money: 5,
+    hand: area([], 8),
+    jokers: area([
+      card({ key: "j_cavendish", set: "JOKER", effect: "X3 Mult" }),
+      card({ key: "j_blueprint", set: "JOKER", effect: "Copies Joker to the right" }),
+    ], 5),
+    consumables: area([], 2),
+    pack: area([card({ key: "c_hex", set: "SPECTRAL" })], 1),
+  };
+  assert.deepEqual(fallbackBalatrobotAction(state), {
+    method: "pack",
+    params: { skip: true },
+    reason: "Fallback: skip because no locally safe pack choice exists",
+  });
+});
+
 test("local policy rejects v1.5.2 actions that are certainly unavailable", () => {
   const bossState = {
     ...handState(),

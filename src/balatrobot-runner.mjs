@@ -37,15 +37,17 @@ const LEARNABLE_METHODS = new Set([
   "play",
   "discard",
   "buy",
+  "buy_use",
   "sell",
   "reroll",
+  "reroll_boss",
   "next_round",
   "use",
   "rearrange",
   "pack",
 ]);
 const MODEL_STATES = new Set(["BLIND_SELECT", "SELECTING_HAND", "SHOP", "SMODS_BOOSTER_OPENED"]);
-const STRATEGIC_SHOP_METHODS = new Set(["buy", "sell", "reroll"]);
+const STRATEGIC_SHOP_METHODS = new Set(["buy", "buy_use", "sell", "reroll"]);
 
 function checkpointSegment(value, fallback = "unknown") {
   const normalized = String(value ?? "").trim().replaceAll(":", "_").replaceAll("|", "_");
@@ -983,6 +985,10 @@ export async function runBalatrobot({
       Object.defineProperties(state, {
         __scoreBenchmarks: { value: scoreBenchmarks, configurable: true },
         __runPlan: { value: runPlan, configurable: true },
+        // Save-backed unlock/discovery progress is deliberately non-enumerable:
+        // local strategy valuation can use it without changing the exact game
+        // fingerprint sent to candidate guards or semantic replay.
+        collectionKnowledge: { value: collectionKnowledge, configurable: true },
       });
       const compactState = compactBalatrobotState(state);
       Object.defineProperties(compactState, {
@@ -1475,9 +1481,11 @@ export async function runBalatrobot({
                 action,
               });
             } else try {
-              const routineCandidates = state?.state === "SHOP"
-                ? candidates.filter((candidate) => !candidate.requiresStrategic)
-                : candidates;
+              // A failed strategic route must never hand an irreversible
+              // consumable/build action to the high-frequency model. It may
+              // rank only candidates that were explicitly classified as
+              // routine-safe by the local rules layer.
+              const routineCandidates = candidates.filter((candidate) => !candidate.requiresStrategic);
               const routineMode = {
                 ...thinkingMode,
                 strategic: false,
@@ -1509,7 +1517,7 @@ export async function runBalatrobot({
                     runPlan,
                     previousError: `Strategic route unavailable: ${strategicError.message}`.slice(0, 300),
                     experienceContext,
-                    candidates,
+                    candidates: routineCandidates,
                     thinkingMode: {
                       ...thinkingMode,
                       strategic: true,
@@ -1608,6 +1616,37 @@ export async function runBalatrobot({
         transitionStartedAt = 0;
         transitionPolls = 0;
         selectedActionCandidate ??= candidateForAction(action, actionCandidates);
+        if (
+          selectedActionCandidate?.requiresStrategic === true &&
+          source !== "balatrobot_model_strategic" &&
+          source !== "balatrobot_checkpoint_sequence" &&
+          source !== "balatrobot_strategic_unavailable_safe_exit"
+        ) {
+          const proposedAction = action;
+          const proposedSource = source;
+          action = fallbackBalatrobotAction(state);
+          selectedActionCandidate = candidateForAction(action, actionCandidates);
+          // The local fallback may only continue if it is a non-strategic
+          // member of the same exact candidate set. Otherwise stop this turn
+          // without input and retry after the strategic service recovers.
+          if (!selectedActionCandidate || selectedActionCandidate.requiresStrategic) action = null;
+          planDetails = action
+            ? {
+                observation: "The strategic route was unavailable; an irreversible local candidate was blocked.",
+                strategy: action.reason,
+                memory,
+                runPlan,
+                confidence: 1,
+              }
+            : null;
+          source = action ? "balatrobot_unapproved_strategic_action_safe_fallback" : "balatrobot_unapproved_strategic_action_blocked";
+          log.event("bot_unapproved_strategic_action_blocked", {
+            step,
+            proposedAction,
+            proposedSource,
+            replacement: action,
+          });
+        }
         if (semanticPriorResult) {
           const selectedPrior = selectedActionCandidate?.experiencePrior ?? null;
           const selectedIsChangedTop = Boolean(

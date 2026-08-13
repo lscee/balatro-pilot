@@ -1,0 +1,30 @@
+{
+  "name": "buy_use",
+  "summary": "Buy and immediately use a shop consumable",
+  "description": "Buy and immediately use the exact consumable at a zero-based shop index after native legality checks.",
+  "tags": [
+    { "$ref": "#/components/tags/shop" }
+  ],
+  "params": [
+    {
+      "name": "card",
+      "required": true,
+      "schema": { "type": "integer", "minimum": 0 }
+    },
+    {
+      "name": "targets",
+      "required": false,
+      "schema": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "uniqueItems": true }
+    }
+  ],
+  "result": {
+    "name": "gamestate",
+    "description": "Complete game state after the consumable purchase and use finishes",
+    "schema": { "$ref": "#/components/schemas/GameState" }
+  },
+  "errors": [
+    { "$ref": "#/components/errors/InvalidState" },
+    { "$ref": "#/components/errors/BadRequest" },
+    { "$ref": "#/components/errors/NotAllowed" }
+  ]
+}

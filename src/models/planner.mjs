@@ -219,7 +219,7 @@ function balatrobotActionSchema() {
           properties: {
             method: {
               type: "string",
-              enum: ["select", "skip", "play", "discard", "buy", "sell", "reroll", "next_round", "pack", "use", "rearrange"],
+              enum: ["select", "skip", "reroll_boss", "play", "discard", "buy", "buy_use", "sell", "reroll", "next_round", "pack", "use", "rearrange"],
             },
             cards: indices,
             card: nullableIndex,
@@ -519,11 +519,12 @@ function kimiBalatrobotJsonInstruction() {
     "Before naming a core build, read activeDeck, collectionKnowledge, and appearedThisRun inside build_planning_context. Treat the active deck effect as a run-wide rule: adapt hand targets, economy, slot usage, and shop priorities to exploit its upside and cover its downside. The save-backed activeUnlockTarget is the run objective, but a locked Joker condition is only an optional opportunity: pursue it only when the exact current state makes it reachable at negligible survival cost, never invent a hidden condition, and never weaken a winning line merely to chase it. A locked Joker is impossible as a shop/build target. buildGoal and synergies may name only owned Jokers or cards that have actually appeared in this run. Unlocked-but-unseen Jokers may appear only as optional shop priorities or explicit pivot possibilities, never as if already owned or as the current core. Prefer the strongest supported route among cards that actually appeared; remain flexible when only weak bridges have appeared.",
     "IMPORTANT: actions MUST be a JSON array containing exactly one object, never a bare object. Example: actions:[{method:\"play\",cards:[0,1],card:null,voucher:null,pack:null,joker:null,consumable:null,targets:[],skip:null,hand:[],jokers:[],consumables:[],reason:\"play pair\"}].",
     "The action has exactly these fields: method, cards, card, voucher, pack, joker, consumable, targets, skip, hand, jokers, consumables, reason.",
-    "method is select|skip|play|discard|buy|sell|reroll|next_round|pack|use|rearrange.",
+    "method is select|skip|reroll_boss|play|discard|buy|buy_use|sell|reroll|next_round|pack|use|rearrange.",
     "On BLIND_SELECT, select means CHALLENGE and play the currently offered blind; skip means truly forfeit that blind, its cash, and its shop. Never output skip when strategy says normal challenge, play the current blind, or do not skip. Skip is exceptional: only a clearly named high-value tag in a mature scoring build may justify it; otherwise select.",
+    "reroll_boss is available only as an exact local candidate approved by strategic planning; it spends $10 through Director's Cut or Retcon and accepts no parameters.",
     "The local rules engine is the sole authority for poker classification, suit equivalence, consumable target counts, legal candidates, conservativeScore, and the whole-round survival budget. rulesApplied records mechanics such as Smeared/Four Fingers/Shortcut/Wild. Never reinterpret those mechanics from prose. For SELECTING_HAND, never claim a play clears when conservativeScore is below the remaining target; when currentLineCanClear is false and a discard candidate exists, preserve the draw instead of spending a hand. Do not burn weak hands merely to reach Acrobat unless conservative arithmetic proves the full route survives.",
     "All indices are zero-based. Every array field is [] when unused; every scalar index is null when unused; skip is null when unused.",
-    "play/discard use cards. buy sets exactly one of card/voucher/pack. sell sets exactly one of joker/consumable.",
+    "play/discard use cards. buy sets exactly one of card/voucher/pack. buy_use sets the exact shop card and optional targets, is always strategic, and buys then immediately uses that consumable. sell sets exactly one of joker/consumable.",
     "A sell is destructive: action.reason and strategy must explicitly name the exact current label/key at that zero-based joker or consumable index. Re-read the current indexed state after every buy/sell; never reuse an earlier index or claim to sell a different item.",
     "pack uses {card,targets} for a choice or skip:true to skip. use sets consumable and optional cards.",
     "rearrange sets exactly one full permutation in hand, jokers, or consumables. Methods without parameters leave every parameter empty/null.",

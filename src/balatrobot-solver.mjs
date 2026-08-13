@@ -17,6 +17,19 @@ import {
   balatroStraightWindows,
   classifyBalatroHand,
 } from "./balatro-rules-engine.mjs";
+import {
+  balatrobotJokerCapability,
+  balatrobotJokerTacticalContext,
+  balatrobotVoucherValue,
+} from "./balatro-strategy-catalog.mjs";
+import {
+  balatroPackHasSafeConsumableChoice,
+  generateBalatroConsumablePackCandidates,
+  generateBalatroConsumableShopUseCandidates,
+  generateBalatroConsumableUseCandidates,
+} from "./balatro-consumable-strategy.mjs";
+
+export { balatrobotJokerCapability, balatrobotJokerTacticalContext, balatrobotVoucherValue };
 
 const BASE_HANDS = Object.freeze({
   "High Card": { chips: 5, mult: 1 },
@@ -120,10 +133,10 @@ const X_MULT_ENGINE_JOKERS = new Set([
   "j_cavendish", "j_hologram", "j_vampire", "j_ramen", "j_blackboard", "j_card_sharp",
   "j_acrobat", "j_flower_pot", "j_photograph", "j_baron", "j_constellation", "j_campfire",
   "j_madness", "j_bloodstone", "j_triboulet", "j_idol", "j_obelisk", "j_lucky_cat",
-  "j_steel_joker", "j_glass_joker", "j_drivers_license", "j_ancient_joker",
+  "j_steel_joker", "j_glass_joker", "j_drivers_license", "j_ancient",
 ]);
 const RETRIGGER_ENGINE_JOKERS = new Set([
-  "j_hanging_chad", "j_mime", "j_hack", "j_sock_and_buskin", "j_dusk", "j_seltzer",
+  "j_hanging_chad", "j_mime", "j_hack", "j_sock_and_buskin", "j_dusk", "j_selzer",
 ]);
 const COPY_ENGINE_JOKERS = new Set(["j_blueprint", "j_brainstorm"]);
 // These Jokers have a positional meaning that cannot be reduced to the usual
@@ -459,12 +472,14 @@ function jokerPurchaseCounterfactual(state, card, benchmarks = []) {
   const before = balatrobotHighScoreBuildProfile(state);
   const afterJokers = [...owned, card];
   const after = balatrobotHighScoreBuildProfile(stateWithJokers(state, afterJokers));
+  const capability = balatrobotJokerCapability(card, state);
   return {
     stage: before.stage,
     engineDelta: Math.round((after.engineScore - before.engineScore) * 100) / 100,
     ...benchmarkScoreDelta(state, owned, afterJokers, benchmarks),
     before,
     after,
+    capability,
   };
 }
 
@@ -473,15 +488,39 @@ function generateBlindSelectCandidates(state) {
   const blind = [state?.blinds?.small, state?.blinds?.big, state?.blinds?.boss]
     .filter(Boolean)
     .find((item) => String(item?.status ?? "").toUpperCase().includes("SELECT"));
-  return [{
+  const candidates = [{
     id: "select:current",
     action: { method: "select" },
     target: `challenge ${blind?.name || blind?.type || "the current blind"}`,
     expectedValue: 1_000,
   }];
+  const vouchers = state?.used_vouchers && typeof state.used_vouchers === "object"
+    ? state.used_vouchers
+    : {};
+  const hasRetcon = Object.hasOwn(vouchers, "v_retcon");
+  const hasDirectorsCut = Object.hasOwn(vouchers, "v_directors_cut");
+  const boss = state?.blinds?.boss ?? (String(blind?.type ?? "").toUpperCase() === "BOSS" ? blind : null);
+  const bossRestriction = String(boss?.effect ?? boss?.description ?? "").trim();
+  const money = Number(state?.money);
+  if (
+    String(blind?.type ?? "").toUpperCase() === "BOSS" &&
+    Number.isFinite(money) && money >= 10 &&
+    (hasRetcon || (hasDirectorsCut && state?.boss_rerolled !== true)) &&
+    (bossRestriction || String(boss?.name ?? "").trim())
+  ) {
+    candidates.push({
+      id: "reroll_boss:current",
+      action: { method: "reroll_boss" },
+      target: `spend $10 to replace ${boss?.name || "the current Boss Blind"}`,
+      expectedValue: bossRestriction ? 850 : 320,
+      requiresStrategic: true,
+      strategicReason: `Boss reroll changes the run matchup and costs $10${bossRestriction ? `: ${bossRestriction}` : ""}`,
+    });
+  }
+  return candidates;
 }
 
-export function generateBalatrobotShopCandidates(state, { limit = 16, benchmarks = [] } = {}) {
+export function generateBalatrobotShopCandidates(state, { limit = 16, benchmarks = [], includeConsumables = true } = {}) {
   if (state?.state !== "SHOP") return [];
   const money = availableShopMoney(state);
   const candidates = [];
@@ -510,8 +549,17 @@ export function generateBalatrobotShopCandidates(state, { limit = 16, benchmarks
         : 520,
       counterfactual,
       requiresStrategic: true,
-      strategicReason: "a shop purchase changes the build or economy",
+      tacticalConstraint: counterfactual?.capability?.constraint ?? null,
+      strategicReason: counterfactual?.capability
+        ? `behavioral Joker requires a plan: ${counterfactual.capability.kind}`
+        : "a shop purchase changes the build or economy",
     });
+  }
+  if (includeConsumables) {
+    candidates.push(...generateBalatroConsumableShopUseCandidates(state, {
+      evaluateBestPlay: (candidateState) => bestPlayCandidates(candidateState, 30)[0] ?? null,
+      limit: Math.max(4, Math.min(12, Number(limit) || 16)),
+    }));
   }
   const ownedJokers = cardsIn(state?.jokers);
   const jokerLimit = Number(state?.jokers?.limit ?? 5);
@@ -569,13 +617,15 @@ export function generateBalatrobotShopCandidates(state, { limit = 16, benchmarks
   for (const [index, card] of cardsIn(state?.vouchers).entries()) {
     const price = cardBuyPrice(card);
     if (price > money) continue;
+    const valuation = balatrobotVoucherValue(state, card, { price });
     candidates.push({
       id: `buy:voucher:${index}`,
       action: { method: "buy", voucher: index },
       card: { index, key: card?.key ?? "", label: card?.label ?? "", set: "VOUCHER", price, effect: cardEffect(card) },
-      expectedValue: 750,
+      expectedValue: valuation.value,
+      valuation,
       requiresStrategic: true,
-      strategicReason: "a voucher purchase changes the run economy",
+      strategicReason: valuation.rationale,
     });
   }
   for (const [index, card] of cardsIn(state?.packs).entries()) {
@@ -610,6 +660,12 @@ export function generateBalatrobotShopCandidates(state, { limit = 16, benchmarks
     requiresStrategic: hasStrategicOpportunity,
     strategicReason: hasStrategicOpportunity ? "leaving a shop with affordable alternatives needs strategic approval" : "",
   });
+  if (includeConsumables) {
+    candidates.push(...generateBalatroConsumableUseCandidates(state, {
+      evaluateBestPlay: (candidateState) => bestPlayCandidates(candidateState, 30)[0] ?? null,
+      limit: Math.max(4, Math.min(12, Number(limit) || 16)),
+    }));
+  }
   return candidates
     .toSorted((left, right) => (Number(right.expectedValue) || 0) - (Number(left.expectedValue) || 0) || left.id.localeCompare(right.id))
     .slice(0, Math.max(1, Number(limit) || 16));
@@ -644,7 +700,7 @@ export function estimateBalatrobotCandidateScore(state, candidate) {
   const duskCount = Number(state?.round?.hands_left) === 1
     ? jokers.filter((joker) => jokerKey(joker) === "j_dusk").length
     : 0;
-  const seltzerCount = jokers.filter((joker) => jokerKey(joker) === "j_seltzer").length;
+  const seltzerCount = jokers.filter((joker) => jokerKey(joker) === "j_selzer").length;
   const photographTarget = scoring.find(({ card }) => !cardDebuffed(card) && balatroCardIsFace(state, card))?.index;
   for (const { index, card } of scoring) {
     if (!card || cardDebuffed(card)) continue;
@@ -660,7 +716,7 @@ export function estimateBalatrobotCandidateScore(state, candidate) {
     if (hack) score.knownRetriggerSources.add("j_hack");
     if (sock) score.knownRetriggerSources.add("j_sock_and_buskin");
     if (duskCount) score.knownRetriggerSources.add("j_dusk");
-    if (seltzerCount) score.knownRetriggerSources.add("j_seltzer");
+    if (seltzerCount) score.knownRetriggerSources.add("j_selzer");
     for (let repetition = 0; repetition < repetitions; repetition += 1) {
       score.chips += chipValue(card);
       const enhancement = cardModifier(card, "enhancement");
@@ -1424,26 +1480,22 @@ function planetPlanValue(state, upgrade, runPlan) {
 export function generateBalatrobotPackCandidates(state, { limit = 12, runPlan = null } = {}) {
   if (state?.state !== "SMODS_BOOSTER_OPENED") return [];
   const offered = cardsIn(state?.pack);
-  const candidates = [];
+  // Tarot and Spectral choices use the dedicated stateful evaluator. It
+  // distinguishes safe upgrades from irreversible cards such as Hex, Ankh,
+  // Ectoplasm and Immolate, and always keeps an explicit skip candidate.
+  const consumableCandidates = generateBalatroConsumablePackCandidates(state, {
+    evaluateBestPlay: (candidateState) => bestPlayCandidates(candidateState, 30)[0] ?? null,
+    limit: 24,
+  }).filter((candidate) =>
+    candidate.action?.skip || String(candidate.card?.set ?? "").toUpperCase() !== "PLANET");
+  const candidates = [...consumableCandidates.filter((candidate) => !candidate.action?.skip)];
   const activeRunPlan = runPlan ?? state?.__runPlan ?? null;
   for (const [index, card] of offered.entries()) {
     const set = String(card?.set ?? "").toUpperCase();
+    // Known Tarot/Spectral cards were handled above. Unknown modded
+    // consumables fail closed instead of receiving a fabricated flat value.
+    if (TARGETED_CONSUMABLE_SETS.has(set)) continue;
     if (set === "JOKER" && Number(state?.jokers?.count) >= Number(state?.jokers?.limit)) continue;
-    if (TARGETED_CONSUMABLE_SETS.has(set)) {
-      const target = bestPackTargets(state, card);
-      if (!target) continue;
-      candidates.push({
-        id: `pack:${index}:${target.targets.join(",")}`,
-        action: { method: "pack", card: index, targets: target.targets },
-        card: { index, key: card?.key ?? "", label: card?.label ?? "", set },
-        targetRule: target.rule,
-        projectedPlay: target.projectedPlay ?? null,
-        projectedScore: target.projectedScore,
-        scoreGain: target.scoreGain,
-        expectedValue: 600 + Math.max(0, target.scoreGain) + target.value,
-      });
-      continue;
-    }
     const planetUpgrade = set === "PLANET" ? PLANET_HAND_UPGRADES.get(String(card?.key ?? "").toLowerCase()) : null;
     const planetValue = planetUpgrade ? planetPlanValue(state, planetUpgrade, activeRunPlan) : null;
     candidates.push({
@@ -1457,17 +1509,21 @@ export function generateBalatrobotPackCandidates(state, { limit = 12, runPlan = 
       expectedValue: set === "PLANET"
         ? 200 + (planetValue?.priority ?? 0)
         : set === "JOKER" && scoringJoker(card) ? 900 : 500,
+      safeChoice: true,
     });
   }
-  candidates.push({
+  const skip = consumableCandidates.find((candidate) => candidate.action?.skip) ?? {
     id: "pack:skip",
     action: { method: "pack", skip: true },
     target: "skip only when every offered choice is unusable or harmful",
     expectedValue: 0,
-  });
-  return candidates
+    safeChoice: true,
+  };
+  const maximum = Math.max(1, Number(limit) || 12);
+  const ranked = candidates
     .toSorted((left, right) => (Number(right.expectedValue) || 0) - (Number(left.expectedValue) || 0) || left.id.localeCompare(right.id))
-    .slice(0, Math.max(1, Number(limit) || 12));
+    .slice(0, Math.max(0, maximum - 1));
+  return [...ranked, skip];
 }
 
 function emergencyBossCandidates(state) {
@@ -1487,7 +1543,322 @@ function emergencyBossCandidates(state) {
     action: { method: "sell", joker: selected.index },
     target: "disable Verdant Leaf before relying on debuffed cards",
     expectedValue: 2_000,
+    requiresStrategic: true,
+    strategicReason: "selling a Joker to disable Verdant Leaf is irreversible",
+    destructive: true,
+    requiredForSurvival: true,
   }];
+}
+
+function roundCounter(state, snakeName, camelName) {
+  const value = Number(state?.round?.[snakeName] ?? state?.round?.[camelName]);
+  return Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function consumableSlotOpen(state) {
+  const cards = cardsIn(state?.consumables);
+  const count = Number(state?.consumables?.count ?? cards.length);
+  const limit = Number(state?.consumables?.limit ?? state?.consumables?.card_limit ?? 2);
+  return Number.isFinite(limit) && (Number.isFinite(count) ? count : cards.length) < limit;
+}
+
+function behavioralJoker(state, key) {
+  return cardsIn(state?.jokers)
+    .map((joker, index) => ({ joker, index, capability: balatrobotJokerCapability(joker, state) }))
+    .find(({ joker, capability }) =>
+      jokerKey(joker) === key && !jokerDebuffed(joker) && capability?.activeNow) ?? null;
+}
+
+function withoutVisibleHandCards(state, removedIndices, { lockMouthToHighCard = false } = {}) {
+  const removed = new Set(removedIndices);
+  const simulated = {
+    ...state,
+    hand: {
+      ...(state?.hand ?? {}),
+      cards: cardsIn(state?.hand).filter((_, index) => !removed.has(index)),
+    },
+  };
+  if (lockMouthToHighCard) simulated.__mouthLockedHandType = "High Card";
+  return simulated;
+}
+
+function conservativeBehaviorSurvivalFloor(state, removedIndices, {
+  setupScore = 0,
+  handsSpent = 0,
+} = {}) {
+  const blind = activeBlind(state);
+  const target = Number(blind?.score);
+  const current = Number(state?.round?.chips);
+  const handsLeft = roundCounter(state, "hands_left", "handsLeft");
+  const handsAfter = Math.max(0, handsLeft - handsSpent);
+  const bossName = String(blind?.name ?? "").trim().toLowerCase();
+  // A one-card setup on The Eye consumes High Card and makes our repeat-line
+  // projection invalid. Fail closed instead of pretending the next High Card
+  // remains legal. The Mouth is modeled by locking subsequent plays locally.
+  if (handsSpent > 0 && bossName === "the eye") {
+    return {
+      safe: false,
+      reason: "The Eye invalidates a repeat-line estimate after a setup hand",
+      target,
+      current,
+      handsAfter,
+      postSetupBestScore: 0,
+      projectedTotal: Number.isFinite(current) ? current + Math.max(0, Number(setupScore) || 0) : 0,
+    };
+  }
+  const simulated = withoutVisibleHandCards(state, removedIndices, {
+    lockMouthToHighCard: handsSpent > 0 && bossName === "the mouth" && !balatrobotMouthLockedHandType(state),
+  });
+  const postSetupBest = bestPlayCandidates(simulated, 30)[0] ?? null;
+  const postSetupBestScore = Math.max(0, Number(postSetupBest?.conservativeScore) || 0);
+  const projectedTotal = (Number.isFinite(current) ? current : 0) +
+    Math.max(0, Number(setupScore) || 0) + postSetupBestScore * handsAfter;
+  const safe = Number.isFinite(target) && target > 0 && handsAfter > 0 && postSetupBestScore > 0 && projectedTotal >= target;
+  return {
+    safe,
+    reason: safe
+      ? "the measured post-setup line still reaches the blind target without credit for the Joker reward or replacement draws"
+      : "the measured post-setup line does not preserve the blind-clear floor",
+    target,
+    current: Number.isFinite(current) ? current : 0,
+    handsAfter,
+    setupScore: Math.max(0, Number(setupScore) || 0),
+    postSetupBestScore,
+    projectedTotal,
+    margin: Number.isFinite(target) ? projectedTotal - target : null,
+  };
+}
+
+function cardDeckValue(card) {
+  const edition = cardModifier(card, "edition");
+  const enhancement = cardModifier(card, "enhancement");
+  const seal = cardModifier(card, "seal");
+  const permanentBonus = Number(card?.perma_bonus ?? card?.permaBonus ?? card?.value?.perma_bonus) || 0;
+  return (
+    (edition ? 2_000 : 0) +
+    (seal ? 1_200 : 0) +
+    (enhancement ? 800 : 0) +
+    permanentBonus * 20 +
+    rankNumber(cardRank(card)) * 10
+  );
+}
+
+function candidateCardsSignature(candidate) {
+  const method = candidate?.action?.method;
+  if (!HAND_ACTION_METHODS.has(method)) return "";
+  return `${method}:${[...(candidate.action?.cards ?? [])].toSorted((left, right) => left - right).join(",")}`;
+}
+
+function dnaSetupCandidate(state) {
+  const behavior = behavioralJoker(state, "j_dna");
+  if (!behavior || roundCounter(state, "hands_played", "handsPlayed") !== 0 || roundCounter(state, "hands_left", "handsLeft") < 2) {
+    return null;
+  }
+  const cards = cardsIn(state?.hand);
+  return cards
+    .map((card, index) => {
+      const play = playCandidate(state, cards, [index]);
+      if (cardDebuffed(card) || !bossAllowsPlayCandidate(state, play)) return null;
+      const survivalFloor = conservativeBehaviorSurvivalFloor(state, [index], {
+        setupScore: play.conservativeScore,
+        handsSpent: 1,
+      });
+      if (!survivalFloor.safe) return null;
+      return {
+        ...play,
+        id: `behavior:j_dna:play:${index}`,
+        target: `copy ${cardRank(card) || "the selected card"} into the deck with DNA`,
+        // The duplicated card's intrinsic permanent value dominates; score
+        // margin is only a late tie-break and must not make an ordinary King
+        // preferable to a Polychrome/Sealed Ace.
+        expectedValue: 1_200 + cardDeckValue(card) + Math.min(200, Math.max(0, Number(play.conservativeScore) || 0)),
+        behavioralJoker: behavior.capability,
+        requiresStrategic: true,
+        strategicReason: "DNA's first-hand single-card setup spends a scoring hand and changes the deck",
+        survivalFloor,
+      };
+    })
+    .filter(Boolean)
+    .toSorted((left, right) =>
+      right.expectedValue - left.expectedValue ||
+      right.survivalFloor.margin - left.survivalFloor.margin ||
+      left.id.localeCompare(right.id))[0] ?? null;
+}
+
+function sixthSenseSetupCandidate(state) {
+  const behavior = behavioralJoker(state, "j_sixth_sense");
+  if (
+    !behavior ||
+    roundCounter(state, "hands_played", "handsPlayed") !== 0 ||
+    roundCounter(state, "hands_left", "handsLeft") < 2 ||
+    !consumableSlotOpen(state)
+  ) return null;
+  const cards = cardsIn(state?.hand);
+  return cards
+    .map((card, index) => {
+      if (rankNumber(cardRank(card)) !== 6 || cardDebuffed(card)) return null;
+      const play = playCandidate(state, cards, [index]);
+      if (!bossAllowsPlayCandidate(state, play)) return null;
+      const survivalFloor = conservativeBehaviorSurvivalFloor(state, [index], {
+        // Sixth Sense destroys the 6; do not count its displayed High Card
+        // score toward survival even if the engine animation later exposes it.
+        setupScore: 0,
+        handsSpent: 1,
+      });
+      if (!survivalFloor.safe) return null;
+      return {
+        ...play,
+        id: `behavior:j_sixth_sense:play:${index}`,
+        target: "destroy one plain 6 with Sixth Sense to create a Spectral card",
+        expectedValue: 1_350 - cardDeckValue(card),
+        behavioralJoker: behavior.capability,
+        requiresStrategic: true,
+        strategicReason: "Sixth Sense destroys the first-hand 6 and spends a scoring hand",
+        destructive: true,
+        survivalFloor,
+      };
+    })
+    .filter(Boolean)
+    .toSorted((left, right) =>
+      right.expectedValue - left.expectedValue ||
+      right.survivalFloor.margin - left.survivalFloor.margin ||
+      left.id.localeCompare(right.id))[0] ?? null;
+}
+
+function tradingCardDiscardCandidate(state, bestPlay) {
+  const behavior = behavioralJoker(state, "j_trading");
+  if (
+    !behavior ||
+    roundCounter(state, "discards_used", "discardsUsed") !== 0 ||
+    roundCounter(state, "discards_left", "discardsLeft") <= 0
+  ) return null;
+  const cards = cardsIn(state?.hand);
+  const scoringCore = new Set(bestPlay?.scoringCards ?? bestPlay?.action?.cards ?? []);
+  return cards
+    .map((card, index) => {
+      const survivalFloor = conservativeBehaviorSurvivalFloor(state, [index]);
+      if (!survivalFloor.safe) return null;
+      const deckValue = cardDeckValue(card);
+      return {
+        id: `behavior:j_trading:discard:${index}`,
+        action: { method: "discard", cards: [index] },
+        target: "destroy one expendable card with Trading Card for $3",
+        keptCards: cards.map((_, cardIndex) => cardIndex).filter((cardIndex) => cardIndex !== index),
+        survivalFloorScore: survivalFloor.postSetupBestScore,
+        exactRemainingDeckOuts: cardsIn(state?.cards ?? state?.remainingDeck).length,
+        expectedValue: 1_500 - deckValue - (scoringCore.has(index) ? 600 : 0),
+        behavioralJoker: behavior.capability,
+        requiresStrategic: true,
+        strategicReason: "Trading Card permanently destroys the selected card on the first discard",
+        destructive: true,
+        survivalFloor,
+      };
+    })
+    .filter(Boolean)
+    .toSorted((left, right) =>
+      right.expectedValue - left.expectedValue ||
+      right.survivalFloor.margin - left.survivalFloor.margin ||
+      left.id.localeCompare(right.id))[0] ?? null;
+}
+
+function handRouteEvidence(state, handType, runPlan, bestPlay) {
+  const planned = plannedHandTypes(runPlan ?? state?.__runPlan ?? null);
+  const planIndex = planned.indexOf(handType);
+  const live = state?.hands?.[handType] ?? state?.pokerHands?.[handType] ?? {};
+  const played = Number(live?.played ?? live?.played_total ?? live?.playedTotal ?? live?.played_this_round ?? live?.playedThisRound) || 0;
+  const level = Number(live?.level) || 1;
+  const currentRoute = bestPlay?.handType === handType;
+  if (planIndex < 0 && played <= 0 && level <= 1 && !currentRoute) return 0;
+  return (planIndex >= 0 ? 2_000 - planIndex * 250 : 0) + played * 90 + Math.max(0, level - 1) * 180 +
+    (currentRoute ? 450 : 0) + (HAND_STRENGTH[handType] ?? 0) * 10;
+}
+
+function burntJokerDiscardCandidate(state, bestPlay, runPlan) {
+  const behavior = behavioralJoker(state, "j_burnt");
+  if (
+    !behavior ||
+    roundCounter(state, "discards_used", "discardsUsed") !== 0 ||
+    roundCounter(state, "discards_left", "discardsLeft") <= 0
+  ) return null;
+  const cards = cardsIn(state?.hand);
+  const highlighted = Number(state?.hand?.highlighted_limit);
+  const maximum = Math.min(5, Number.isInteger(highlighted) && highlighted > 0 ? highlighted : 5, Math.max(1, cards.length - 1));
+  return combinations(cards.length, maximum)
+    .map((indices) => {
+      const classified = classifyBalatroHand(state, cards, indices);
+      const routeEvidence = handRouteEvidence(state, classified.handType, runPlan, bestPlay);
+      if (routeEvidence <= 0) return null;
+      // Do not invent a High Card route merely because every subset classifies
+      // as one. It must already be planned, played, levelled, or the only live
+      // route in the current hand.
+      const survivalFloor = conservativeBehaviorSurvivalFloor(state, indices);
+      if (!survivalFloor.safe) return null;
+      return {
+        id: `behavior:j_burnt:discard:${indices.join(",")}`,
+        action: { method: "discard", cards: indices },
+        target: `upgrade ${classified.handType} with Burnt Joker's first discard`,
+        handType: classified.handType,
+        pursuesHandTypes: [classified.handType],
+        keptCards: cards.map((_, index) => index).filter((index) => !indices.includes(index)),
+        survivalFloorScore: survivalFloor.postSetupBestScore,
+        exactRemainingDeckOuts: cardsIn(state?.cards ?? state?.remainingDeck).length,
+        expectedValue: 1_100 + routeEvidence - indices.reduce((sum, index) => sum + cardDeckValue(cards[index]), 0) * 0.1,
+        behavioralJoker: behavior.capability,
+        requiresStrategic: true,
+        strategicReason: `Burnt Joker's first discard permanently chooses a ${classified.handType} level-up route for this round`,
+        survivalFloor,
+      };
+    })
+    .filter(Boolean)
+    .toSorted((left, right) =>
+      right.expectedValue - left.expectedValue ||
+      right.survivalFloor.margin - left.survivalFloor.margin ||
+      left.action.cards.length - right.action.cards.length ||
+      left.id.localeCompare(right.id))[0] ?? null;
+}
+
+function luchadorBossCandidate(state, bestPlay) {
+  const behavior = behavioralJoker(state, "j_luchador");
+  const blind = activeBlind(state);
+  if (!behavior || String(blind?.type ?? "").toUpperCase() !== "BOSS") return null;
+  if (Boolean(behavior.joker?.modifier?.eternal ?? behavior.joker?.eternal)) return null;
+  const budget = balatroRoundSurvivalBudget(state, Number(bestPlay?.conservativeScore) || 0);
+  const restriction = String(blind?.effect ?? blind?.description ?? blind?.name ?? "current Boss restriction").trim();
+  return {
+    id: `behavior:j_luchador:sell:${behavior.index}`,
+    action: { method: "sell", joker: behavior.index },
+    target: `sell Luchador to disable ${blind?.name ?? "the Boss blind"}`,
+    expectedValue: budget.currentLineCanClear ? 500 : 1_600,
+    behavioralJoker: behavior.capability,
+    bossRestriction: restriction,
+    requiresStrategic: true,
+    strategicReason: `selling Luchador is irreversible; approve only if disabling ${blind?.name ?? "this Boss"} is worth the slot loss`,
+    destructive: true,
+    requiredForSurvival: false,
+    survivalFloor: {
+      safe: budget.currentLineCanClear,
+      target: budget.target,
+      current: budget.current,
+      handsAfter: budget.handsLeft,
+      postSetupBestScore: budget.bestScore,
+      projectedTotal: budget.projectedTotal,
+      margin: budget.projectedTotal - budget.target,
+      reason: budget.currentLineCanClear
+        ? "the measured line clears even before crediting disabled Boss effects"
+        : "the score model cannot prove the line without disabling the Boss effect; strategic review is required",
+    },
+  };
+}
+
+function behavioralJokerCandidates(state, plays, { runPlan = null } = {}) {
+  const bestPlay = [...plays].toSorted(playSort)[0] ?? null;
+  return [
+    dnaSetupCandidate(state),
+    sixthSenseSetupCandidate(state),
+    tradingCardDiscardCandidate(state, bestPlay),
+    burntJokerDiscardCandidate(state, bestPlay, runPlan),
+    luchadorBossCandidate(state, bestPlay),
+  ].filter(Boolean);
 }
 
 export function generateBalatrobotCandidates(state, { limit = 14, benchmarks = [], runPlan = null } = {}) {
@@ -1501,9 +1872,19 @@ export function generateBalatrobotCandidates(state, { limit = 14, benchmarks = [
   const discardLimit = Math.min(5, Math.max(2, Math.floor(normalizedLimit / 3)));
   const discards = discardCandidates(state, discardLimit);
   const plays = bestPlayCandidates(state, normalizedLimit - discards.length);
-  const consumables = emergencyConsumableCandidates(state, plays);
-  const semanticActions = [...emergencyBossCandidates(state), ...consumables];
-  const handActions = [...plays, ...discards].slice(0, Math.max(0, normalizedLimit - semanticActions.length));
+  const jokerActions = behavioralJokerCandidates(state, plays, { runPlan });
+  // A behavioral setup must not also be exposed as an unmarked routine hand
+  // action. Otherwise the same cards could bypass strategic approval simply by
+  // selecting the generic candidate id.
+  const protectedActions = new Set(jokerActions.map(candidateCardsSignature).filter(Boolean));
+  const ordinaryHandActions = [...plays, ...discards]
+    .filter((candidate) => !protectedActions.has(candidateCardsSignature(candidate)));
+  const consumables = generateBalatroConsumableUseCandidates(state, {
+    evaluateBestPlay: (candidateState) => bestPlayCandidates(candidateState, 30)[0] ?? null,
+    limit: Math.max(4, Math.min(10, normalizedLimit - 2)),
+  });
+  const semanticActions = [...emergencyBossCandidates(state), ...jokerActions, ...consumables];
+  const handActions = ordinaryHandActions.slice(0, Math.max(0, normalizedLimit - semanticActions.length));
   let result = [...handActions, ...semanticActions].slice(0, normalizedLimit);
   const mouthLocked = balatrobotMouthLockedHandType(state);
   if (
@@ -1584,6 +1965,7 @@ export function generateBalatrobotCandidates(state, { limit = 14, benchmarks = [
           paceShortfall: assessment.paceShortfall,
           currentLineCanClear: assessment.currentLineCanClear,
           shouldDiscard: assessment.shouldDiscard,
+          mrBones: assessment.mrBones,
         },
       }
     : candidate);
@@ -1595,19 +1977,35 @@ export function balatrobotSurvivalAssessment(state, candidates) {
     .toSorted((left, right) => (right.conservativeScore ?? 0) - (left.conservativeScore ?? 0));
   const discard = (Array.isArray(candidates) ? candidates : []).find((candidate) => candidate.action?.method === "discard") ?? null;
   const emergencyConsumable = (Array.isArray(candidates) ? candidates : [])
-    .filter((candidate) => candidate.action?.method === "use")
+    .filter((candidate) =>
+      candidate.action?.method === "use" &&
+      candidate.eligibleForEmergency === true &&
+      candidate.fallbackSafe === true)
     .toSorted(
       (left, right) =>
         (Number(right.projectedScore) || 0) - (Number(left.projectedScore) || 0) ||
         (Number(right.expectedValue) || 0) - (Number(left.expectedValue) || 0),
     )[0] ?? null;
-  const requiredBossAction = (Array.isArray(candidates) ? candidates : []).find((candidate) => candidate.action?.method === "sell") ?? null;
+  const requiredBossAction = (Array.isArray(candidates) ? candidates : [])
+    .find((candidate) => candidate.action?.method === "sell" && candidate.requiredForSurvival === true) ?? null;
   const blind = activeBlind(state);
   const discardsLeft = Number(state?.round?.discards_left);
   const bestPlay = plays[0] ?? null;
   const bestScore = Number(bestPlay?.conservativeScore) || 0;
   const budget = balatroRoundSurvivalBudget(state, bestScore);
   const { target, current, deficit, handsLeft, requiredPace } = budget;
+  const mrBonesOwned = cardsIn(state?.jokers).some((joker) =>
+    jokerKey(joker) === "j_mr_bones" && !jokerDebuffed(joker));
+  const mrBonesThreshold = Number.isFinite(target) && target > 0 ? Math.ceil(target * 0.25) : 0;
+  const mrBones = {
+    owned: mrBonesOwned,
+    threshold: mrBonesThreshold,
+    currentReached: mrBonesOwned && mrBonesThreshold > 0 && current >= mrBonesThreshold,
+    projectedReached: mrBonesOwned && mrBonesThreshold > 0 && budget.projectedTotal >= mrBonesThreshold,
+    canPreventLoss: mrBonesOwned && mrBonesThreshold > 0 && !budget.currentLineCanClear && budget.projectedTotal >= mrBonesThreshold,
+    destroysOnSave: mrBonesOwned,
+    exactScoreSupported: false,
+  };
   const canImprove = discardsLeft > 0 && Boolean(discard);
   const shouldDiscard = canImprove && deficit > 0 && (
     (handsLeft <= 1 && bestScore < deficit) ||
@@ -1634,6 +2032,7 @@ export function balatrobotSurvivalAssessment(state, candidates) {
     projectedTotal: budget.projectedTotal,
     paceShortfall: budget.paceShortfall,
     currentLineCanClear: budget.currentLineCanClear,
+    mrBones,
     discard,
     shouldDiscard,
     emergencyConsumable,
@@ -1658,10 +2057,12 @@ export function assertBalatrobotCandidateAction(action, candidates, state = null
     return action;
   }
   if (state?.state === "SMODS_BOOSTER_OPENED" && action?.method === "pack" && action?.params?.skip === true) {
-    const safeChoice = candidates.find((candidate) => candidate.action?.method === "pack" && !candidate.action.skip);
+    const safeChoice = balatroPackHasSafeConsumableChoice(candidates) || candidates.some(
+      (candidate) => candidate.action?.method === "pack" && !candidate.action.skip && candidate.safeChoice === true,
+    );
     if (safeChoice) {
       throw new Error(
-        `do not skip a pack with a locally safe choice: ${safeChoice.card?.label || safeChoice.card?.key || safeChoice.id}`,
+        "do not skip a pack with a locally safe choice",
       );
     }
   }
@@ -1742,15 +2143,16 @@ export function assertBalatrobotCandidateAction(action, candidates, state = null
       return `play:${cards.join(",")}` === signature;
     });
     const chosenScore = Number(chosen?.conservativeScore) || 0;
+    const approvedBehaviorSetup = Boolean(chosen?.behavioralJoker && chosen?.requiresStrategic && chosen?.survivalFloor?.safe);
     if (assessment.shouldResolveBoss) {
       throw new Error("Verdant Leaf is still debuffing the hand; sell the recommended non-core Joker before playing");
     }
-    if (assessment.bestScore > 0 && chosenScore < assessment.bestScore * 0.72) {
+    if (!approvedBehaviorSetup && assessment.bestScore > 0 && chosenScore < assessment.bestScore * 0.72) {
       throw new Error(
         `play conservative score ${chosenScore} is far below the locally best ${assessment.bestScore}; choose the stronger candidate`,
       );
     }
-    if (assessment.shouldDiscard) {
+    if (!approvedBehaviorSetup && assessment.shouldDiscard) {
       throw new Error(
         `best conservative play ${assessment.bestScore} cannot maintain the survival pace ` +
           `${Math.ceil(assessment.requiredPace)} with ${assessment.discardsLeft} discard(s) available; discard to improve first`,
@@ -1770,11 +2172,12 @@ export function assertBalatrobotCandidateAction(action, candidates, state = null
       const cards = [...(candidate.action.cards ?? [])].sort((left, right) => left - right);
       return `discard:${cards.join(",")}` === signature;
     });
+    const approvedBehaviorDiscard = Boolean(selected?.behavioralJoker && selected?.requiresStrategic && selected?.survivalFloor?.safe);
     const bestDiscardValue = Math.max(
       0,
       ...candidates.filter((candidate) => candidate.action?.method === "discard").map((candidate) => Number(candidate.expectedValue) || 0),
     );
-    if (bestDiscardValue > 0 && (Number(selected?.expectedValue) || 0) < bestDiscardValue * 0.7) {
+    if (!approvedBehaviorDiscard && bestDiscardValue > 0 && (Number(selected?.expectedValue) || 0) < bestDiscardValue * 0.7) {
       throw new Error(`discard expected value ${selected?.expectedValue ?? 0} is far below the locally best ${bestDiscardValue}`);
     }
     const highScoreProfile = balatrobotHighScoreBuildProfile(state);
@@ -1792,14 +2195,15 @@ export function assertBalatrobotCandidateAction(action, candidates, state = null
       survivalFloorScore > 0 &&
       target > 0 &&
       current + survivalFloorScore * assessment.handsLeft >= target * 1.1;
-    if (assessment.bestScore >= assessment.deficit && assessment.deficit > 0 && !safeHighScoreChase) {
+    if (assessment.bestScore >= assessment.deficit && assessment.deficit > 0 && !safeHighScoreChase && !approvedBehaviorDiscard) {
       throw new Error(`a local play already clears the remaining ${assessment.deficit}; do not spend a discard`);
     }
     if (
       assessment.handsLeft <= 3 &&
       assessment.requiredPace > 0 &&
       assessment.bestScore >= assessment.requiredPace * 1.35 &&
-      !safeHighScoreChase
+      !safeHighScoreChase &&
+      !approvedBehaviorDiscard
     ) {
       throw new Error(
         `local play ${assessment.bestScore} safely exceeds the per-hand pace ${Math.ceil(assessment.requiredPace)}; ` +
@@ -1839,6 +2243,9 @@ export function balatrobotThinkingMode(state, candidates, config = {}) {
     return { strategic: true, effort: strategic, reason: `${state.state.toLowerCase()} changes the run build` };
   }
   if (state?.state === "BLIND_SELECT") {
+    if (candidates.some((candidate) => candidate.action?.method === "reroll_boss" && candidate.requiresStrategic)) {
+      return { strategic: true, effort: strategic, reason: "Boss reroll needs strategic approval" };
+    }
     const selectable = [state?.blinds?.small, state?.blinds?.big, state?.blinds?.boss]
       .filter(Boolean)
       .find((blind) => String(blind.status ?? "").toUpperCase().includes("SELECT"));
@@ -1851,6 +2258,7 @@ export function balatrobotThinkingMode(state, candidates, config = {}) {
     return { strategic: false, effort: routine, reason: "blind selection has a clear progress action" };
   }
   if (state?.state !== "SELECTING_HAND") return { strategic: false, effort: routine, reason: "local navigation" };
+  const jokerTactics = balatrobotJokerTacticalContext(state);
   const blind = activeBlind(state);
   const boss = String(blind?.type ?? "").toUpperCase() === "BOSS";
   const handsLeft = Number(state?.round?.hands_left);
@@ -1861,10 +2269,11 @@ export function balatrobotThinkingMode(state, candidates, config = {}) {
   const belowPace = requiredPace > 0 && bestBase < requiredPace;
   const survival = balatrobotSurvivalAssessment(state, candidates);
   const rescue = survival.shouldUseConsumable && survival.consumableClearsBlind;
-  if (boss || rescue) {
+  if (boss || rescue || jokerTactics.requiresStrategic) {
     const reasons = [
       boss && "one strategic package for this Boss blind",
       rescue && `consumable can clear the remaining ${survival.deficit}`,
+      jokerTactics.requiresStrategic && "an active behavioral Joker changes hand/discard sequencing",
     ].filter(Boolean);
     return { strategic: true, effort: strategic, reason: reasons.join(", "), checkpointPhase: "blind" };
   }

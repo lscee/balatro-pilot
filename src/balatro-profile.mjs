@@ -95,12 +95,29 @@ function parseUnlockCondition(line) {
   return condition;
 }
 
+function luaBooleanField(source, name, fallback = false) {
+  const value = String(source ?? "").match(new RegExp(`\\b${name}\\s*=\\s*(true|false)`, "u"))?.[1];
+  return value == null ? fallback : value === "true";
+}
+
+function luaStringField(source, name, fallback = "") {
+  return String(source ?? "").match(new RegExp(`\\b${name}\\s*=\\s*["']([^"']+)["']`, "u"))?.[1] ?? fallback;
+}
+
+function luaRequires(line) {
+  const marker = /\brequires\s*=\s*/u.exec(line);
+  if (!marker) return [];
+  const openingBrace = line.indexOf("{", marker.index + marker[0].length);
+  if (openingBrace < 0) return [];
+  return [...bracedBodyAt(line, openingBrace).matchAll(/["']([^"']+)["']/gu)].map((match) => match[1]);
+}
+
 export function parseVanillaJokerCatalog(source) {
   const jokers = [];
   for (const line of String(source ?? "").split(/\r?\n/u)) {
     const key = line.match(/^\s*(j_[a-z0-9_]+)\s*=\s*\{/iu)?.[1]?.toLowerCase();
     if (!key) continue;
-    const label = line.match(/\bname\s*=\s*"([^"]+)"/u)?.[1] ?? key;
+    const label = luaStringField(line, "name", key);
     const unlocked = line.match(/\bunlocked\s*=\s*(true|false)/u)?.[1];
     const rarity = Number(line.match(/\brarity\s*=\s*(\d+)/u)?.[1]) || null;
     if (!unlocked) continue;
@@ -109,10 +126,59 @@ export function parseVanillaJokerCatalog(source) {
       label,
       rarity,
       defaultUnlocked: unlocked === "true",
+      defaultDiscovered: luaBooleanField(line, "discovered"),
       unlockCondition: parseUnlockCondition(line),
     });
   }
   return jokers.sort((left, right) => left.key.localeCompare(right.key));
+}
+
+const CONSUMABLE_SET_ORDER = Object.freeze({ TAROT: 1, PLANET: 2, SPECTRAL: 3 });
+
+export function parseVanillaConsumableCatalog(source) {
+  const consumables = [];
+  for (const line of String(source ?? "").split(/\r?\n/u)) {
+    const key = line.match(/^\s*(c_[a-z0-9_]+)\s*=\s*\{/iu)?.[1]?.toLowerCase();
+    if (!key) continue;
+    const set = luaStringField(line, "set").toUpperCase();
+    if (!(set in CONSUMABLE_SET_ORDER)) continue;
+    const unlocked = line.match(/\bunlocked\s*=\s*(true|false)/u)?.[1];
+    consumables.push({
+      key,
+      label: luaStringField(line, "name", key),
+      set,
+      order: Number(line.match(/\border\s*=\s*(\d+)/u)?.[1]) || null,
+      hidden: luaBooleanField(line, "hidden"),
+      defaultUnlocked: unlocked == null || unlocked === "true",
+      defaultDiscovered: luaBooleanField(line, "discovered"),
+      unlockCondition: parseUnlockCondition(line),
+    });
+  }
+  return consumables.sort((left, right) =>
+    CONSUMABLE_SET_ORDER[left.set] - CONSUMABLE_SET_ORDER[right.set] ||
+    (left.order ?? 999) - (right.order ?? 999) ||
+    left.key.localeCompare(right.key));
+}
+
+export function parseVanillaVoucherCatalog(source) {
+  const vouchers = [];
+  for (const line of String(source ?? "").split(/\r?\n/u)) {
+    const key = line.match(/^\s*(v_[a-z0-9_]+)\s*=\s*\{/iu)?.[1]?.toLowerCase();
+    if (!key || luaStringField(line, "set").toUpperCase() !== "VOUCHER") continue;
+    const unlocked = line.match(/\bunlocked\s*=\s*(true|false)/u)?.[1];
+    if (!unlocked) continue;
+    vouchers.push({
+      key,
+      label: luaStringField(line, "name", key),
+      order: Number(line.match(/\border\s*=\s*(\d+)/u)?.[1]) || null,
+      defaultUnlocked: unlocked === "true",
+      defaultDiscovered: luaBooleanField(line, "discovered"),
+      requires: luaRequires(line),
+      unlockCondition: parseUnlockCondition(line),
+    });
+  }
+  return vouchers.sort((left, right) =>
+    (left.order ?? 999) - (right.order ?? 999) || left.key.localeCompare(right.key));
 }
 
 export function parseVanillaStakeCatalog(source) {
@@ -205,6 +271,73 @@ function numericTable(source, name) {
   return result;
 }
 
+function keyedUsageCounts(source, name) {
+  const result = new Map();
+  const body = tableBody(String(source ?? ""), name);
+  for (const match of body.matchAll(/\["([a-z0-9_]+)"\]=\{/gu)) {
+    const openingBrace = match.index + match[0].lastIndexOf("{");
+    const entry = bracedBodyAt(body, openingBrace);
+    result.set(match[1], scalarNumber(entry, "count") ?? 0);
+  }
+  return result;
+}
+
+const CAREER_STAT_PROGRESS_TYPES = new Set([
+  "c_cards_discarded",
+  "c_cards_played",
+  "c_planetarium_used",
+  "c_planets_bought",
+  "c_playing_cards_bought",
+  "c_shop_dollars_spent",
+  "c_shop_rerolls",
+  "c_tarot_reading_used",
+  "c_tarots_bought",
+]);
+
+function collectionUnlockProgress(item, profileLua, voucherUsage) {
+  const condition = item.unlockCondition;
+  if (!condition?.type) return null;
+  const target = Number(condition.extra ?? condition.ante ?? condition.amount);
+  if (!Number.isFinite(target)) return { type: condition.type, current: null, target: null, complete: false };
+  let current = null;
+  let source = null;
+  if (condition.type === "blank_redeems") {
+    current = voucherUsage.get("v_blank") ?? 0;
+    source = "voucher_usage.v_blank.count";
+  } else if (condition.type === "interest_streak") {
+    current = scalarNumber(tableBody(profileLua, "career_stats"), "c_round_interest_cap_streak") ?? 0;
+    source = "career_stats.c_round_interest_cap_streak";
+  } else if (CAREER_STAT_PROGRESS_TYPES.has(condition.type)) {
+    current = scalarNumber(tableBody(profileLua, "career_stats"), condition.type) ?? 0;
+    source = `career_stats.${condition.type}`;
+  }
+  return {
+    type: condition.type,
+    current,
+    target,
+    complete: current == null ? false : current >= target,
+    source,
+  };
+}
+
+function snapshotCollection(catalog, unlockedFromProfile, discoveredFromProfile, allUnlocked, profileLua, usage) {
+  return catalog.map((item) => {
+    const unlocked = allUnlocked || item.defaultUnlocked || unlockedFromProfile.has(item.key);
+    return {
+      key: item.key,
+      label: item.label,
+      ...(item.set ? { set: item.set } : {}),
+      ...(item.hidden ? { hidden: true } : {}),
+      unlocked,
+      discovered: item.defaultDiscovered || discoveredFromProfile.has(item.key),
+      timesUsed: usage.get(item.key) ?? 0,
+      requires: [...(item.requires ?? [])],
+      unlockCondition: item.unlockCondition,
+      progress: unlocked ? null : collectionUnlockProgress(item, profileLua, usage),
+    };
+  });
+}
+
 export function parseDeckStakeProgress(source, stakeCatalog) {
   const deckUsage = tableBody(String(source ?? ""), "deck_usage");
   const stakes = Array.isArray(stakeCatalog) ? stakeCatalog : [];
@@ -270,6 +403,8 @@ export class BalatroProfileReader {
     this.stat = stat;
     this.readEntry = readEntry;
     this.catalog = null;
+    this.consumableCatalog = null;
+    this.voucherCatalog = null;
     this.deckCatalog = null;
     this.stakeCatalog = null;
     this.cached = null;
@@ -283,6 +418,22 @@ export class BalatroProfileReader {
     this.catalog = parseVanillaJokerCatalog(gameLua);
     if (!this.catalog.length) throw new Error("The installed Balatro game.lua did not contain a Joker catalog");
     return this.catalog;
+  }
+
+  #consumables() {
+    if (this.consumableCatalog) return this.consumableCatalog;
+    if (!this.executablePath) throw new Error("Balatro.exe was not found, so the installed consumable pool cannot be read");
+    const gameLua = this.readEntry(this.executablePath, "game.lua", "utf8");
+    this.consumableCatalog = parseVanillaConsumableCatalog(gameLua);
+    return this.consumableCatalog;
+  }
+
+  #vouchers() {
+    if (this.voucherCatalog) return this.voucherCatalog;
+    if (!this.executablePath) throw new Error("Balatro.exe was not found, so the installed voucher pool cannot be read");
+    const gameLua = this.readEntry(this.executablePath, "game.lua", "utf8");
+    this.voucherCatalog = parseVanillaVoucherCatalog(gameLua);
+    return this.voucherCatalog;
   }
 
   #decks() {
@@ -328,6 +479,8 @@ export class BalatroProfileReader {
       if (this.cached && this.cacheKey === cacheKey) return this.cached;
 
       const catalog = this.#catalog();
+      const consumableCatalog = this.#consumables();
+      const voucherCatalog = this.#vouchers();
       const deckCatalog = this.#decks();
       const stakeCatalog = this.#stakes();
       const meta = readCompressedLua(metaPath, this.readFile);
@@ -335,6 +488,24 @@ export class BalatroProfileReader {
       const unlockedFromProfile = trueKeys(meta, "unlocked");
       const discoveredFromProfile = trueKeys(meta, "discovered");
       const allUnlocked = scalarBoolean(profileLua, "all_unlocked");
+      const consumableUsage = keyedUsageCounts(profileLua, "consumeable_usage");
+      const voucherUsage = keyedUsageCounts(profileLua, "voucher_usage");
+      const consumables = snapshotCollection(
+        consumableCatalog,
+        unlockedFromProfile,
+        discoveredFromProfile,
+        allUnlocked,
+        profileLua,
+        consumableUsage,
+      );
+      const vouchers = snapshotCollection(
+        voucherCatalog,
+        unlockedFromProfile,
+        discoveredFromProfile,
+        allUnlocked,
+        profileLua,
+        voucherUsage,
+      );
       const unlocked = catalog.filter((joker) => allUnlocked || joker.defaultUnlocked || unlockedFromProfile.has(joker.key));
       const locked = catalog.filter((joker) => !allUnlocked && !joker.defaultUnlocked && !unlockedFromProfile.has(joker.key));
       const unlockedKeys = unlocked.map((joker) => joker.key);
@@ -365,6 +536,8 @@ export class BalatroProfileReader {
         allUnlocked,
         signature: collectionSignature([
           ...unlockedKeys,
+          ...consumables.filter((item) => item.unlocked).map((item) => item.key),
+          ...vouchers.filter((item) => item.unlocked).map((item) => item.key),
           ...unlockedDecks.map((deck) => deck.key),
           ...progressSignature,
         ]),
@@ -374,13 +547,39 @@ export class BalatroProfileReader {
           key: joker.key,
           label: joker.label,
           rarity: joker.rarity,
-          discovered: joker.defaultUnlocked || discoveredFromProfile.has(joker.key),
+          discovered: joker.defaultDiscovered || discoveredFromProfile.has(joker.key),
         })),
         lockedJokers: locked.map((joker) => ({
           key: joker.key,
           label: joker.label,
           rarity: joker.rarity,
           unlockCondition: joker.unlockCondition,
+        })),
+        unlockedConsumableCount: consumables.filter((item) => item.unlocked).length,
+        totalConsumableCount: consumables.length,
+        discoveredConsumableCount: consumables.filter((item) => item.discovered).length,
+        consumables,
+        unlockedConsumables: consumables.filter((item) => item.unlocked),
+        lockedConsumables: consumables.filter((item) => !item.unlocked),
+        discoveredConsumables: consumables.filter((item) => item.discovered),
+        undiscoveredConsumables: consumables.filter((item) => !item.discovered),
+        consumableProgress: consumables.filter((item) => item.progress).map((item) => ({
+          key: item.key,
+          label: item.label,
+          progress: item.progress,
+        })),
+        unlockedVoucherCount: vouchers.filter((item) => item.unlocked).length,
+        totalVoucherCount: vouchers.length,
+        discoveredVoucherCount: vouchers.filter((item) => item.discovered).length,
+        vouchers,
+        unlockedVouchers: vouchers.filter((item) => item.unlocked),
+        lockedVouchers: vouchers.filter((item) => !item.unlocked),
+        discoveredVouchers: vouchers.filter((item) => item.discovered),
+        undiscoveredVouchers: vouchers.filter((item) => !item.discovered),
+        voucherProgress: vouchers.filter((item) => item.progress).map((item) => ({
+          key: item.key,
+          label: item.label,
+          progress: item.progress,
         })),
         unlockedDeckCount: unlockedDecks.length,
         totalDeckCount: deckCatalog.length,
@@ -401,6 +600,24 @@ export class BalatroProfileReader {
         totalJokerCount: 0,
         unlockedJokers: [],
         lockedJokers: [],
+        unlockedConsumableCount: 0,
+        totalConsumableCount: 0,
+        discoveredConsumableCount: 0,
+        consumables: [],
+        unlockedConsumables: [],
+        lockedConsumables: [],
+        discoveredConsumables: [],
+        undiscoveredConsumables: [],
+        consumableProgress: [],
+        unlockedVoucherCount: 0,
+        totalVoucherCount: 0,
+        discoveredVoucherCount: 0,
+        vouchers: [],
+        unlockedVouchers: [],
+        lockedVouchers: [],
+        discoveredVouchers: [],
+        undiscoveredVouchers: [],
+        voucherProgress: [],
         unlockedDeckCount: 0,
         totalDeckCount: 0,
         unlockedDecks: [],
@@ -449,13 +666,14 @@ export class BalatroRunCardTracker {
     const seed = state?.seed == null ? null : String(state.seed);
     if (seed && this.seed && seed !== this.seed) this.reset(seed);
     else if (seed && !this.seed) this.seed = seed;
+    const openedPack = areaCards(state?.pack).length > 0 ? state.pack : state?.openedPack;
     const sources = [
       ["owned_joker", state?.jokers],
       ["owned_consumable", state?.consumables],
       ["shop_offer", state?.shop],
       ["voucher_offer", state?.vouchers],
       ["pack_offer", state?.packs],
-      ["opened_pack", state?.pack],
+      ["opened_pack", openedPack],
     ];
     for (const [source, area] of sources) {
       for (const card of areaCards(area)) {

@@ -682,6 +682,41 @@ test("early blind selection stays fast while a developed-run skip reward gets st
   assert.equal(balatrobotThinkingMode({ ...blindSelect, ante_num: 2 }, [], config).effort, "high");
 });
 
+test("Director's Cut and Retcon expose an exact strategic Boss reroll candidate", () => {
+  const base = {
+    state: "BLIND_SELECT",
+    money: 18,
+    boss_rerolled: false,
+    used_vouchers: { v_directors_cut: "" },
+    blinds: { boss: { type: "BOSS", status: "SELECT", name: "The Plant", effect: "All face cards are debuffed" } },
+  };
+  const candidates = generateBalatrobotCandidates(base);
+  const reroll = candidates.find((candidate) => candidate.action.method === "reroll_boss");
+  assert.ok(reroll?.requiresStrategic);
+  assert.deepEqual(
+    balatrobotThinkingMode(base, candidates, {
+      balatrobotStrategicThinkingEnabled: true,
+      balatrobotStrategicReasoningEffort: "high",
+      balatrobotRoutineReasoningEffort: "none",
+    }),
+    { strategic: true, effort: "high", reason: "Boss reroll needs strategic approval" },
+  );
+  assert.doesNotThrow(() => assertBalatrobotCandidateAction(
+    { method: "reroll_boss", params: {} },
+    candidates,
+    base,
+  ));
+  assert.equal(generateBalatrobotCandidates({ ...base, boss_rerolled: true }).some(
+    (candidate) => candidate.action.method === "reroll_boss"), false);
+  assert.ok(generateBalatrobotCandidates({
+    ...base,
+    boss_rerolled: true,
+    used_vouchers: { v_retcon: "" },
+  }).some((candidate) => candidate.action.method === "reroll_boss"));
+  assert.equal(generateBalatrobotCandidates({ ...base, money: 9 }).some(
+    (candidate) => candidate.action.method === "reroll_boss"), false);
+});
+
 test("routine navigation and shop choices are exposed only as local candidate ids", () => {
   const blind = {
     state: "BLIND_SELECT",

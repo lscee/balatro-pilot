@@ -43,9 +43,9 @@ const ACTION_FIELDS = new Set([
 ]);
 
 const METHODS_BY_STATE = Object.freeze({
-  BLIND_SELECT: new Set(["select", "skip"]),
+  BLIND_SELECT: new Set(["select", "skip", "reroll_boss"]),
   SELECTING_HAND: new Set(["play", "discard", "sell", "use", "rearrange"]),
-  SHOP: new Set(["buy", "sell", "reroll", "next_round", "use", "rearrange"]),
+  SHOP: new Set(["buy", "buy_use", "sell", "reroll", "next_round", "use", "rearrange"]),
   SMODS_BOOSTER_OPENED: new Set(["pack", "rearrange"]),
 });
 const CONSUMABLE_SETS = new Set(["TAROT", "PLANET", "SPECTRAL"]);
@@ -174,6 +174,9 @@ export function compactBalatrobotState(state) {
     deck: state.deck ?? null,
     stake: state.stake ?? null,
     seed: state.seed ?? null,
+    bossRerolled: Boolean(state.boss_rerolled),
+    lastTarotPlanet: typeof state.last_tarot_planet === "string" ? state.last_tarot_planet : null,
+    ectoMinus: Number.isInteger(state.ecto_minus) && state.ecto_minus > 0 ? state.ecto_minus : null,
     round: {
       chips: round.chips ?? null,
       handsLeft: round.hands_left ?? null,
@@ -272,8 +275,25 @@ function assertNoParams(params, method) {
 function rpcParams(method, params, state) {
   switch (method) {
     case "select":
+    case "reroll_boss":
     case "next_round":
       assertNoParams(params, method);
+      if (method === "reroll_boss") {
+        const vouchers = state.used_vouchers && typeof state.used_vouchers === "object"
+          ? state.used_vouchers
+          : {};
+        const hasRetcon = Object.hasOwn(vouchers, "v_retcon");
+        const hasDirectorsCut = Object.hasOwn(vouchers, "v_directors_cut");
+        if (!hasRetcon && !hasDirectorsCut) {
+          throw new Error("Boss reroll requires Director's Cut or Retcon");
+        }
+        if (!hasRetcon && state.boss_rerolled === true) {
+          throw new Error("Director's Cut has already rerolled this Ante's Boss Blind");
+        }
+        if (availableMoney(state) < 10) {
+          throw new Error(`Boss reroll costs $10, but only $${availableMoney(state)} is available`);
+        }
+      }
       return {};
     case "skip": {
       assertNoParams(params, method);
@@ -335,6 +355,27 @@ function rpcParams(method, params, state) {
       }
       return { [choice]: index };
     }
+    case "buy_use": {
+      const card = asIndex(params.card, "buy_use.card");
+      const offeredCard = assertAreaIndex(state, "shop", card, "buy_use.card");
+      const set = String(offeredCard?.set ?? "").toUpperCase();
+      if (!CONSUMABLE_SETS.has(set)) {
+        throw new Error("buy_use.card must be a Tarot, Planet, or Spectral consumable");
+      }
+      const price = offeredCard?.cost?.buy;
+      const money = availableMoney(state);
+      if (Number.isFinite(price) && Number.isFinite(money) && price > money) {
+        throw new Error(`buy_use.card costs $${price}, but only $${money} is available`);
+      }
+      const targets = uniqueIndices(params.targets, "buy_use.targets", { min: 0, max: 5 });
+      assertIndicesInArea(state, "hand", targets, "buy_use.targets");
+      validateBalatroConsumableTargets(offeredCard, targets, state, "buy_use.card");
+      if (String(offeredCard?.key ?? "").toLowerCase() === "c_aura" &&
+          targets.some((index) => state.hand?.cards?.[index]?.modifier?.edition)) {
+        throw new Error("Aura requires one playing card without an existing edition");
+      }
+      return targets.length ? { card, targets } : { card };
+    }
     case "sell": {
       const choices = ["joker", "consumable"].filter((name) => params[name] !== null);
       if (choices.length !== 1) throw new Error("sell requires exactly one of joker or consumable");
@@ -371,8 +412,8 @@ function rpcParams(method, params, state) {
       if (targetRule.max > 0 && state.state !== BALATROBOT_STATES.SELECTING_HAND) {
         throw new Error(`use.consumable ${targetRule.key} requires hand-card selection and cannot be used from ${state.state}`);
       }
-      if (targetRule.key === "c_aura") {
-        throw new Error("owned Aura targeting is not safely supported by the pinned BalatroBot v1.5.2 use endpoint");
+      if (targetRule.key === "c_aura" && cards.some((index) => state.hand?.cards?.[index]?.modifier?.edition)) {
+        throw new Error("Aura requires one playing card without an existing edition");
       }
       return cards.length ? { consumable, cards } : { consumable };
     }
@@ -801,7 +842,9 @@ export function validateBalatrobotPlan(
   if (method === "play" || method === "discard") {
     assertHandNarrativeMatchesAction(state, method, normalizedParams.cards, rationale);
   }
-  if (method === "buy") assertBuyNarrativeMatchesAction(state, normalizedParams, rawAction.reason, candidate.strategy);
+  if (method === "buy" || method === "buy_use") {
+    assertBuyNarrativeMatchesAction(state, normalizedParams, rawAction.reason, candidate.strategy);
+  }
   assertShopResourcesConverted(state, method, normalizedParams);
   if (method === "sell") {
     const choice = Number.isInteger(normalizedParams.joker) ? "joker" : "consumable";
@@ -981,7 +1024,13 @@ export function fallbackBalatrobotAction(state) {
       }
     case BALATROBOT_STATES.PACK:
       {
-        const choice = generateBalatrobotCandidates(state).find((candidate) => candidate.action?.method === "pack" && !candidate.action.skip);
+        const choice = generateBalatrobotCandidates(state).find((candidate) =>
+          candidate.action?.method === "pack" &&
+          !candidate.action.skip &&
+          candidate.fallbackSafe === true &&
+          candidate.safeChoice === true &&
+          !candidate.destructive &&
+          !candidate.harmful);
         if (choice) {
           const params = { card: choice.action.card };
           if (choice.action.targets?.length) params.targets = choice.action.targets;

@@ -43,7 +43,9 @@ $BalatroBotBrokenEntropyEndlessRuntimeFingerprint = "4ceb563a70550df685623685813
 $BalatroBotRacyEntropyEndlessRuntimeFingerprint = "e935f034677a82d9cc83d4b8e1f1360dc9ba8361c0a66ba58cbc787b9c657014"
 $BalatroBotUnsafeEndlessRuntimeFingerprint = "e2ab32128ec0fed5473e215df423265fac62278d8875af7c243e6423c3547e73"
 $BalatroBotPrePackRuntimeFingerprint = "a5b67a53b06fd4a949b3031d870bea87c6280b8bb7e13a1ad0b9d79e9145603d"
-$BalatroBotRuntimeFingerprint = "d53fa2eb86813c48e33b9d2c9317f786ef24bef28c0c60e4b4a48bcfcb6441e2"
+$BalatroBotPreCapabilityRuntimeFingerprint = "d53fa2eb86813c48e33b9d2c9317f786ef24bef28c0c60e4b4a48bcfcb6441e2"
+$BalatroBotPreBuyUseRuntimeFingerprint = "7c780857ac7b7991479bc8942db17830a2b4c5ad4e9808718ac0f1dc17f00e7d"
+$BalatroBotRuntimeFingerprint = "f5ffff76f5b0237e617a48e539ebb8cd4e007fa717cc0378987406559860964f"
 $MinimumUvVersion = [version]"0.9.21"
 $SmodsRuntimeVersion = "1.0.0~BETA-1814a-STEAMODDED"
 $PinnedUvExecutableSha256 = "68a22cbab1674647bcda32120b214e6480f875414e3333f49f87ae99b4b0e0fa"
@@ -385,8 +387,24 @@ function Add-BalatroBotEndlessPatch {
   $playSource = Join-Path $assetRoot "play.lua"
   $cashOutSource = Join-Path $assetRoot "cash_out.lua"
   $packSource = Join-Path $assetRoot "pack.lua"
-  $methodSource = Join-Path $assetRoot "openrpc-endless-method.json"
-  foreach ($asset in @($endpointSource, $playSource, $cashOutSource, $packSource, $methodSource)) {
+  $useSource = Join-Path $assetRoot "use.lua"
+  $bossRerollSource = Join-Path $assetRoot "reroll_boss.lua"
+  $buyUseSource = Join-Path $assetRoot "buy_use.lua"
+  $endlessMethodSource = Join-Path $assetRoot "openrpc-endless-method.json"
+  $bossRerollMethodSource = Join-Path $assetRoot "openrpc-reroll-boss-method.json"
+  $buyUseMethodSource = Join-Path $assetRoot "openrpc-buy-use-method.json"
+  foreach ($asset in @(
+    $endpointSource,
+    $playSource,
+    $cashOutSource,
+    $packSource,
+    $useSource,
+    $bossRerollSource,
+    $buyUseSource,
+    $endlessMethodSource,
+    $bossRerollMethodSource,
+    $buyUseMethodSource
+  )) {
     if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
       throw "Balatro Pilot endless patch asset is missing: $asset"
     }
@@ -404,25 +422,52 @@ function Add-BalatroBotEndlessPatch {
   Copy-Item -LiteralPath $playSource -Destination (Join-Path $Root "src\lua\endpoints\play.lua") -Force -ErrorAction Stop
   Copy-Item -LiteralPath $cashOutSource -Destination (Join-Path $Root "src\lua\endpoints\cash_out.lua") -Force -ErrorAction Stop
   Copy-Item -LiteralPath $packSource -Destination (Join-Path $Root "src\lua\endpoints\pack.lua") -Force -ErrorAction Stop
+  Copy-Item -LiteralPath $useSource -Destination (Join-Path $Root "src\lua\endpoints\use.lua") -Force -ErrorAction Stop
+  Copy-Item -LiteralPath $bossRerollSource -Destination (Join-Path $Root "src\lua\endpoints\reroll_boss.lua") -Force -ErrorAction Stop
+  Copy-Item -LiteralPath $buyUseSource -Destination (Join-Path $Root "src\lua\endpoints\buy_use.lua") -Force -ErrorAction Stop
 
   $entryPath = Join-Path $Root "balatrobot.lua"
   $entry = [System.IO.File]::ReadAllText($entryPath)
+  $newline = if ($entry.Contains("`r`n")) { "`r`n" } else { "`n" }
   if (-not $entry.Contains('"src/lua/endpoints/endless.lua"')) {
-    $newline = if ($entry.Contains("`r`n")) { "`r`n" } else { "`n" }
     $anchor = '  "src/lua/endpoints/cash_out.lua",' + $newline
     if (-not $entry.Contains($anchor)) {
       throw "The pinned BalatroBot entry module no longer matches the Endless endpoint registration anchor."
     }
     $entry = $entry.Replace($anchor, $anchor + '  "src/lua/endpoints/endless.lua",' + $newline)
-    [System.IO.File]::WriteAllText($entryPath, $entry, (New-Object System.Text.UTF8Encoding($false)))
   }
+  if (-not $entry.Contains('"src/lua/endpoints/reroll_boss.lua"')) {
+    $anchor = '  "src/lua/endpoints/select.lua",' + $newline
+    if (-not $entry.Contains($anchor)) {
+      throw "The pinned BalatroBot entry module no longer matches the Boss reroll registration anchor."
+    }
+    $entry = $entry.Replace($anchor, $anchor + '  "src/lua/endpoints/reroll_boss.lua",' + $newline)
+  }
+  if (-not $entry.Contains('"src/lua/endpoints/buy_use.lua"')) {
+    $anchor = '  "src/lua/endpoints/buy.lua",' + $newline
+    if (-not $entry.Contains($anchor)) {
+      throw "The pinned BalatroBot entry module no longer matches the Buy & Use registration anchor."
+    }
+    $entry = $entry.Replace($anchor, $anchor + '  "src/lua/endpoints/buy_use.lua",' + $newline)
+  }
+  [System.IO.File]::WriteAllText($entryPath, $entry, (New-Object System.Text.UTF8Encoding($false)))
 
   $openRpcPath = Join-Path $Root "src\lua\utils\openrpc.json"
   $openRpc = Get-Content -LiteralPath $openRpcPath -Raw | ConvertFrom-Json
-  $alreadyRegistered = @($openRpc.methods | Where-Object { [string]$_.name -eq "endless" }).Count -gt 0
-  if (-not $alreadyRegistered) {
-    $method = Get-Content -LiteralPath $methodSource -Raw | ConvertFrom-Json
-    $openRpc.methods = @($openRpc.methods) + @($method)
+  $openRpcChanged = $false
+  foreach ($methodSpec in @(
+    @{ Name = "endless"; Source = $endlessMethodSource },
+    @{ Name = "reroll_boss"; Source = $bossRerollMethodSource },
+    @{ Name = "buy_use"; Source = $buyUseMethodSource }
+  )) {
+    $alreadyRegistered = @($openRpc.methods | Where-Object { [string]$_.name -eq $methodSpec.Name }).Count -gt 0
+    if (-not $alreadyRegistered) {
+      $method = Get-Content -LiteralPath $methodSpec.Source -Raw | ConvertFrom-Json
+      $openRpc.methods = @($openRpc.methods) + @($method)
+      $openRpcChanged = $true
+    }
+  }
+  if ($openRpcChanged) {
     [System.IO.File]::WriteAllText(
       $openRpcPath,
       ($openRpc | ConvertTo-Json -Depth 100),
@@ -507,12 +552,18 @@ foreach ($requiredPath in @($balatroBotManifest, $balatroBotEntry, $balatroBotLu
 }
 $balatroBotRoot = Join-Path $resolvedModsDirectory "balatrobot"
 $installedRuntimeFingerprint = Get-BalatroBotRuntimeFingerprint -Root $balatroBotRoot
+$runningBalatroBeforePatch = @(Get-Process -Name "Balatro" -ErrorAction SilentlyContinue)
 if ($installedRuntimeFingerprint -eq $BalatroBotUpstreamRuntimeFingerprint -or
     $installedRuntimeFingerprint -eq $BalatroBotEntropyRuntimeFingerprint -or
     $installedRuntimeFingerprint -eq $BalatroBotBrokenEntropyEndlessRuntimeFingerprint -or
     $installedRuntimeFingerprint -eq $BalatroBotRacyEntropyEndlessRuntimeFingerprint -or
     $installedRuntimeFingerprint -eq $BalatroBotUnsafeEndlessRuntimeFingerprint -or
-    $installedRuntimeFingerprint -eq $BalatroBotPrePackRuntimeFingerprint) {
+    $installedRuntimeFingerprint -eq $BalatroBotPrePackRuntimeFingerprint -or
+    $installedRuntimeFingerprint -eq $BalatroBotPreCapabilityRuntimeFingerprint -or
+    $installedRuntimeFingerprint -eq $BalatroBotPreBuyUseRuntimeFingerprint) {
+  if ($runningBalatroBeforePatch.Count -gt 0) {
+    throw "Balatro is running with an older in-memory BalatroBot runtime. Close the game before applying the pinned Mod capability update, then launch it again with this script."
+  }
   if ($PSCmdlet.ShouldProcess($balatroBotRoot, "Apply the pinned unseeded-run entropy and safe Endless-settlement patches")) {
     Add-BalatroBotUnseededEntropyPatch -Root $balatroBotRoot | Out-Null
     Add-BalatroBotEndlessPatch -Root $balatroBotRoot | Out-Null
