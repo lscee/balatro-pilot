@@ -1284,11 +1284,37 @@ function withRuleTransformation(state, targets, rule) {
   return { ...state, hand: { ...(state?.hand ?? {}), cards: transformed } };
 }
 
+function noTargetPackValue(state, rule) {
+  if (rule.kind !== "all-hands-upgrade") return 300;
+  // Black Hole applies one planet-style level to every hand. Value both the
+  // routes already used this run and a smaller option value for rare hands;
+  // this keeps it visible as the broad upgrade it is without hard-forcing it.
+  return 900 + [...PLANET_HAND_UPGRADES.values()].reduce((sum, upgrade) => {
+    const hand = state?.hands?.[upgrade.handType] ?? state?.pokerHands?.[upgrade.handType] ?? {};
+    const played = Math.max(0, Number(hand?.played) || 0);
+    const values = handValues(state, upgrade.handType);
+    const scoreDelta = Math.max(
+      0,
+      (values.chips + upgrade.chips) * (values.mult + upgrade.mult) - values.chips * values.mult,
+    );
+    const routeWeight = 0.2 + Math.min(2, Math.log2(played + 1));
+    return sum + scoreDelta * routeWeight;
+  }, 0);
+}
+
 function bestPackTargets(state, offeredCard) {
   const rule = balatroConsumableTargetRule(offeredCard);
   const hand = cardsIn(state?.hand);
   if (!rule.known || (rule.requiresJoker && !cardsIn(state?.jokers).length)) return null;
-  if (rule.max === 0) return { targets: [], projectedScore: 0, scoreGain: 0, rule };
+  if (rule.max === 0) {
+    return {
+      targets: [],
+      projectedScore: 0,
+      scoreGain: 0,
+      value: noTargetPackValue(state, rule),
+      rule,
+    };
+  }
   // Death and Cryptid depend on selection order/copy direction.  Leave them
   // to the strategic model, but never fabricate a "safe" local fallback.
   if (rule.kind === "copy") return null;

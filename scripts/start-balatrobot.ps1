@@ -42,7 +42,8 @@ $BalatroBotEntropyRuntimeFingerprint = "d16f644fbc876316bc81b6f11a6694434de5ec37
 $BalatroBotBrokenEntropyEndlessRuntimeFingerprint = "4ceb563a70550df685623685813b348128f4b2035e9f8010ef3841f5d8d5e5e4"
 $BalatroBotRacyEntropyEndlessRuntimeFingerprint = "e935f034677a82d9cc83d4b8e1f1360dc9ba8361c0a66ba58cbc787b9c657014"
 $BalatroBotUnsafeEndlessRuntimeFingerprint = "e2ab32128ec0fed5473e215df423265fac62278d8875af7c243e6423c3547e73"
-$BalatroBotRuntimeFingerprint = "a5b67a53b06fd4a949b3031d870bea87c6280b8bb7e13a1ad0b9d79e9145603d"
+$BalatroBotPrePackRuntimeFingerprint = "a5b67a53b06fd4a949b3031d870bea87c6280b8bb7e13a1ad0b9d79e9145603d"
+$BalatroBotRuntimeFingerprint = "d53fa2eb86813c48e33b9d2c9317f786ef24bef28c0c60e4b4a48bcfcb6441e2"
 $MinimumUvVersion = [version]"0.9.21"
 $SmodsRuntimeVersion = "1.0.0~BETA-1814a-STEAMODDED"
 $PinnedUvExecutableSha256 = "68a22cbab1674647bcda32120b214e6480f875414e3333f49f87ae99b4b0e0fa"
@@ -383,8 +384,9 @@ function Add-BalatroBotEndlessPatch {
   $endpointSource = Join-Path $assetRoot "endless.lua"
   $playSource = Join-Path $assetRoot "play.lua"
   $cashOutSource = Join-Path $assetRoot "cash_out.lua"
+  $packSource = Join-Path $assetRoot "pack.lua"
   $methodSource = Join-Path $assetRoot "openrpc-endless-method.json"
-  foreach ($asset in @($endpointSource, $playSource, $cashOutSource, $methodSource)) {
+  foreach ($asset in @($endpointSource, $playSource, $cashOutSource, $packSource, $methodSource)) {
     if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
       throw "Balatro Pilot endless patch asset is missing: $asset"
     }
@@ -401,6 +403,7 @@ function Add-BalatroBotEndlessPatch {
 
   Copy-Item -LiteralPath $playSource -Destination (Join-Path $Root "src\lua\endpoints\play.lua") -Force -ErrorAction Stop
   Copy-Item -LiteralPath $cashOutSource -Destination (Join-Path $Root "src\lua\endpoints\cash_out.lua") -Force -ErrorAction Stop
+  Copy-Item -LiteralPath $packSource -Destination (Join-Path $Root "src\lua\endpoints\pack.lua") -Force -ErrorAction Stop
 
   $entryPath = Join-Path $Root "balatrobot.lua"
   $entry = [System.IO.File]::ReadAllText($entryPath)
@@ -508,7 +511,8 @@ if ($installedRuntimeFingerprint -eq $BalatroBotUpstreamRuntimeFingerprint -or
     $installedRuntimeFingerprint -eq $BalatroBotEntropyRuntimeFingerprint -or
     $installedRuntimeFingerprint -eq $BalatroBotBrokenEntropyEndlessRuntimeFingerprint -or
     $installedRuntimeFingerprint -eq $BalatroBotRacyEntropyEndlessRuntimeFingerprint -or
-    $installedRuntimeFingerprint -eq $BalatroBotUnsafeEndlessRuntimeFingerprint) {
+    $installedRuntimeFingerprint -eq $BalatroBotUnsafeEndlessRuntimeFingerprint -or
+    $installedRuntimeFingerprint -eq $BalatroBotPrePackRuntimeFingerprint) {
   if ($PSCmdlet.ShouldProcess($balatroBotRoot, "Apply the pinned unseeded-run entropy and safe Endless-settlement patches")) {
     Add-BalatroBotUnseededEntropyPatch -Root $balatroBotRoot | Out-Null
     Add-BalatroBotEndlessPatch -Root $balatroBotRoot | Out-Null
@@ -516,7 +520,7 @@ if ($installedRuntimeFingerprint -eq $BalatroBotUpstreamRuntimeFingerprint -or
     if ($installedRuntimeFingerprint -ne $BalatroBotRuntimeFingerprint) {
       throw "The BalatroBot unseeded-run entropy patch failed runtime fingerprint validation."
     }
-    Write-Output "[ok] Applied the unseeded-run entropy and safe Endless-settlement patches; normal runs keep unlocks, avoid timing seeds, and wait for complete payout UI."
+    Write-Output "[ok] Applied the entropy, safe settlement, and selected-card pack patches; normal runs keep unlocks and mixed Celestial packs do not wait for a nonexistent hand."
   }
 } elseif ($installedRuntimeFingerprint -ne $BalatroBotRuntimeFingerprint) {
   throw "BalatroBot runtime does not match the pinned v$BalatroBotVersion build. Re-run install-balatrobot.ps1 after inspecting the Mods directory."

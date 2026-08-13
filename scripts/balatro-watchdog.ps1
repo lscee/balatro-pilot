@@ -126,7 +126,7 @@ function Get-ProgressStatus {
 
   $interesting = @()
   foreach ($line in (Get-Content -LiteralPath $eventFile.FullName -Tail 1200 -ErrorAction Stop)) {
-    if ($line -notmatch '"type":"(?:plan|input_ack|bot_state|bot_transition_wait)"') { continue }
+    if ($line -notmatch '"type":"(?:plan|input_ack|bot_state|bot_transition_wait|rpc_uncertain|rpc_uncertain_quarantine_result)"') { continue }
     try {
       $interesting += ($line | ConvertFrom-Json -ErrorAction Stop)
     } catch {
@@ -142,6 +142,47 @@ function Get-ProgressStatus {
   )
   $botStates = @($interesting | Where-Object { $_.type -eq "bot_state" })
   $transitionWaits = @($interesting | Where-Object { $_.type -eq "bot_transition_wait" })
+  $rpcUncertain = @($interesting | Where-Object { $_.type -eq "rpc_uncertain" })
+
+  if ($rpcUncertain.Count -ge 3) {
+    $latestRpcTimeout = $rpcUncertain | Select-Object -Last 1
+    $latestFingerprint = [string]$latestRpcTimeout.stateFingerprint
+    $latestMethod = [string]$latestRpcTimeout.method
+    $rpcStreak = @()
+    for ($index = $interesting.Count - 1; $index -ge 0; $index -= 1) {
+      $event = $interesting[$index]
+      if ([string]$event.type -eq "rpc_uncertain") {
+        if (
+          [string]$event.stateFingerprint -ne $latestFingerprint -or
+          [string]$event.method -ne $latestMethod
+        ) { break }
+        $rpcStreak = @($event) + $rpcStreak
+        continue
+      }
+      if ([string]$event.type -eq "bot_state") {
+        $eventFingerprint = [string]$event.fingerprint
+        if (-not [string]::IsNullOrWhiteSpace($eventFingerprint) -and $eventFingerprint -ne $latestFingerprint) { break }
+        continue
+      }
+      if ([string]$event.type -eq "rpc_uncertain_quarantine_result") {
+        $changedProperty = $event.PSObject.Properties["changed"]
+        if ($null -ne $changedProperty -and [bool]$changedProperty.Value) { break }
+      }
+    }
+    if ($rpcStreak.Count -ge 3) {
+      $firstRpcAt = [DateTime]::Parse([string]$rpcStreak[0].at).ToUniversalTime()
+      $lastRpcAt = [DateTime]::Parse([string]$rpcStreak[-1].at).ToUniversalTime()
+      if (($lastRpcAt - $firstRpcAt).TotalMinutes -ge 2) {
+        return [pscustomobject]@{
+          Healthy = $false
+          Reason = "BalatroBot RPC $latestMethod timed out $($rpcStreak.Count) times on the same exact game-state fingerprint for at least 2 minutes"
+          EventAgeMinutes = $eventAge
+          EventPath = $eventFile.FullName
+          PlanCount = $plans.Count
+        }
+      }
+    }
+  }
 
   if ($transitionWaits.Count -gt 0) {
     $latestTransitionWait = $transitionWaits | Select-Object -Last 1

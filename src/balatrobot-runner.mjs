@@ -227,6 +227,19 @@ function isUncertainActionError(error) {
   return error instanceof BalatrobotTransportError || error instanceof BalatrobotProtocolError;
 }
 
+function validatedStuckPackSkip(state) {
+  const plan = validateBalatrobotPlan(
+    {
+      observation: "The same open pack state remained unchanged after two independent RPC outcome checks.",
+      strategy: "Use the pack's local Skip action once instead of replaying another uncertain card choice.",
+      confidence: 1,
+      actions: [{ method: "pack", skip: true, reason: "Circuit breaker: skip a stuck open pack once" }],
+    },
+    state,
+  );
+  return { action: plan.actions[0], plan };
+}
+
 async function reconcileGamestate({ client, config, log, step, signal }) {
   let lastError;
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -587,6 +600,18 @@ export async function runBalatrobot({
   let victoryOverlayDismissed = false;
   let approvedShopContinuation = null;
 
+  const stopAfterUncertainRpc = async ({ step, method, fingerprint, reason, params = null }) => {
+    log.event("rpc_uncertain_safe_stop", {
+      step,
+      method,
+      params,
+      stateFingerprint: fingerprint,
+      reason,
+    });
+    console.warn(`  [warn] ${reason} Controller stopped safely without replaying ${method}.`);
+    return { state, usage: cumulativeUsage, logDir: log.dir, stoppedReason: reason };
+  };
+
   const refreshRunKnowledge = (currentState) => {
     collectionKnowledge = profileReader?.snapshot?.() ?? collectionKnowledge;
     appearedThisRun = runCardTracker.observe(currentState);
@@ -812,6 +837,7 @@ export async function runBalatrobot({
       console.log(`\n[${step}/${stepLimitLabel}] ${stateLabel(state)}`);
       finalizeEpisode(semanticState);
 
+      let circuitRecovery = null;
       if (uncertainAction) {
         if (uncertainAction.fingerprint === exactFingerprint) {
           const delayMs = Math.min(2_000, Math.max(100, Number(config.balatrobotPollMs) || 0));
@@ -833,14 +859,65 @@ export async function runBalatrobot({
             changed: checkedFingerprint !== exactFingerprint,
           });
           state = checked;
-          uncertainAction = null;
-          previousError =
-            checkedFingerprint === exactFingerprint
-              ? "A fresh state check still shows no effect from the uncertain RPC; reconsider from this verified state."
-              : "";
-          continue;
+          if (checkedFingerprint !== exactFingerprint) {
+            uncertainAction = null;
+            previousError = "";
+            continue;
+          }
+
+          const unchangedChecks = (uncertainAction.unchangedChecks ?? 1) + 1;
+          if (
+            state?.state === "SMODS_BOOSTER_OPENED" &&
+            uncertainAction.method === "pack" &&
+            uncertainAction.params?.skip !== true
+          ) {
+            let recovery;
+            try {
+              recovery = validatedStuckPackSkip(state);
+            } catch (error) {
+              const pending = uncertainAction;
+              uncertainAction = null;
+              return await stopAfterUncertainRpc({
+                step,
+                method: pending.method,
+                params: pending.params ?? null,
+                fingerprint: exactFingerprint,
+                reason: `The stuck pack could not be skipped safely: ${error.message}`,
+              });
+            }
+            circuitRecovery = {
+              ...recovery,
+              originalSignature: uncertainAction.signature,
+              unchangedChecks,
+            };
+            log.event("rpc_uncertain_circuit_breaker", {
+              step,
+              method: uncertainAction.method,
+              originalParams: uncertainAction.params ?? null,
+              recovery: recovery.action,
+              stateFingerprint: exactFingerprint,
+              unchangedChecks,
+            });
+            console.warn("  [warn] The open pack was unchanged after two checks; bypassing the model and trying local Pack Skip once.");
+            uncertainAction = null;
+            previousError = "The previous pack choice had no visible effect after two checks; local circuit breaker is skipping it once.";
+          } else {
+            const pending = uncertainAction;
+            const reason =
+              state?.state === "SMODS_BOOSTER_OPENED" && pending.params?.skip === true
+                ? "Pack Skip remained unchanged after two independent checks."
+                : `${pending.method} remained unchanged after two independent checks.`;
+            uncertainAction = null;
+            return await stopAfterUncertainRpc({
+              step,
+              method: pending.method,
+              params: pending.params ?? null,
+              fingerprint: exactFingerprint,
+              reason,
+            });
+          }
         }
-        uncertainAction = null;
+        if (!circuitRecovery) uncertainAction = null;
       }
 
       let deckSelection = null;
@@ -873,7 +950,7 @@ export async function runBalatrobot({
             `${deckSelection.reason}.`,
         );
       }
-      let action = deterministicBalatrobotAction(
+      let action = circuitRecovery?.action ?? deterministicBalatrobotAction(
         state,
         {
           ...config,
@@ -887,8 +964,14 @@ export async function runBalatrobot({
           reason: `Start ${deckSelection.label}: ${deckSelection.effect}`.slice(0, 160),
         };
       }
-      let planDetails;
-      let source = "balatrobot_local";
+      let planDetails = circuitRecovery
+        ? {
+            ...circuitRecovery.plan,
+            memory,
+            runPlan,
+          }
+        : undefined;
+      let source = circuitRecovery ? "balatrobot_rpc_circuit_breaker" : "balatrobot_local";
       let planned = { usage: mergeUsage(), attempts: [], planningMs: 0 };
       let actionCandidates = [];
       let approvedCheckpointScope = null;
@@ -1448,12 +1531,37 @@ export async function runBalatrobot({
       }
       try {
         state = assertGameState(await client.call(action.method, action.params, { signal }), action.method);
+        const resultFingerprint = balatrobotStateFingerprint(state);
         log.event("rpc_result", {
           step,
           method: action.method,
           state: state.state,
-          fingerprint: balatrobotStateFingerprint(state),
+          fingerprint: resultFingerprint,
         });
+        if (
+          beforeState?.state === "SMODS_BOOSTER_OPENED" &&
+          action.method === "pack" &&
+          resultFingerprint === exactFingerprint
+        ) {
+          uncertainAction = {
+            fingerprint: exactFingerprint,
+            signature: actionSignature(action),
+            method: action.method,
+            params: action.params,
+            unchangedChecks: 1,
+          };
+          previousError = "The pack RPC returned successfully but the exact pack state did not change; do not replay it.";
+          log.event("rpc_no_effect", {
+            step,
+            method: action.method,
+            params: action.params,
+            source,
+            stateFingerprint: exactFingerprint,
+          });
+          console.warn("  [warn] Pack RPC returned without changing the exact state; quarantining it before any recovery.");
+          await sleep(config.balatrobotPollMs, signal);
+          continue;
+        }
         if (scorePrediction) {
           const beforeChips = Number(beforeState?.round?.chips);
           const afterChips = Number(state?.round?.chips);
@@ -1504,6 +1612,16 @@ export async function runBalatrobot({
             log.event("bot_endless_already_dismissed", { step, code: error.code, error: error.message });
             state = assertGameState(await client.gamestate({ signal }), "gamestate after Endless overlay check");
             continue;
+          }
+          if (source === "balatrobot_rpc_circuit_breaker") {
+            state = assertGameState(await client.gamestate({ signal }), "gamestate after rejected pack circuit breaker");
+            return await stopAfterUncertainRpc({
+              step,
+              method: action.method,
+              params: action.params,
+              fingerprint: balatrobotStateFingerprint(state),
+              reason: `The one-shot stuck-pack recovery was rejected: ${error.message}`,
+            });
           }
           const key = `${exactFingerprint}:${action.method}:${JSON.stringify(action.params)}`;
           repeatedRpcFailures = key === repeatedRpcFailureKey ? repeatedRpcFailures + 1 : 1;
@@ -1586,6 +1704,8 @@ export async function runBalatrobot({
               fingerprint: exactFingerprint,
               signature: actionSignature(action),
               method: action.method,
+              params: action.params,
+              unchangedChecks: 1,
             };
             previousError = `${action.method} had an uncertain result and no state change was observed; do not blindly repeat it.`.slice(0, 300);
             console.warn("  No state change is visible yet; the next turn is reserved for a second reconciliation with no RPC sent.");

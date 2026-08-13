@@ -435,6 +435,122 @@ test("runner reconciles an uncertain action and does not replay it on the next t
   assert.ok(log.events.some((event) => event.type === "rpc_uncertain_quarantine"));
 });
 
+test("runner circuit-breaks an unchanged uncertain pack choice with one local skip", async () => {
+  const initial = {
+    ...handState(),
+    state: "SMODS_BOOSTER_OPENED",
+    seed: "PACK-CIRCUIT",
+    pack: {
+      cards: [
+        { key: "c_jupiter", set: "PLANET", label: "Jupiter", value: { effect: "Level up Flush" }, modifier: {}, state: {}, cost: {} },
+      ],
+    },
+  };
+  const after = { ...initial, state: "SHOP", pack: { cards: [] } };
+  let plannerCalls = 0;
+  const calls = [];
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() { return initial; },
+    async call(method, params) {
+      calls.push({ method, params });
+      if (calls.length === 1) {
+        throw new BalatrobotTimeoutError("pack timed out", { method, requestId: 1, timeoutMs: 10 });
+      }
+      return after;
+    },
+  };
+  const planner = {
+    async planState() {
+      plannerCalls += 1;
+      return modelPlan(semanticAction("pack", { card: 0 }));
+    },
+  };
+  const log = fakeLog();
+
+  const result = await runBalatrobot({ projectRoot: ".", config, client, planner, maxSteps: 2, log });
+
+  assert.deepEqual(calls, [
+    { method: "pack", params: { card: 0 } },
+    { method: "pack", params: { skip: true } },
+  ]);
+  assert.equal(plannerCalls, 1);
+  assert.equal(result.state.state, "SHOP");
+  assert.ok(log.events.some((event) => event.type === "rpc_uncertain_circuit_breaker"));
+  assert.ok(log.events.some((event) => event.type === "rpc_result" && event.method === "pack" && event.state === "SHOP"));
+});
+
+test("runner stops safely when one-shot pack skip also has no effect", async () => {
+  const initial = {
+    ...handState(),
+    state: "SMODS_BOOSTER_OPENED",
+    seed: "PACK-CIRCUIT-STOP",
+    pack: {
+      cards: [
+        { key: "c_jupiter", set: "PLANET", label: "Jupiter", value: { effect: "Level up Flush" }, modifier: {}, state: {}, cost: {} },
+      ],
+    },
+  };
+  const calls = [];
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() { return initial; },
+    async call(method, params) {
+      calls.push({ method, params });
+      if (calls.length === 1) {
+        throw new BalatrobotTimeoutError("pack timed out", { method, requestId: 1, timeoutMs: 10 });
+      }
+      return initial;
+    },
+  };
+  const planner = { async planState() { return modelPlan(semanticAction("pack", { card: 0 })); } };
+  const log = fakeLog();
+
+  const result = await runBalatrobot({ projectRoot: ".", config, client, planner, maxSteps: 3, log });
+
+  assert.deepEqual(calls, [
+    { method: "pack", params: { card: 0 } },
+    { method: "pack", params: { skip: true } },
+  ]);
+  assert.match(result.stoppedReason, /Pack Skip remained unchanged/);
+  assert.ok(log.events.some((event) => event.type === "rpc_no_effect"));
+  assert.ok(log.events.some((event) => event.type === "rpc_uncertain_safe_stop"));
+});
+
+test("runner never replays a one-shot pack skip after its transport timeout", async () => {
+  const initial = {
+    ...handState(),
+    state: "SMODS_BOOSTER_OPENED",
+    seed: "PACK-CIRCUIT-SKIP-TIMEOUT",
+    pack: {
+      cards: [
+        { key: "c_jupiter", set: "PLANET", label: "Jupiter", value: { effect: "Level up Flush" }, modifier: {}, state: {}, cost: {} },
+      ],
+    },
+  };
+  const calls = [];
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() { return initial; },
+    async call(method, params) {
+      calls.push({ method, params });
+      throw new BalatrobotTimeoutError("pack timed out", { method, requestId: calls.length, timeoutMs: 10 });
+    },
+  };
+  const planner = { async planState() { return modelPlan(semanticAction("pack", { card: 0 })); } };
+  const log = fakeLog();
+
+  const result = await runBalatrobot({ projectRoot: ".", config, client, planner, maxSteps: 3, log });
+
+  assert.deepEqual(calls, [
+    { method: "pack", params: { card: 0 } },
+    { method: "pack", params: { skip: true } },
+  ]);
+  assert.match(result.stoppedReason, /Pack Skip remained unchanged/);
+  assert.equal(log.events.filter((event) => event.type === "rpc_uncertain_circuit_breaker").length, 1);
+  assert.equal(log.events.filter((event) => event.type === "rpc_uncertain_safe_stop").length, 1);
+});
+
 test("runner treats a changed reconciled state as an applied uncertain action", async () => {
   const initial = handState();
   const after = { ...initial, state: "ROUND_EVAL", round: { ...initial.round, chips: 120 } };

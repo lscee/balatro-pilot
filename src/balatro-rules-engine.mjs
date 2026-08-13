@@ -48,6 +48,10 @@ const CONSUMABLE_TARGET_RULES = Object.freeze({
   c_immolate: { min: 0, max: 0, kind: "destroy-money" },
   c_hex: { min: 0, max: 0, kind: "joker-edition" },
   c_soul: { min: 0, max: 0, kind: "joker" },
+  // Black Hole can appear inside a Celestial pack, but it is still a
+  // Spectral card. It upgrades every poker hand immediately and never asks
+  // the player to select cards from G.hand.
+  c_black_hole: { min: 0, max: 0, kind: "all-hands-upgrade" },
   c_magician: { min: 1, max: 2, kind: "enhance", enhancement: "LUCKY" },
   c_empress: { min: 1, max: 2, kind: "enhance", enhancement: "MULT" },
   c_heirophant: { min: 1, max: 2, kind: "enhance", enhancement: "BONUS" },

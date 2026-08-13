@@ -757,6 +757,35 @@ test("compound planet route names do not also promote their substring hands", ()
   assert.equal(choices.find((item) => item.card?.key === "c_jupiter").planRelevance, "unrelated");
 });
 
+test("celestial pack exposes a leading Black Hole as a strong no-target choice", () => {
+  const exact = {
+    state: "SMODS_BOOSTER_OPENED",
+    hands: {
+      Flush: { level: 3, chips: 65, mult: 8, played: 9 },
+      Straight: { level: 2, chips: 60, mult: 7, played: 5 },
+      "Straight Flush": { level: 1, chips: 100, mult: 8, played: 0 },
+    },
+    hand: { count: 0, cards: [] },
+    jokers: { count: 2, limit: 5, cards: [] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    pack: { cards: [
+      { key: "c_black_hole", label: "Black Hole", set: "SPECTRAL" },
+      { key: "c_jupiter", label: "Jupiter", set: "PLANET" },
+      { key: "c_neptune", label: "Neptune", set: "PLANET" },
+    ] },
+  };
+  const choices = generateBalatrobotPackCandidates(exact, {
+    runPlan: { buildGoal: "Straight / Flush route" },
+  });
+  const blackHole = choices.find((candidate) => candidate.card?.key === "c_black_hole");
+  assert.ok(blackHole);
+  assert.deepEqual(blackHole.action, { method: "pack", card: 0, targets: [] });
+  assert.equal(blackHole.targetRule.kind, "all-hands-upgrade");
+  assert.ok(Number.isFinite(blackHole.expectedValue));
+  assert.ok(blackHole.expectedValue > choices.find((candidate) => candidate.card?.key === "c_jupiter").expectedValue);
+  assert.ok(blackHole.expectedValue > choices.find((candidate) => candidate.card?.key === "c_neptune").expectedValue);
+});
+
 test("shop counterfactual values multiplicative engines and offers a verified full-slot replacement", () => {
   const shop = {
     state: "SHOP",

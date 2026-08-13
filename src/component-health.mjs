@@ -7,6 +7,114 @@ import { localAppDataFile } from "./persistent-json.mjs";
 
 const execFileAsync = promisify(execFile);
 
+const RPC_STALL_EVENT_TYPES = new Set([
+  "bot_state",
+  "rpc_uncertain",
+  "rpc_uncertain_quarantine_result",
+]);
+
+function latestRunEventFile(runsDirectory) {
+  try {
+    let latest = null;
+    for (const entry of fs.readdirSync(runsDirectory, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const file = path.join(runsDirectory, entry.name, "events.ndjson");
+      try {
+        const stat = fs.statSync(file);
+        if (stat.isFile() && (!latest || stat.mtimeMs > latest.mtimeMs)) latest = { file, mtimeMs: stat.mtimeMs };
+      } catch {
+        // A new run directory may not contain its event file yet.
+      }
+    }
+    return latest?.file ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function readEventTail(file, maxBytes = 4 * 1_024 * 1_024) {
+  const stat = fs.statSync(file);
+  const length = Math.min(stat.size, maxBytes);
+  if (length <= 0) return [];
+  const offset = stat.size - length;
+  const descriptor = fs.openSync(file, "r");
+  const buffer = Buffer.allocUnsafe(length);
+  try {
+    fs.readSync(descriptor, buffer, 0, length, offset);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  let source = buffer.toString("utf8");
+  if (offset > 0) source = source.slice(Math.max(0, source.indexOf("\n") + 1));
+  const events = [];
+  for (const line of source.split(/\r?\n/u)) {
+    if (!line.includes('"type"')) continue;
+    try {
+      const event = JSON.parse(line);
+      if (RPC_STALL_EVENT_TYPES.has(event?.type)) events.push(event);
+    } catch {
+      // Ignore an incomplete line while the controller is appending it.
+    }
+  }
+  return events;
+}
+
+export function detectRpcStall(events, {
+  now = Date.now(),
+  minimumTimeouts = 3,
+  minimumSpanMs = 120_000,
+  freshnessMs = 300_000,
+} = {}) {
+  let currentFingerprint = null;
+  let streak = [];
+  for (const event of events ?? []) {
+    if (event?.type === "bot_state") {
+      const fingerprint = String(event.fingerprint ?? "").trim();
+      if (fingerprint && streak.length && fingerprint !== streak.at(-1).fingerprint) streak = [];
+      if (fingerprint) currentFingerprint = fingerprint;
+      continue;
+    }
+    if (event?.type === "rpc_uncertain_quarantine_result") {
+      if (event.changed === true) streak = [];
+      continue;
+    }
+    if (event?.type !== "rpc_uncertain") continue;
+    const fingerprint = String(event.stateFingerprint ?? currentFingerprint ?? "").trim();
+    const method = String(event.method ?? "unknown").trim() || "unknown";
+    const timestamp = Date.parse(event.at ?? "");
+    if (!fingerprint || !Number.isFinite(timestamp)) {
+      streak = [];
+      continue;
+    }
+    if (streak.length && (streak.at(-1).fingerprint !== fingerprint || streak.at(-1).method !== method)) streak = [];
+    streak.push({ fingerprint, method, timestamp, at: event.at });
+    currentFingerprint = fingerprint;
+  }
+  if (streak.length < minimumTimeouts) return null;
+  const firstThresholdEvent = streak.at(-minimumTimeouts);
+  const last = streak.at(-1);
+  if (last.timestamp - firstThresholdEvent.timestamp < minimumSpanMs) return null;
+  if (now - last.timestamp > freshnessMs || last.timestamp - now > 60_000) return null;
+  return {
+    method: last.method,
+    fingerprint: last.fingerprint,
+    timeoutCount: streak.length,
+    spanSeconds: Math.round((last.timestamp - streak[0].timestamp) / 1_000),
+    lastAt: last.at,
+  };
+}
+
+export function readRecentRpcStall(runsDirectory, options = {}) {
+  const file = latestRunEventFile(runsDirectory);
+  if (!file) return null;
+  try {
+    const stall = detectRpcStall(readEventTail(file), options);
+    return stall ? { ...stall, eventFile: file } : null;
+  } catch {
+    return null;
+  }
+}
+
 function normalizedCommand(value) {
   return String(value ?? "").replaceAll("/", "\\").toLowerCase();
 }
@@ -219,6 +327,7 @@ export class ProjectHealthMonitor {
     const overlayListener = listener(4_313);
     const lastEventAt = telemetry?.coverage?.lastEventAt ?? telemetry?.live?.at ?? null;
     const eventAgeSeconds = ageSeconds(lastEventAt, now);
+    const rpcStall = readRecentRpcStall(path.join(this.projectRoot, "runs"), { now });
     const components = [];
 
     const processStatus = (present) => snapshotState === "fresh" ? (present ? "healthy" : "offline") : "degraded";
@@ -250,8 +359,16 @@ export class ProjectHealthMonitor {
         : `精确游戏状态服务监听状态未知${snapshotSuffix}`,
       { pid: botListener?.pid ?? botLauncher?.pid ?? null },
     ));
+    if (rpcStall) {
+      Object.assign(components.at(-1), {
+        status: "degraded",
+        summary: "RPC 连续超时，游戏状态未推进",
+        detail: `${rpcStall.method} 在同一状态连续超时 ${rpcStall.timeoutCount} 次，持续 ${rpcStall.spanSeconds} 秒`,
+        rpcStall,
+      });
+    }
     const controllerStatus = snapshotState !== "fresh" ? "degraded" : controller
-      ? eventAgeSeconds !== null && eventAgeSeconds > 600 ? "degraded" : "healthy"
+      ? rpcStall || (eventAgeSeconds !== null && eventAgeSeconds > 600) ? "degraded" : "healthy"
       : "offline";
     components.push(healthComponent(
       "controller", "AI 控制器", "核心", controllerStatus,
@@ -261,6 +378,13 @@ export class ProjectHealthMonitor {
         : `运行 run-balatro-pilot.ps1 后开始控制游戏${snapshotSuffix}`,
       { pid: controller?.pid ?? null, eventAgeSeconds },
     ));
+    if (rpcStall) {
+      Object.assign(components.at(-1), {
+        summary: "进程存在，但动作超时循环未推进",
+        detail: `PID ${controller?.pid ?? "?"} · ${rpcStall.method} / ${rpcStall.fingerprint.slice(0, 12)}… · 最近仍在写入失败事件`,
+        rpcStall,
+      });
+    }
 
     const localRequested = backend?.mode === "local";
     const localReady = Boolean(backend?.ollama?.reachable && backend?.ollama?.installed && backend?.ollama?.loaded);

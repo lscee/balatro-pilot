@@ -71,6 +71,7 @@ test("vanilla no-target Tarot and Spectral cards do not invent hand targets", ()
     "c_immolate",
     "c_hex",
     "c_soul",
+    "c_black_hole",
   ]) {
     const set = key === "c_hermit" || key === "c_temperance" || key === "c_judgement" || key === "c_wheel_of_fortune"
       ? "TAROT"

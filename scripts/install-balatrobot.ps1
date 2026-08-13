@@ -33,7 +33,8 @@ $BalatroBotEntropyRuntimeFingerprint = "d16f644fbc876316bc81b6f11a6694434de5ec37
 $BalatroBotBrokenEntropyEndlessRuntimeFingerprint = "4ceb563a70550df685623685813b348128f4b2035e9f8010ef3841f5d8d5e5e4"
 $BalatroBotRacyEntropyEndlessRuntimeFingerprint = "e935f034677a82d9cc83d4b8e1f1360dc9ba8361c0a66ba58cbc787b9c657014"
 $BalatroBotUnsafeEndlessRuntimeFingerprint = "e2ab32128ec0fed5473e215df423265fac62278d8875af7c243e6423c3547e73"
-$BalatroBotRuntimeFingerprint = "a5b67a53b06fd4a949b3031d870bea87c6280b8bb7e13a1ad0b9d79e9145603d"
+$BalatroBotPrePackRuntimeFingerprint = "a5b67a53b06fd4a949b3031d870bea87c6280b8bb7e13a1ad0b9d79e9145603d"
+$BalatroBotRuntimeFingerprint = "d53fa2eb86813c48e33b9d2c9317f786ef24bef28c0c60e4b4a48bcfcb6441e2"
 
 $UvVersion = "0.12.3"
 $UvArchiveUri = "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-pc-windows-msvc.zip"
@@ -298,8 +299,9 @@ function Add-BalatroBotEndlessPatch {
   $endpointSource = Join-Path $assetRoot "endless.lua"
   $playSource = Join-Path $assetRoot "play.lua"
   $cashOutSource = Join-Path $assetRoot "cash_out.lua"
+  $packSource = Join-Path $assetRoot "pack.lua"
   $methodSource = Join-Path $assetRoot "openrpc-endless-method.json"
-  foreach ($asset in @($endpointSource, $playSource, $cashOutSource, $methodSource)) {
+  foreach ($asset in @($endpointSource, $playSource, $cashOutSource, $packSource, $methodSource)) {
     if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
       throw "Balatro Pilot endless patch asset is missing: $asset"
     }
@@ -320,6 +322,10 @@ function Add-BalatroBotEndlessPatch {
   # every payout-row event and the native cash-out button are ready.
   Copy-Item -LiteralPath $playSource -Destination (Join-Path $Root "src\lua\endpoints\play.lua") -Force -ErrorAction Stop
   Copy-Item -LiteralPath $cashOutSource -Destination (Join-Path $Root "src\lua\endpoints\cash_out.lua") -Force -ErrorAction Stop
+  # Mixed packs can contain Black Hole before an ordinary Planet. The pinned
+  # endpoint derives hand readiness from the selected card and actual targets,
+  # never from the first offer's broad set.
+  Copy-Item -LiteralPath $packSource -Destination (Join-Path $Root "src\lua\endpoints\pack.lua") -Force -ErrorAction Stop
 
   $entryPath = Join-Path $Root "balatrobot.lua"
   $entry = [System.IO.File]::ReadAllText($entryPath)
@@ -412,9 +418,10 @@ function Get-TargetState {
     $fingerprint -eq $BalatroBotEntropyRuntimeFingerprint -or
     $fingerprint -eq $BalatroBotBrokenEntropyEndlessRuntimeFingerprint -or
     $fingerprint -eq $BalatroBotRacyEntropyEndlessRuntimeFingerprint -or
-    $fingerprint -eq $BalatroBotUnsafeEndlessRuntimeFingerprint
+    $fingerprint -eq $BalatroBotUnsafeEndlessRuntimeFingerprint -or
+    $fingerprint -eq $BalatroBotPrePackRuntimeFingerprint
   ) {
-    return [pscustomobject]@{ State = "patch"; Detail = "BalatroBot v$BalatroBotVersion legacy runtime detected; installer will apply the pinned entropy and safe Endless-settlement patches" }
+    return [pscustomobject]@{ State = "patch"; Detail = "BalatroBot v$BalatroBotVersion legacy runtime detected; installer will apply the pinned entropy, safe settlement, and selected-card pack patches" }
   }
   $shownFingerprint = if ($null -eq $fingerprint) { "unrecognized" } else { $fingerprint }
   return [pscustomobject]@{ State = "conflict"; Detail = "existing runtime fingerprint is $shownFingerprint" }

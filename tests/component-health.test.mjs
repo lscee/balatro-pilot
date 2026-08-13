@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { ProjectHealthMonitor, parseWindowsNetstatListeners } from "../src/component-health.mjs";
+import { ProjectHealthMonitor, detectRpcStall, parseWindowsNetstatListeners } from "../src/component-health.mjs";
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "balatro-health-"));
@@ -82,6 +82,69 @@ test("netstat listener parser keeps only watched TCP listeners", () => {
     { port: 4_312, pid: 101 },
     { port: 4_313, pid: 102 },
   ]);
+});
+
+test("RPC stall detection requires repeated fresh timeouts on one exact state", () => {
+  const at = (seconds) => new Date(Date.parse("2026-08-13T02:00:00.000Z") + seconds * 1_000).toISOString();
+  const stalled = detectRpcStall([
+    { type: "bot_state", at: at(0), fingerprint: "same" },
+    { type: "rpc_uncertain", at: at(1), method: "pack", stateFingerprint: "same" },
+    { type: "rpc_uncertain_quarantine_result", at: at(2), changed: false },
+    { type: "bot_state", at: at(61), fingerprint: "same" },
+    { type: "rpc_uncertain", at: at(62), method: "pack", stateFingerprint: "same" },
+    { type: "bot_state", at: at(122), fingerprint: "same" },
+    { type: "rpc_uncertain", at: at(123), method: "pack", stateFingerprint: "same" },
+  ], { now: Date.parse(at(130)) });
+  assert.equal(stalled.method, "pack");
+  assert.equal(stalled.fingerprint, "same");
+  assert.equal(stalled.timeoutCount, 3);
+
+  assert.equal(detectRpcStall([
+    { type: "rpc_uncertain", at: at(1), method: "pack", stateFingerprint: "old" },
+    { type: "rpc_uncertain", at: at(62), method: "pack", stateFingerprint: "old" },
+    { type: "bot_state", at: at(90), fingerprint: "advanced" },
+    { type: "rpc_uncertain", at: at(123), method: "pack", stateFingerprint: "advanced" },
+  ], { now: Date.parse(at(130)) }), null);
+});
+
+test("component health degrades live RPC and controller when events advance only through timeouts", async () => {
+  const { root, credentials } = fixture();
+  const run = path.join(root, "runs", "live-bot-run");
+  fs.mkdirSync(run, { recursive: true });
+  const events = [0, 61, 122].flatMap((seconds) => [
+    { at: new Date(Date.parse("2026-08-13T02:00:00.000Z") + seconds * 1_000).toISOString(), type: "bot_state", fingerprint: "stuck" },
+    { at: new Date(Date.parse("2026-08-13T02:00:01.000Z") + seconds * 1_000).toISOString(), type: "rpc_uncertain", method: "pack", stateFingerprint: "stuck" },
+  ]);
+  fs.writeFileSync(path.join(run, "events.ndjson"), events.map((event) => JSON.stringify(event)).join("\n") + "\n");
+  const commandRoot = root.replaceAll("/", "\\");
+  const monitor = new ProjectHealthMonitor({
+    projectRoot: root,
+    config: config(),
+    credentialDirectory: credentials,
+    now: () => Date.parse("2026-08-13T02:02:10.000Z"),
+    processProvider: async () => ({
+      processes: [
+        { Name: "Balatro.exe", ProcessId: 101, CommandLine: "Balatro.exe" },
+        { Name: "node.exe", ProcessId: 102, CommandLine: `node ${commandRoot}\\src\\index.mjs run` },
+        { Name: "python.exe", ProcessId: 103, CommandLine: "python balatrobot-serve-compat.py serve" },
+      ],
+      listeners: [
+        { LocalPort: 4312, OwningProcess: 100 },
+        { LocalPort: 12346, OwningProcess: 101 },
+      ],
+    }),
+    routineBackend: { async status() { return { mode: "deepseek", ollama: { reachable: false } }; } },
+    stats: { refresh() { return { coverage: { lastEventAt: events.at(-1).at, totalEvents: 6, runDirectories: 1 } }; } },
+    fetchImpl: async () => { throw new Error("overlay unavailable"); },
+  });
+  try {
+    const result = await monitor.refresh();
+    assert.equal(result.components.find((item) => item.id === "balatrobot").status, "degraded");
+    assert.equal(result.components.find((item) => item.id === "controller").status, "degraded");
+    assert.equal(result.components.find((item) => item.id === "controller").rpcStall.method, "pack");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("component health reports the live stack without probing paid model APIs", async () => {
