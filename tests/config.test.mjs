@@ -59,7 +59,8 @@ test("loadConfig keeps Kimi vision while routing exact state to DeepSeek V4 Flas
       assert.equal(exact.balatrobotStrategicMaxOutputTokens, 2_400);
       assert.equal(exact.balatrobotStrategicTimeoutMs, 300_000);
       assert.equal(exact.balatrobotHandCandidateLimit, 14);
-      assert.equal(exact.balatrobotDeckMode, "adaptive");
+      assert.equal(exact.balatrobotDeckMode, "unlock");
+      assert.equal(exact.balatrobotPostWinMode, "menu");
       assert.equal(exact.balatrobotDeckMinimumTrials, 2);
     },
   );
@@ -81,14 +82,27 @@ test("loadConfig supports environment overrides for the exact-state planner", ()
   });
 });
 
-test("loadConfig supports fixed or adaptive deck selection overrides", () => {
+test("loadConfig supports unlock, fixed, or adaptive deck selection overrides", () => {
   withConfig({}, (directory) => {
     const fixed = loadConfig(directory, { BALATROBOT_DECK: "blue", BALATROBOT_DECK_MODE: "fixed" });
     assert.equal(fixed.balatrobotDeck, "BLUE");
     assert.equal(fixed.balatrobotDeckMode, "fixed");
   });
   withConfig({ balatrobotDeckMode: "random" }, (directory) => {
-    assert.throws(() => loadConfig(directory, {}), /adaptive or fixed/u);
+    assert.throws(() => loadConfig(directory, {}), /unlock, adaptive, or fixed/u);
+  });
+});
+
+test("loadConfig defaults to ending a confirmed win and permits explicit Endless mode", () => {
+  withConfig({}, (directory) => {
+    assert.equal(loadConfig(directory, {}).balatrobotPostWinMode, "menu");
+    assert.equal(
+      loadConfig(directory, { BALATROBOT_POST_WIN_MODE: "endless" }).balatrobotPostWinMode,
+      "endless",
+    );
+  });
+  withConfig({ balatrobotPostWinMode: "invalid" }, (directory) => {
+    assert.throws(() => loadConfig(directory, {}), /balatrobotPostWinMode must be menu or endless/u);
   });
 });
 

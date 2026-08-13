@@ -596,11 +596,16 @@ function highScoreBonus(score) {
   return logarithmic + milestones;
 }
 
-export function semanticTerminalOutcome(state, { victoryCheckpointSeen = false } = {}) {
+export function semanticTerminalOutcome(
+  state,
+  { victoryCheckpointSeen = false, victoryCheckpointTerminal = false } = {},
+) {
   // G.GAME.won is historical and is set before Balatro decides whether the
   // Ante-8 Boss hand actually cleared. Therefore GAME_OVER + won=true can be
-  // an ordinary failed Boss, not a victory. Only a ROUND_EVAL+won checkpoint
-  // observed by the runner proves that this run cleared the win Ante.
+  // an ordinary failed Boss, not a victory. ROUND_EVAL+won is the native win
+  // overlay checkpoint; treat it as terminal only when the configured mode
+  // leaves the run there instead of continuing into Endless.
+  if (victoryCheckpointTerminal && state?.state === "ROUND_EVAL" && state?.won === true) return "won";
   if (state?.state === "GAME_OVER") return victoryCheckpointSeen ? "won" : "lost";
   return null;
 }

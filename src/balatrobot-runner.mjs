@@ -137,6 +137,20 @@ function assertGameState(value, method) {
   return value;
 }
 
+function assertStartedRunMatches(action, state) {
+  if (action?.method !== "start") return;
+  const requestedDeck = String(action?.params?.deck ?? "").trim().toUpperCase();
+  const requestedStake = String(action?.params?.stake ?? "").trim().toUpperCase();
+  const actualDeck = String(state?.deck ?? "").trim().toUpperCase();
+  const actualStake = String(state?.stake ?? "").trim().toUpperCase();
+  if (requestedDeck && actualDeck !== requestedDeck) {
+    throw new Error(`BalatroBot start returned deck ${actualDeck || "unknown"}; expected ${requestedDeck}`);
+  }
+  if (requestedStake && actualStake !== requestedStake) {
+    throw new Error(`BalatroBot start returned stake ${actualStake || "unknown"}; expected ${requestedStake}`);
+  }
+}
+
 function stateLabel(state) {
   return `${state.state} | Ante ${state.ante_num ?? "?"}, Round ${state.round_num ?? "?"}, $${state.money ?? "?"}`;
 }
@@ -619,6 +633,7 @@ export async function runBalatrobot({
   let state = null;
   const mouthLockCache = { blindKey: null, handType: null };
   let collectionKnowledge = null;
+  let activeUnlockTarget = null;
   let appearedThisRun = runCardTracker.snapshot();
   let scoreBenchmarks = [];
   const scoreBenchmarkKeys = new Set();
@@ -628,6 +643,7 @@ export async function runBalatrobot({
   let episodeId = null;
   let victoryCheckpointSeen = false;
   let victoryOverlayDismissed = false;
+  const victoryCheckpointTerminal = String(config.balatrobotPostWinMode ?? "menu").toLowerCase() !== "endless";
   let approvedShopContinuation = null;
   let semanticPriorIndex = new Map();
   const refreshSemanticPriorIndex = ({ announce = false } = {}) => {
@@ -660,14 +676,20 @@ export async function runBalatrobot({
   };
 
   const refreshRunKnowledge = (currentState) => {
-    collectionKnowledge = profileReader?.snapshot?.() ?? collectionKnowledge;
+    const snapshot = profileReader?.snapshot?.() ?? collectionKnowledge;
+    collectionKnowledge = snapshot && activeUnlockTarget
+      ? Object.freeze({ ...snapshot, activeUnlockTarget })
+      : snapshot;
     appearedThisRun = runCardTracker.observe(currentState);
     return contextualBalatrobotState(currentState, collectionKnowledge, appearedThisRun);
   };
 
   const beginEpisode = (episodeState, { allowResume = false } = {}) => {
     if (!episodeState) return;
-    const terminalOutcome = semanticTerminalOutcome(episodeState, { victoryCheckpointSeen });
+    const terminalOutcome = semanticTerminalOutcome(episodeState, {
+      victoryCheckpointSeen,
+      victoryCheckpointTerminal,
+    });
     if (episodeState.state === "MENU" || (terminalOutcome && !allowResume)) return;
     if (!episodeId) strategicCheckpointScopes.clear();
     if (dryRun || !experienceStore?.enabled || episodeId) return;
@@ -724,7 +746,10 @@ export async function runBalatrobot({
 
   const finalizeEpisode = (episodeState) => {
     if (dryRun || !experienceStore?.enabled || !episodeId) return;
-    const outcome = semanticTerminalOutcome(episodeState, { victoryCheckpointSeen });
+    const outcome = semanticTerminalOutcome(episodeState, {
+      victoryCheckpointSeen,
+      victoryCheckpointTerminal,
+    });
     if (!outcome) return;
     try {
       const completed = experienceStore.finalizeEpisode(episodeId, outcome, episodeState);
@@ -853,6 +878,7 @@ export async function runBalatrobot({
       victoryCheckpointSeen = false;
       victoryOverlayDismissed = false;
     }
+    if (action.method === "menu") activeUnlockTarget = null;
     previousError = "";
     repeatedRpcFailureKey = "";
     repeatedRpcFailures = 0;
@@ -1054,7 +1080,9 @@ export async function runBalatrobot({
       if (state.state === "MENU") {
         let deckPerformance = [];
         try {
-          deckPerformance = experienceStore?.deckPerformance?.(config.balatrobotStake) ?? [];
+          deckPerformance = experienceStore?.deckPerformance?.(
+            config.balatrobotDeckMode === "unlock" ? "" : config.balatrobotStake,
+          ) ?? [];
         } catch (error) {
           log.event("bot_deck_performance_error", { step, error: error.message });
           console.warn(`[warn] Deck performance history could not be read; exploration will use unlocked decks only: ${error.message}`);
@@ -1064,9 +1092,21 @@ export async function runBalatrobot({
           performance: deckPerformance,
           config,
         });
+        if (collectionKnowledge && deckSelection?.mode === "unlock") {
+          activeUnlockTarget = Object.freeze({
+            deck: deckSelection.deck,
+            stake: deckSelection.stake,
+            targetUnlocks: Object.freeze([...(deckSelection.targetUnlocks ?? [])]),
+            reason: deckSelection.reason,
+          });
+          collectionKnowledge = Object.freeze({
+            ...collectionKnowledge,
+            activeUnlockTarget,
+          });
+        }
         log.event("bot_deck_selected", {
           step,
-          stake: config.balatrobotStake,
+          stake: deckSelection.stake ?? config.balatrobotStake,
           selection: deckSelection,
           candidates: collectionKnowledge?.unlockedDecks?.map((deck) => ({
             code: deck.code,
@@ -1084,14 +1124,19 @@ export async function runBalatrobot({
         state,
         {
           ...config,
-          ...(deckSelection ? { balatrobotDeck: deckSelection.deck } : {}),
+          ...(deckSelection
+            ? {
+                balatrobotDeck: deckSelection.deck,
+                balatrobotStake: deckSelection.stake ?? config.balatrobotStake,
+              }
+            : {}),
           balatrobotVictoryOverlayDismissed: victoryOverlayDismissed,
         },
       );
       if (action?.method === "start" && deckSelection) {
         action = {
           ...action,
-          reason: `Start ${deckSelection.label}: ${deckSelection.effect}`.slice(0, 160),
+          reason: `Start ${deckSelection.label} on ${deckSelection.stake ?? config.balatrobotStake}: ${deckSelection.reason}`.slice(0, 200),
         };
       }
       let planDetails = circuitRecovery
@@ -1675,6 +1720,7 @@ export async function runBalatrobot({
       }
       try {
         state = assertGameState(await client.call(action.method, action.params, { signal }), action.method);
+        assertStartedRunMatches(action, state);
         const resultFingerprint = balatrobotStateFingerprint(state);
         log.event("rpc_result", {
           step,

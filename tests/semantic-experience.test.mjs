@@ -150,6 +150,13 @@ test("reward and discounted return propagate whole-run outcomes backwards", () =
   assert.ok([...winReturns.values()].every((value) => value > 0));
   assert.ok([...lossReturns.values()].every((value) => value < 0));
   assert.equal(semanticTerminalOutcome({ state: "ROUND_EVAL", won: true }), null);
+  assert.equal(
+    semanticTerminalOutcome(
+      { state: "ROUND_EVAL", won: true },
+      { victoryCheckpointTerminal: true },
+    ),
+    "won",
+  );
   assert.equal(semanticTerminalOutcome({ state: "GAME_OVER", won: true }), "lost");
   assert.equal(semanticTerminalOutcome({ state: "GAME_OVER", won: true }, { victoryCheckpointSeen: true }), "won");
   assert.equal(semanticTerminalOutcome({ state: "GAME_OVER", won: false }), "lost");

@@ -515,8 +515,8 @@ function kimiBalatrobotJsonInstruction() {
     "Write observation, strategy, memory, every runPlan value, and action.reason in concise Simplified Chinese. memory is a compact viewer summary of runPlan. strategy explains how the one current action follows or safely revises that plan. Keep JSON keys, method names, card keys, and enum values unchanged.",
     "runPlan is the persistent plan for this one game and has exactly metaAssessment, buildGoal, synergies, economyPolicy, shopPriorities, pivotPolicy, handPolicy, nextMilestone, revisionReason. metaAssessment compares the exact route with strong 1.0.1o build packages without forcing a tier list. economyPolicy states a practical cash/interest reserve plus spend and reroll triggers. pivotPolicy compares keep, bridge, and pivot lines and names the concrete support, cash, slot, and timing conditions required to change routes. It must connect owned Jokers/consumables/deck changes, the repeatable poker hand being built, which shop effects or categories are highest priority, and how play/discard decisions support that build. Base it on exact current cards and offers; revise it when a stronger shop pivot appears, a purchase changes the build, or survival requires a temporary deviation.",
     "On SHOP, exact_state.shopReroll is a local score-pressure budget, not a fixed build prescription. Use its target, estimatedRoundCapacity, reserve, budget, and remainingDesiredRerolls to compare buying a visible upgrade, rerolling, or preserving cash. If shouldReroll is true, do not leave without either taking a useful visible resource or using an allowed reroll. Never require a fixed Chips/Mult/XMult composition or a named archetype when exact offers support a different route.",
-    "Treat exact_state.highScoreTraining as an advisory local counterfactual profile. In survival stage, first maintain a reliable path through the next blind; in scaling stage, replace weak flat bridges with supported scaling, XMult, copy, retrigger, deck shaping, or hand-level engines; after Ante 8, preserve survival while maximizing multiplicative and retrigger ceiling toward 100000 and 1000000 single-hand milestones. A shop candidate counterfactual.engineDelta compares the build before and after that exact item. It is evidence, not a hard rule: use exact effects, Boss safety, price, slots, and current support to approve or reject it.",
-    "Before naming a core build, read activeDeck, collectionKnowledge, and appearedThisRun inside build_planning_context. Treat the active deck effect as a run-wide rule: adapt hand targets, economy, slot usage, and shop priorities to exploit its upside and cover its downside. A locked Joker is impossible and must never appear as a target. buildGoal and synergies may name only owned Jokers or cards that have actually appeared in this run. Unlocked-but-unseen Jokers may appear only as optional shop priorities or explicit pivot possibilities, never as if already owned or as the current core. Prefer the strongest supported route among cards that actually appeared; remain flexible when only weak bridges have appeared.",
+    "Treat exact_state.highScoreTraining as an advisory local counterfactual profile. In survival stage, first maintain a reliable path through the next blind; in scaling stage, replace weak flat bridges with supported scaling, XMult, copy, retrigger, deck shaping, or hand-level engines. This collection-progression policy ends at the confirmed Ante 8 victory, so high-score ceiling is useful only when it improves that clear. A shop candidate counterfactual.engineDelta compares the build before and after that exact item. It is evidence, not a hard rule: use exact effects, Boss safety, price, slots, and current support to approve or reject it.",
+    "Before naming a core build, read activeDeck, collectionKnowledge, and appearedThisRun inside build_planning_context. Treat the active deck effect as a run-wide rule: adapt hand targets, economy, slot usage, and shop priorities to exploit its upside and cover its downside. The save-backed activeUnlockTarget is the run objective, but a locked Joker condition is only an optional opportunity: pursue it only when the exact current state makes it reachable at negligible survival cost, never invent a hidden condition, and never weaken a winning line merely to chase it. A locked Joker is impossible as a shop/build target. buildGoal and synergies may name only owned Jokers or cards that have actually appeared in this run. Unlocked-but-unseen Jokers may appear only as optional shop priorities or explicit pivot possibilities, never as if already owned or as the current core. Prefer the strongest supported route among cards that actually appeared; remain flexible when only weak bridges have appeared.",
     "IMPORTANT: actions MUST be a JSON array containing exactly one object, never a bare object. Example: actions:[{method:\"play\",cards:[0,1],card:null,voucher:null,pack:null,joker:null,consumable:null,targets:[],skip:null,hand:[],jokers:[],consumables:[],reason:\"play pair\"}].",
     "The action has exactly these fields: method, cards, card, voucher, pack, joker, consumable, targets, skip, hand, jokers, consumables, reason.",
     "method is select|skip|play|discard|buy|sell|reroll|next_round|pack|use|rearrange.",
@@ -592,13 +592,26 @@ export function balatrobotBuildPlanningContext(gameState) {
           unlockedJokerCount: collection.unlockedJokerCount ?? 0,
           totalJokerCount: collection.totalJokerCount ?? 0,
           unlockedJokers: (collection.unlockedJokers ?? []).map((joker) => joker.label || joker.key),
-          lockedJokers: (collection.lockedJokers ?? []).map((joker) => joker.label || joker.key),
+          lockedJokers: (collection.lockedJokers ?? []).map((joker) => ({
+            key: joker.key,
+            label: joker.label || joker.key,
+            unlockCondition: joker.unlockCondition ?? null,
+          })),
           unlockedDecks: (collection.unlockedDecks ?? []).map((deck) => ({
             code: deck.code,
             label: deck.label,
             effect: deck.effect,
           })),
           lockedDecks: (collection.lockedDecks ?? []).map((deck) => deck.label || deck.code || deck.key),
+          activeUnlockTarget: collection.activeUnlockTarget ?? null,
+          deckProgress: (collection.deckProgress ?? [])
+            .filter((deck) => deck.unlocked)
+            .map((deck) => ({
+              code: deck.code,
+              highestWonStake: deck.highestWonStake,
+              nextStake: deck.nextStake,
+              availableStakes: deck.availableStakes,
+            })),
           error: collection.available === false ? collection.error ?? "unavailable" : null,
         }
       : null,
@@ -608,7 +621,7 @@ export function balatrobotBuildPlanningContext(gameState) {
       vouchers: (appeared.vouchers ?? []).map((card) => ({ key: card.key, label: card.label, sources: card.sources })),
     },
     decisionRequired:
-      "use active deck and exact score-pressure budget; verify unlock pool first; keep build composition flexible; buildGoal/synergies use only owned or appeared cards; unlocked unseen cards are optional shop/pivot targets; compare keep_current_build vs temporary_bridge vs pivot",
+      "use active deck, activeUnlockTarget, and exact score-pressure budget; win the selected deck/stake run; locked-Joker conditions are optional only when already reachable without reducing survival; keep build composition flexible; buildGoal/synergies use only owned or appeared cards; unlocked unseen cards are optional shop/pivot targets; compare keep_current_build vs temporary_bridge vs pivot",
   };
 }
 

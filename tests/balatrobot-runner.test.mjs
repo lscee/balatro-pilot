@@ -164,6 +164,108 @@ test("runner starts only an unlocked deck chosen from adaptive performance", asy
   assert.ok(log.events.some((event) => event.type === "bot_deck_selected" && event.selection.deck === "BLUE"));
 });
 
+test("runner sends the unlock selector's legal Stake and preserves its target after profile refresh", async () => {
+  const initial = { state: "MENU" };
+  const after = { ...blindSelectState(), deck: "YELLOW", stake: "RED", seed: "unlock-stake-test" };
+  const afterSelect = { ...handState(), deck: "YELLOW", stake: "RED", seed: "unlock-stake-test" };
+  const calls = [];
+  let current = initial;
+  let plannedUnlockTarget = null;
+  let snapshotCalls = 0;
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() { return current; },
+    async call(method, params) {
+      calls.push({ method, params });
+      current = method === "start" ? after : afterSelect;
+      return current;
+    },
+  };
+  const collection = {
+    available: true,
+    profile: "1",
+    signature: "unlock-pool",
+    unlockedJokers: [],
+    lockedJokers: [],
+    unlockedDecks: [{ code: "YELLOW", label: "Yellow Deck", effect: "+$10", order: 3 }],
+    lockedDecks: [{ code: "ZODIAC" }],
+    deckProgress: [{
+      code: "YELLOW",
+      unlocked: true,
+      winsByStake: { WHITE: 1 },
+      availableStakes: ["WHITE", "RED"],
+      nextStake: "RED",
+    }],
+  };
+  const profileReader = { snapshot() { snapshotCalls += 1; return collection; } };
+  const log = fakeLog();
+  const result = await runBalatrobot({
+    projectRoot: ".",
+    config: { ...config, balatrobotDeckMode: "unlock", balatrobotPostWinMode: "menu" },
+    client,
+    planner: {
+      async planState({ gameState }) {
+        plannedUnlockTarget = gameState.collectionKnowledge?.activeUnlockTarget ?? null;
+        return modelPlan(semanticAction("select"));
+      },
+    },
+    experienceStore: { enabled: false, deckPerformance() { return []; } },
+    profileReader,
+    maxSteps: 2,
+    log,
+  });
+  assert.deepEqual(calls, [
+    { method: "start", params: { deck: "YELLOW", stake: "RED" } },
+    { method: "select", params: {} },
+  ]);
+  assert.ok(snapshotCalls >= 2, "start commit refreshes the save-backed snapshot");
+  assert.deepEqual(plannedUnlockTarget, {
+    deck: "YELLOW",
+    stake: "RED",
+    targetUnlocks: ["ZODIAC"],
+    reason: "Advance the strongest unlocked deck through its next legal Stake (RED)",
+  });
+  assert.deepEqual(result.state, afterSelect);
+  assert.equal(log.events.find((event) => event.type === "bot_deck_selected")?.stake, "RED");
+});
+
+test("runner stops when start returns a different deck or Stake", async () => {
+  const initial = { state: "MENU" };
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() { return initial; },
+    async call() { return { ...blindSelectState(), deck: "RED", stake: "WHITE", seed: "wrong-start" }; },
+  };
+  const profileReader = {
+    snapshot() {
+      return {
+        available: true,
+        unlockedDecks: [{ code: "YELLOW", label: "Yellow Deck", effect: "+$10", order: 3 }],
+        lockedDecks: [{ code: "ZODIAC" }],
+        deckProgress: [{
+          code: "YELLOW",
+          winsByStake: { WHITE: 1 },
+          availableStakes: ["WHITE", "RED"],
+          nextStake: "RED",
+        }],
+      };
+    },
+  };
+  await assert.rejects(
+    runBalatrobot({
+      projectRoot: ".",
+      config: { ...config, balatrobotDeckMode: "unlock" },
+      client,
+      planner: { async planState() { throw new Error("menu must not call a model"); } },
+      experienceStore: { enabled: false, deckPerformance() { return []; } },
+      profileReader,
+      maxSteps: 1,
+      log: fakeLog(),
+    }),
+    /start returned deck RED; expected YELLOW/u,
+  );
+});
+
 test("runner detects and dismisses the unlock overlay after the no-blind RPC mismatch", async () => {
   const initial = blindSelectState();
   const after = handState();
@@ -271,7 +373,57 @@ test("runner handles round navigation locally without spending model tokens", as
   assert.equal(result.usage.apiCalls, 0);
 });
 
-test("runner enters Endless once at a confirmed victory and then cashes out", async () => {
+test("runner records the winning play, finalizes it, and only then returns the win overlay to the menu", async () => {
+  const initial = { ...handState(), seed: "MENU-WIN" };
+  const victory = {
+    ...initial,
+    state: "ROUND_EVAL",
+    won: true,
+    ante_num: 8,
+    round_num: 24,
+    seed: "MENU-WIN",
+  };
+  const menu = { ...victory, state: "MENU", won: false };
+  const order = [];
+  const experienceStore = {
+    enabled: true,
+    allRewardEvidence() { return []; },
+    beginEpisode() {},
+    retrieve() {
+      return { items: [], groups: [], evidence: [], searched: 0, elapsedMs: 0, truncated: false, cached: false };
+    },
+    contextItems() { return []; },
+    formatContext() { return ""; },
+    chooseFastAction() { return null; },
+    recordTransition() {
+      order.push("record:play");
+      return { id: 1, immediateReward: 1 };
+    },
+    finalizeEpisode(episodeId, outcome) {
+      order.push(`finalize:${outcome}`);
+      return { episodeId, outcome, transitions: 3 };
+    },
+    rewardEvidenceForCreditEpisode() { return []; },
+    markEpisodeInterrupted() { order.push("interrupt"); },
+  };
+  let current = initial;
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() { return current; },
+    async call(method) {
+      order.push(`rpc:${method}`);
+      current = method === "play" ? victory : menu;
+      return current;
+    },
+  };
+  const planner = { async planState() { return modelPlan(semanticAction("play", { cards: [0, 1] })); } };
+
+  await runBalatrobot({ projectRoot: ".", config, client, planner, experienceStore, maxSteps: 2, log: fakeLog() });
+
+  assert.deepEqual(order, ["rpc:play", "record:play", "finalize:won", "rpc:menu"]);
+});
+
+test("runner enters Endless once at a confirmed victory and then cashes out when explicitly configured", async () => {
   const victory = {
     ...handState(),
     state: "ROUND_EVAL",
@@ -293,14 +445,21 @@ test("runner enters Endless once at a confirmed victory and then cashes out", as
     },
   };
   const planner = { async planState() { throw new Error("victory navigation must stay local"); } };
-  await runBalatrobot({ projectRoot: ".", config, client, planner, maxSteps: 2, log: fakeLog() });
+  await runBalatrobot({
+    projectRoot: ".",
+    config: { ...config, balatrobotPostWinMode: "endless" },
+    client,
+    planner,
+    maxSteps: 2,
+    log: fakeLog(),
+  });
   assert.deepEqual(calls, [
     { method: "endless", params: {} },
     { method: "cash_out", params: {} },
   ]);
 });
 
-test("runner treats the guarded no-overlay Endless rejection as already dismissed", async () => {
+test("runner treats the guarded no-overlay Endless rejection as already dismissed when explicitly configured", async () => {
   const victory = {
     ...handState(),
     state: "ROUND_EVAL",
@@ -329,7 +488,14 @@ test("runner treats the guarded no-overlay Endless rejection as already dismisse
   };
   const log = fakeLog();
   const planner = { async planState() { throw new Error("victory navigation must stay local"); } };
-  await runBalatrobot({ projectRoot: ".", config, client, planner, maxSteps: 2, log });
+  await runBalatrobot({
+    projectRoot: ".",
+    config: { ...config, balatrobotPostWinMode: "endless" },
+    client,
+    planner,
+    maxSteps: 2,
+    log,
+  });
   assert.deepEqual(calls, [
     { method: "endless", params: {} },
     { method: "cash_out", params: {} },

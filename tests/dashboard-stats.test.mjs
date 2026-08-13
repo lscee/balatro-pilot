@@ -212,6 +212,43 @@ test("DashboardStats records a repeated seed as a new attempt after the previous
   }
 });
 
+test("DashboardStats keeps a post-finalization win overlay in the completed attempt", () => {
+  const fixture = createFixture();
+  try {
+    const directory = path.join(fixture.root, "runs", "2026-08-03T00-00-00-000Z-bot-run");
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, "events.ndjson"), [
+      event("2026-08-03T00:00:00.000Z", "semantic_episode_started", { episodeId: "episode-menu-win" }),
+      event("2026-08-03T00:00:01.000Z", "bot_state", {
+        state: compactState("MENU-WIN", { ante: 8, round: 24 }),
+      }),
+      event("2026-08-03T00:00:02.000Z", "semantic_episode_completed", {
+        episodeId: "episode-menu-win",
+        outcome: "won",
+        transitions: 12,
+      }),
+      event("2026-08-03T00:00:03.000Z", "bot_state", {
+        state: compactState("MENU-WIN", {
+          state: "ROUND_EVAL",
+          ante: 8,
+          round: 24,
+          score: 100_000,
+          won: true,
+        }),
+      }),
+    ].join("\n") + "\n");
+
+    const tracker = new DashboardStats(fixture.root);
+    const stats = tracker.refresh();
+    const games = stats.recentGames.filter((game) => game.seed === "MENU-WIN");
+    assert.equal(games.length, 1);
+    assert.equal(games[0].outcome, "won");
+    assert.equal(stats.overview.ongoingGames, 0);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("DashboardStats merges time-overlapping controller logs for the same seed", () => {
   const fixture = createFixture();
   try {

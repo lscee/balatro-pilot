@@ -8,8 +8,10 @@ import { deflateRawSync } from "node:zlib";
 import {
   BalatroProfileReader,
   BalatroRunCardTracker,
+  parseDeckStakeProgress,
   parseVanillaDeckCatalog,
   parseVanillaJokerCatalog,
+  parseVanillaStakeCatalog,
 } from "../src/balatro-profile.mjs";
 
 function writeJkr(filePath, lua) {
@@ -18,9 +20,16 @@ function writeJkr(filePath, lua) {
 }
 
 const gameLua = `
+  stake_white = {name = 'White Chip', unlocked = true, order = 1, stake_level = 1, set = 'Stake'},
+  stake_red = {name = 'Red Chip', unlocked = false, order = 2, stake_level = 2, set = 'Stake'},
+  stake_green = {name = 'Green Chip', unlocked = false, order = 3, stake_level = 3, set = 'Stake'},
+  stake_black = {name = 'Black Chip', unlocked = false, order = 4, stake_level = 4, set = 'Stake'},
+  stake_blue = {name = 'Blue Chip', unlocked = false, order = 5, stake_level = 5, set = 'Stake'},
   j_joker={order=1, unlocked=true, discovered=true, rarity=1, name="Joker", set="Joker"},
-  j_blueprint={order=2, unlocked=false, discovered=false, rarity=3, name="Blueprint", set="Joker"},
-  j_brainstorm={order=3, unlocked=false, discovered=false, rarity=3, name="Brainstorm", set="Joker"},
+  j_blueprint={order=2, unlocked=false, discovered=false, rarity=3, name="Blueprint", set="Joker", unlock_condition={type='win', n_rounds=18}},
+  j_brainstorm={order=3, unlocked=false, discovered=false, rarity=3, name="Brainstorm", set="Joker", unlock_condition={type='chip_score', chips=100000000, extra={count=2, suit='Spades'}}},
+  j_cartomancer={order=4, unlocked=false, discovered=false, rarity=2, name="Cartomancer", set="Joker", unlock_condition={type='discover_amount', tarot_count=22}},
+  j_showman={order=5, unlocked=false, discovered=false, rarity=2, name="Showman", set="Joker", unlock_condition={type='ante_up', ante=4}},
   b_red={name = "Red Deck", stake = 1, unlocked = true, order = 1, config = {discards = 1}},
   b_blue={name = "Blue Deck", stake = 1, unlocked = false, order = 2, config = {hands = 1}},
   b_black={name = "Black Deck", stake = 1, unlocked = false, order = 5, config = {hands = -1, joker_slot = 1}},
@@ -37,7 +46,10 @@ test("profile reader merges installed defaults with the selected profile unlock 
       path.join(balatro, "2", "meta.jkr"),
       'return {["unlocked"]={["j_blueprint"]=true,["b_blue"]=true,},["discovered"]={["j_blueprint"]=true,["b_blue"]=true,},}',
     );
-    writeJkr(path.join(balatro, "2", "profile.jkr"), 'return {["all_unlocked"]=false,}');
+    writeJkr(
+      path.join(balatro, "2", "profile.jkr"),
+      'return {["all_unlocked"]=false,["deck_usage"]={["b_red"]={["wins"]={[1]=1,},["wins_by_key"]={["stake_white"]=1,},},["b_blue"]={["wins"]={[1]=1,[2]=1,},["wins_by_key"]={["stake_white"]=1,["stake_red"]=1,},},},}',
+    );
     const snapshot = new BalatroProfileReader({
       appData: root,
       executablePath: executable,
@@ -46,15 +58,35 @@ test("profile reader merges installed defaults with the selected profile unlock 
     assert.equal(snapshot.available, true);
     assert.equal(snapshot.profile, "2");
     assert.equal(snapshot.unlockedJokerCount, 2);
-    assert.equal(snapshot.totalJokerCount, 3);
+    assert.equal(snapshot.totalJokerCount, 5);
     assert.deepEqual(snapshot.unlockedJokers.map((joker) => joker.key), ["j_blueprint", "j_joker"]);
-    assert.deepEqual(snapshot.lockedJokers.map((joker) => joker.key), ["j_brainstorm"]);
+    assert.deepEqual(snapshot.lockedJokers.map((joker) => joker.key), ["j_brainstorm", "j_cartomancer", "j_showman"]);
+    assert.deepEqual(snapshot.lockedJokers[0].unlockCondition, {
+      type: "chip_score",
+      chips: 100000000,
+      extra: "{count=2, suit='Spades'}",
+      raw: "{type='chip_score', chips=100000000, extra={count=2, suit='Spades'}}",
+    });
     assert.equal(snapshot.unlockedJokers.find((joker) => joker.key === "j_blueprint").discovered, true);
     assert.equal(snapshot.unlockedDeckCount, 2);
     assert.equal(snapshot.totalDeckCount, 3);
     assert.deepEqual(snapshot.unlockedDecks.map((deck) => deck.code), ["RED", "BLUE"]);
     assert.deepEqual(snapshot.lockedDecks.map((deck) => deck.code), ["BLACK"]);
     assert.match(snapshot.unlockedDecks[1].effect, /\+1 hand/u);
+    assert.equal(snapshot.highestWonStake, "RED");
+    assert.deepEqual(snapshot.deckProgress.find((deck) => deck.code === "RED"), {
+      key: "b_red",
+      code: "RED",
+      label: "Red Deck",
+      order: 1,
+      unlocked: true,
+      winsByStake: { WHITE: 1 },
+      highestWonStake: "WHITE",
+      availableStakes: ["WHITE", "RED"],
+      nextStake: "RED",
+    });
+    assert.equal(snapshot.deckProgress.find((deck) => deck.code === "BLUE").nextStake, "GREEN");
+    assert.deepEqual(snapshot.deckProgress.find((deck) => deck.code === "BLACK").availableStakes, []);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -74,10 +106,11 @@ test("profile reader honors the all-unlocked profile flag", () => {
       executablePath: executable,
       readEntry: () => gameLua,
     }).snapshot();
-    assert.equal(snapshot.unlockedJokerCount, 3);
+    assert.equal(snapshot.unlockedJokerCount, 5);
     assert.deepEqual(snapshot.lockedJokers, []);
     assert.equal(snapshot.unlockedDeckCount, 3);
     assert.deepEqual(snapshot.lockedDecks, []);
+    assert.deepEqual(snapshot.deckProgress[0].availableStakes, ["WHITE", "RED", "GREEN", "BLACK", "BLUE"]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -109,9 +142,40 @@ test("run card tracker remembers cards that appeared and resets on a new seed", 
 
 test("installed Joker parser preserves labels, rarity, and default lock state", () => {
   assert.deepEqual(parseVanillaJokerCatalog(gameLua), [
-    { key: "j_blueprint", label: "Blueprint", rarity: 3, defaultUnlocked: false },
-    { key: "j_brainstorm", label: "Brainstorm", rarity: 3, defaultUnlocked: false },
-    { key: "j_joker", label: "Joker", rarity: 1, defaultUnlocked: true },
+    {
+      key: "j_blueprint",
+      label: "Blueprint",
+      rarity: 3,
+      defaultUnlocked: false,
+      unlockCondition: { type: "win", n_rounds: 18, raw: "{type='win', n_rounds=18}" },
+    },
+    {
+      key: "j_brainstorm",
+      label: "Brainstorm",
+      rarity: 3,
+      defaultUnlocked: false,
+      unlockCondition: {
+        type: "chip_score",
+        chips: 100000000,
+        extra: "{count=2, suit='Spades'}",
+        raw: "{type='chip_score', chips=100000000, extra={count=2, suit='Spades'}}",
+      },
+    },
+    {
+      key: "j_cartomancer",
+      label: "Cartomancer",
+      rarity: 2,
+      defaultUnlocked: false,
+      unlockCondition: { type: "discover_amount", tarot_count: 22, raw: "{type='discover_amount', tarot_count=22}" },
+    },
+    { key: "j_joker", label: "Joker", rarity: 1, defaultUnlocked: true, unlockCondition: null },
+    {
+      key: "j_showman",
+      label: "Showman",
+      rarity: 2,
+      defaultUnlocked: false,
+      unlockCondition: { type: "ante_up", ante: 4, raw: "{type='ante_up', ante=4}" },
+    },
   ]);
 });
 
@@ -142,6 +206,66 @@ test("installed deck parser preserves RPC codes, effects, and default locks", ()
       defaultUnlocked: false,
     },
   ]);
+});
+
+test("installed stake parser preserves RPC codes and the vanilla prerequisite chain", () => {
+  assert.deepEqual(parseVanillaStakeCatalog(gameLua), [
+    {
+      key: "stake_white",
+      code: "WHITE",
+      label: "White Chip",
+      order: 1,
+      stakeLevel: 1,
+      defaultUnlocked: true,
+      appliedStakes: [],
+    },
+    {
+      key: "stake_red",
+      code: "RED",
+      label: "Red Chip",
+      order: 2,
+      stakeLevel: 2,
+      defaultUnlocked: false,
+      appliedStakes: ["stake_white"],
+    },
+    {
+      key: "stake_green",
+      code: "GREEN",
+      label: "Green Chip",
+      order: 3,
+      stakeLevel: 3,
+      defaultUnlocked: false,
+      appliedStakes: ["stake_red"],
+    },
+    {
+      key: "stake_black",
+      code: "BLACK",
+      label: "Black Chip",
+      order: 4,
+      stakeLevel: 4,
+      defaultUnlocked: false,
+      appliedStakes: ["stake_green"],
+    },
+    {
+      key: "stake_blue",
+      code: "BLUE",
+      label: "Blue Chip",
+      order: 5,
+      stakeLevel: 5,
+      defaultUnlocked: false,
+      appliedStakes: ["stake_black"],
+    },
+  ]);
+});
+
+test("deck stake progress prefers wins_by_key and falls back to legacy numeric wins", () => {
+  const stakes = parseVanillaStakeCatalog(gameLua);
+  const parsed = parseDeckStakeProgress(`return {["deck_usage"]={
+    ["b_red"]={["wins"]={[1]=9,[2]=7,},["wins_by_key"]={["stake_white"]=2,}},
+    ["b_blue"]={["wins"]={[1]=1,[2]=1,[3]=1,},["wins_by_key"]={},},
+  },}`, stakes);
+  assert.deepEqual(parsed.get("b_red"), { WHITE: 2, RED: 7 });
+  assert.deepEqual(parsed.get("b_blue"), { WHITE: 1, RED: 1, GREEN: 1 });
 });
 
 test("run card tracker restores appeared cards from an earlier controller log", () => {

@@ -873,7 +873,13 @@ export function deterministicBalatrobotAction(state, config = {}) {
         reason: "Start the next run locally",
       };
     case BALATROBOT_STATES.ROUND_EVAL:
-      return state?.won === true && config.balatrobotVictoryOverlayDismissed !== true
+      if (state?.won !== true) {
+        return { method: "cash_out", params: {}, reason: "Collect round rewards locally" };
+      }
+      if (String(config.balatrobotPostWinMode ?? "menu").toLowerCase() !== "endless") {
+        return { method: "menu", params: {}, reason: "Finish the confirmed victory and return to menu" };
+      }
+      return config.balatrobotVictoryOverlayDismissed !== true
         ? { method: "endless", params: {}, reason: "Dismiss the confirmed victory overlay and continue into Endless mode" }
         : { method: "cash_out", params: {}, reason: "Collect round rewards locally" };
     case BALATROBOT_STATES.GAME_OVER:

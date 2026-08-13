@@ -48,6 +48,53 @@ function scalarBoolean(source, name) {
   return match ? match[1] === "true" : false;
 }
 
+function luaFieldValue(source, name) {
+  const marker = new RegExp(`\\b${name}\\s*=\\s*`, "u").exec(source);
+  if (!marker) return null;
+  const start = marker.index + marker[0].length;
+  const quote = source[start];
+  if (quote === "\"" || quote === "'") {
+    const end = source.indexOf(quote, start + 1);
+    return end < 0 ? null : source.slice(start + 1, end);
+  }
+  if (source[start] === "{") {
+    const body = bracedBodyAt(source, start);
+    return body ? `{${body.trim()}}` : "{}";
+  }
+  const scalar = source.slice(start).match(/^(-?\d+(?:\.\d+)?|true|false)/u)?.[1];
+  if (!scalar) return null;
+  if (scalar === "true" || scalar === "false") return scalar === "true";
+  return Number(scalar);
+}
+
+function parseUnlockCondition(line) {
+  const marker = /\bunlock_condition\s*=\s*/u.exec(line);
+  if (!marker) return null;
+  const openingBrace = line.indexOf("{", marker.index + marker[0].length);
+  if (openingBrace < 0) return null;
+  const body = bracedBodyAt(line, openingBrace);
+  if (!body) return null;
+  const condition = {
+    type: luaFieldValue(body, "type") ?? "",
+    raw: `{${body.trim()}}`,
+  };
+  for (const name of [
+    "n_rounds",
+    "chips",
+    "extra",
+    "ante",
+    "tarot_count",
+    "planet_count",
+    "amount",
+    "deck",
+    "stake",
+  ]) {
+    const value = luaFieldValue(body, name);
+    if (value != null) condition[name] = value;
+  }
+  return condition;
+}
+
 export function parseVanillaJokerCatalog(source) {
   const jokers = [];
   for (const line of String(source ?? "").split(/\r?\n/u)) {
@@ -57,9 +104,41 @@ export function parseVanillaJokerCatalog(source) {
     const unlocked = line.match(/\bunlocked\s*=\s*(true|false)/u)?.[1];
     const rarity = Number(line.match(/\brarity\s*=\s*(\d+)/u)?.[1]) || null;
     if (!unlocked) continue;
-    jokers.push({ key, label, rarity, defaultUnlocked: unlocked === "true" });
+    jokers.push({
+      key,
+      label,
+      rarity,
+      defaultUnlocked: unlocked === "true",
+      unlockCondition: parseUnlockCondition(line),
+    });
   }
   return jokers.sort((left, right) => left.key.localeCompare(right.key));
+}
+
+export function parseVanillaStakeCatalog(source) {
+  const stakes = [];
+  for (const line of String(source ?? "").split(/\r?\n/u)) {
+    const key = line.match(/^\s*(stake_[a-z0-9_]+)\s*=\s*\{/iu)?.[1]?.toLowerCase();
+    if (!key) continue;
+    const label = line.match(/\bname\s*=\s*["']([^"']+)["']/u)?.[1] ?? key;
+    const order = Number(line.match(/\border\s*=\s*(\d+)/u)?.[1]) || null;
+    const stakeLevel = Number(line.match(/\bstake_level\s*=\s*(\d+)/u)?.[1]) || order;
+    const unlocked = line.match(/\bunlocked\s*=\s*(true|false)/u)?.[1];
+    if (!order || !stakeLevel || !unlocked) continue;
+    stakes.push({
+      key,
+      code: key.slice("stake_".length).toUpperCase(),
+      label,
+      order,
+      stakeLevel,
+      defaultUnlocked: unlocked === "true",
+    });
+  }
+  stakes.sort((left, right) => left.order - right.order);
+  return stakes.map((stake, index) => ({
+    ...stake,
+    appliedStakes: index > 0 ? [stakes[index - 1].key] : [],
+  }));
 }
 
 const VANILLA_DECK_EFFECTS = Object.freeze({
@@ -106,6 +185,75 @@ function collectionSignature(keys) {
   return createHash("sha256").update([...keys].sort().join("\n")).digest("hex").slice(0, 16);
 }
 
+function bracedBodyAt(source, openingBrace) {
+  let depth = 0;
+  for (let index = openingBrace; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    else if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(openingBrace + 1, index);
+    }
+  }
+  return "";
+}
+
+function numericTable(source, name) {
+  const result = new Map();
+  for (const match of tableBody(source, name).matchAll(/\[(?:"([^"]+)"|(\d+))\]=(-?\d+)/gu)) {
+    result.set(match[1] ?? match[2], Number(match[3]));
+  }
+  return result;
+}
+
+export function parseDeckStakeProgress(source, stakeCatalog) {
+  const deckUsage = tableBody(String(source ?? ""), "deck_usage");
+  const stakes = Array.isArray(stakeCatalog) ? stakeCatalog : [];
+  const byKey = new Map(stakes.map((stake) => [stake.key, stake]));
+  const result = new Map();
+  for (const match of deckUsage.matchAll(/\["(b_[a-z0-9_]+)"\]=\{/gu)) {
+    const openingBrace = match.index + match[0].lastIndexOf("{");
+    const entry = bracedBodyAt(deckUsage, openingBrace);
+    const keyedWins = numericTable(entry, "wins_by_key");
+    const legacyWins = numericTable(entry, "wins");
+    const winsByStake = {};
+    for (const [stakeKey, count] of keyedWins) {
+      const normalizedKey = stakeKey.startsWith("stake_") ? stakeKey : `stake_${stakeKey}`;
+      const stake = byKey.get(normalizedKey);
+      if (stake && count > 0) winsByStake[stake.code] = count;
+    }
+    for (const [order, count] of legacyWins) {
+      const stake = stakes.find((candidate) => candidate.order === Number(order));
+      if (stake && count > 0 && !(stake.code in winsByStake)) winsByStake[stake.code] = count;
+    }
+    result.set(match[1], winsByStake);
+  }
+  return result;
+}
+
+function stakeProgressForDeck(deck, unlocked, allUnlocked, stakes, winsByStake) {
+  const stakeByKey = new Map(stakes.map((stake) => [stake.key, stake]));
+  const won = (stake) => Number(winsByStake[stake.code]) > 0;
+  const availableStakes = unlocked
+    ? stakes.filter((stake) => allUnlocked || stake.defaultUnlocked || stake.appliedStakes.every((key) => {
+      const prerequisite = stakeByKey.get(key);
+      return prerequisite ? won(prerequisite) : false;
+    })).map((stake) => stake.code)
+    : [];
+  const highestWon = [...stakes].reverse().find(won) ?? null;
+  const nextStake = stakes.find((stake) => availableStakes.includes(stake.code) && !won(stake)) ?? null;
+  return {
+    key: deck.key,
+    code: deck.code,
+    label: deck.label,
+    order: deck.order,
+    unlocked,
+    winsByStake: { ...winsByStake },
+    highestWonStake: highestWon?.code ?? null,
+    availableStakes,
+    nextStake: nextStake?.code ?? null,
+  };
+}
+
 export class BalatroProfileReader {
   constructor({
     appData = process.env.APPDATA,
@@ -123,6 +271,7 @@ export class BalatroProfileReader {
     this.readEntry = readEntry;
     this.catalog = null;
     this.deckCatalog = null;
+    this.stakeCatalog = null;
     this.cached = null;
     this.cacheKey = "";
   }
@@ -143,6 +292,15 @@ export class BalatroProfileReader {
     this.deckCatalog = parseVanillaDeckCatalog(gameLua);
     if (!this.deckCatalog.length) throw new Error("The installed Balatro game.lua did not contain a deck catalog");
     return this.deckCatalog;
+  }
+
+  #stakes() {
+    if (this.stakeCatalog) return this.stakeCatalog;
+    if (!this.executablePath) throw new Error("Balatro.exe was not found, so the installed stake pool cannot be read");
+    const gameLua = this.readEntry(this.executablePath, "game.lua", "utf8");
+    this.stakeCatalog = parseVanillaStakeCatalog(gameLua);
+    if (!this.stakeCatalog.length) throw new Error("The installed Balatro game.lua did not contain a stake catalog");
+    return this.stakeCatalog;
   }
 
   #selectedProfile(root) {
@@ -171,6 +329,7 @@ export class BalatroProfileReader {
 
       const catalog = this.#catalog();
       const deckCatalog = this.#decks();
+      const stakeCatalog = this.#stakes();
       const meta = readCompressedLua(metaPath, this.readFile);
       const profileLua = readCompressedLua(profilePath, this.readFile);
       const unlockedFromProfile = trueKeys(meta, "unlocked");
@@ -185,12 +344,30 @@ export class BalatroProfileReader {
       const lockedDecks = deckCatalog.filter(
         (deck) => !allUnlocked && !deck.defaultUnlocked && !unlockedFromProfile.has(deck.key),
       );
+      const deckStakeWins = parseDeckStakeProgress(profileLua, stakeCatalog);
+      const unlockedDeckKeys = new Set(unlockedDecks.map((deck) => deck.key));
+      const deckProgress = deckCatalog.map((deck) => stakeProgressForDeck(
+        deck,
+        unlockedDeckKeys.has(deck.key),
+        allUnlocked,
+        stakeCatalog,
+        deckStakeWins.get(deck.key) ?? {},
+      ));
+      const highestWonStake = [...stakeCatalog].reverse().find(
+        (stake) => deckProgress.some((deck) => Number(deck.winsByStake[stake.code]) > 0),
+      ) ?? null;
+      const progressSignature = deckProgress.flatMap((deck) => Object.keys(deck.winsByStake)
+        .map((stake) => `${deck.key}:${stake}`));
       this.cacheKey = cacheKey;
       this.cached = Object.freeze({
         available: true,
         profile,
         allUnlocked,
-        signature: collectionSignature([...unlockedKeys, ...unlockedDecks.map((deck) => deck.key)]),
+        signature: collectionSignature([
+          ...unlockedKeys,
+          ...unlockedDecks.map((deck) => deck.key),
+          ...progressSignature,
+        ]),
         unlockedJokerCount: unlocked.length,
         totalJokerCount: catalog.length,
         unlockedJokers: unlocked.map((joker) => ({
@@ -199,11 +376,19 @@ export class BalatroProfileReader {
           rarity: joker.rarity,
           discovered: joker.defaultUnlocked || discoveredFromProfile.has(joker.key),
         })),
-        lockedJokers: locked.map((joker) => ({ key: joker.key, label: joker.label, rarity: joker.rarity })),
+        lockedJokers: locked.map((joker) => ({
+          key: joker.key,
+          label: joker.label,
+          rarity: joker.rarity,
+          unlockCondition: joker.unlockCondition,
+        })),
         unlockedDeckCount: unlockedDecks.length,
         totalDeckCount: deckCatalog.length,
         unlockedDecks: unlockedDecks.map((deck) => ({ ...deck })),
         lockedDecks: lockedDecks.map((deck) => ({ ...deck })),
+        stakeCatalog: stakeCatalog.map((stake) => ({ ...stake, appliedStakes: [...stake.appliedStakes] })),
+        highestWonStake: highestWonStake?.code ?? null,
+        deckProgress,
       });
       return this.cached;
     } catch (error) {
@@ -220,6 +405,9 @@ export class BalatroProfileReader {
         totalDeckCount: 0,
         unlockedDecks: [],
         lockedDecks: [],
+        stakeCatalog: [],
+        highestWonStake: null,
+        deckProgress: [],
         error: error.message,
       });
     }

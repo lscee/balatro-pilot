@@ -639,11 +639,18 @@ test("navigation and fallback policies always make legal forward progress", () =
     reason: "Start the next run locally",
   });
   assert.equal(deterministicBalatrobotAction({ state: "ROUND_EVAL", won: false }).method, "cash_out");
-  assert.equal(deterministicBalatrobotAction({ state: "ROUND_EVAL", won: true }).method, "endless");
+  assert.equal(deterministicBalatrobotAction({ state: "ROUND_EVAL", won: true }).method, "menu");
   assert.equal(
     deterministicBalatrobotAction(
       { state: "ROUND_EVAL", won: true },
-      { balatrobotVictoryOverlayDismissed: true },
+      { balatrobotPostWinMode: "endless" },
+    ).method,
+    "endless",
+  );
+  assert.equal(
+    deterministicBalatrobotAction(
+      { state: "ROUND_EVAL", won: true },
+      { balatrobotPostWinMode: "endless", balatrobotVictoryOverlayDismissed: true },
     ).method,
     "cash_out",
   );

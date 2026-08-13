@@ -139,7 +139,11 @@ test("BalatroBot build context exposes phase, economy, slots, and exact Joker of
   assert.equal(context.shopReroll.budget, 10);
   assert.equal(context.freeJokerSlots, 1);
   assert.deepEqual(context.offeredJokers.map((card) => card.key), ["j_blueprint"]);
-  assert.deepEqual(context.collectionKnowledge.lockedJokers, ["Brainstorm"]);
+  assert.deepEqual(context.collectionKnowledge.lockedJokers, [{
+    key: "j_brainstorm",
+    label: "Brainstorm",
+    unlockCondition: null,
+  }]);
   assert.deepEqual(context.activeDeck, {
     code: "BLACK",
     label: "Black Deck",

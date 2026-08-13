@@ -292,11 +292,17 @@ export class DashboardStats {
     return this.games.get(id);
   }
 
-  gameForExactState(seed, stateName, run, eventAt) {
+  gameForExactState(seed, stateName, run, eventAt, won = false) {
     const current = run.currentGameKey ? this.games.get(run.currentGameKey) : null;
     if (current?.source === "exact" && current.seed === seed) {
       const terminal = current.outcome === "won" || current.outcome === "lost";
       const overlapsCompletedAttempt = terminal && eventAt && current.endedAt && eventAt <= current.endedAt;
+      // In stop-at-win mode semantic learning is finalized immediately after
+      // the winning play, before the next loop logs the still-open native win
+      // overlay. That overlay is the terminal frame of the completed attempt,
+      // not a second same-seed game.
+      const isCompletedWinOverlay = current.outcome === "won" && stateName === "ROUND_EVAL" && won === true;
+      if (isCompletedWinOverlay) return current;
       if (!terminal || stateName === "GAME_OVER" || overlapsCompletedAttempt) return current;
     }
 
@@ -392,7 +398,7 @@ export class DashboardStats {
     if (event.type === "bot_state" && event.state?.seed) {
       const state = event.state;
       const seed = String(state.seed);
-      const game = this.gameForExactState(seed, state.state, run, event.at);
+      const game = this.gameForExactState(seed, state.state, run, event.at, state.won === true);
       run.currentGameKey = game.id;
       game.runIds.add(runId);
       game.startedAt = !game.startedAt || event.at < game.startedAt ? event.at : game.startedAt;

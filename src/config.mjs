@@ -10,10 +10,11 @@ const DEFAULTS = Object.freeze({
   balatrobotPollMs: 100,
   balatrobotTransitionTimeoutMs: 30_000,
   balatrobotDeck: "RED",
-  balatrobotDeckMode: "adaptive",
+  balatrobotDeckMode: "unlock",
   balatrobotDeckMinimumTrials: 2,
   balatrobotDeckExploration: 1.15,
   balatrobotStake: "WHITE",
+  balatrobotPostWinMode: "menu",
   windowTitle: "Balatro",
   provider: "openai-responses",
   model: "gpt-5.6-terra",
@@ -122,6 +123,7 @@ const ENV_OVERRIDES = Object.freeze([
   ["BALATROBOT_URL", "balatrobotUrl"],
   ["BALATROBOT_DECK", "balatrobotDeck"],
   ["BALATROBOT_DECK_MODE", "balatrobotDeckMode"],
+  ["BALATROBOT_POST_WIN_MODE", "balatrobotPostWinMode"],
   ["BALATRO_MODEL", "model"],
   ["BALATROBOT_PROVIDER", "balatrobotProvider"],
   ["BALATROBOT_MODEL", "balatrobotModel"],
@@ -302,11 +304,12 @@ export function loadConfig(projectRoot, env = process.env) {
   if (!balatrobotDecks.has(config.balatrobotDeck)) {
     throw new Error(`balatrobotDeck must be one of: ${[...balatrobotDecks].join(", ")}`);
   }
-  assertOneOf(config.balatrobotDeckMode, "balatrobotDeckMode", ["adaptive", "fixed"]);
+  assertOneOf(config.balatrobotDeckMode, "balatrobotDeckMode", ["unlock", "adaptive", "fixed"]);
   const balatrobotStakes = new Set(["WHITE", "RED", "GREEN", "BLACK", "BLUE", "PURPLE", "ORANGE", "GOLD"]);
   if (!balatrobotStakes.has(config.balatrobotStake)) {
     throw new Error(`balatrobotStake must be one of: ${[...balatrobotStakes].join(", ")}`);
   }
+  assertOneOf(config.balatrobotPostWinMode, "balatrobotPostWinMode", ["menu", "endless"]);
   assertNonEmpty(config.model, "model");
   const providers = new Set(MODEL_PROVIDERS);
   for (const [name, value] of [

@@ -5,10 +5,11 @@
   "balatrobotPollMs": 100,
   "balatrobotTransitionTimeoutMs": 30000,
   "balatrobotDeck": "RED",
-  "balatrobotDeckMode": "adaptive",
+  "balatrobotDeckMode": "unlock",
   "balatrobotDeckMinimumTrials": 2,
   "balatrobotDeckExploration": 1.15,
   "balatrobotStake": "WHITE",
+  "balatrobotPostWinMode": "menu",
   "windowTitle": "Balatro",
   "modelRoutes": {
     "routine": {
