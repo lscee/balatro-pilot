@@ -354,6 +354,44 @@ test("resumeEpisode atomically resumes only a non-regressing matching interrupte
   }
 });
 
+test("resumeEpisode recovers an open episode left by a forced managed-process restart", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "balatro-semantic-rag-open-resume-"));
+  let store;
+  try {
+    store = new SemanticRagStore(root, config("data/semantic.sqlite"));
+    const before = state({ seed: "forced-restart", ante_num: 6, round_num: 15, money: 8 });
+    const boundary = state({ seed: "forced-restart", ante_num: 6, round_num: 16, money: 8, state: "SHOP" });
+    store.beginEpisode({ episodeId: "old-open", runId: "old-managed-run", state: before });
+    store.recordTransition({
+      runId: "old-managed-run", episodeId: "old-open", step: 1, state: before,
+      action: { method: "play", params: { cards: [0, 1] } }, nextState: boundary,
+      source: "balatrobot_model", plan: {}, usage: {},
+    });
+    // Simulate the first post-restart controller having already created a
+    // zero-transition duplicate before this recovery behavior was deployed.
+    store.beginEpisode({ episodeId: "stray-open", runId: "intermediate-run", state: boundary });
+
+    assert.equal(store.resumeEpisode({ runId: "new-managed-run", state: boundary }).episodeId, "old-open");
+    const database = new DatabaseSync(path.join(root, "data", "semantic.sqlite"), { readOnly: true });
+    const recovered = database.prepare(
+      "SELECT run_id, outcome, ended_at FROM semantic_episodes WHERE episode_id='old-open'",
+    ).get();
+    const stray = database.prepare(
+      "SELECT outcome, ended_at FROM semantic_episodes WHERE episode_id='stray-open'",
+    ).get();
+    assert.equal(recovered.run_id, "new-managed-run");
+    assert.equal(recovered.outcome, null);
+    assert.equal(recovered.ended_at, null);
+    assert.equal(stray.outcome, "interrupted");
+    assert.ok(stray.ended_at);
+    database.close();
+    assert.equal(store.resumeEpisode({ runId: "new-managed-run", state: boundary }), null);
+  } finally {
+    store?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("reward migration corrects an unproven legacy Ante-8 win without mutating its raw outcome", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "balatro-semantic-rag-false-win-"));
   let store;

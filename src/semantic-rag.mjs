@@ -756,19 +756,25 @@ export class SemanticRagStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const candidates = this.db.prepare(`
-        SELECT episodes.episode_id, episodes.run_id, episodes.ended_at,
+        SELECT episodes.episode_id, episodes.run_id, episodes.ended_at, episodes.outcome,
+               latest.run_id AS latest_run_id,
                latest.next_features_json, latest.next_state_fingerprint,
-               latest.next_replay_fingerprint
+               latest.next_replay_fingerprint,
+               COALESCE(episodes.ended_at, latest.created_at, episodes.started_at) AS boundary_at
         FROM semantic_episodes episodes
         LEFT JOIN semantic_experiences latest ON latest.id = (
           SELECT id FROM semantic_experiences
           WHERE episode_id = episodes.episode_id ORDER BY id DESC LIMIT 1
         )
-        WHERE episodes.outcome = 'interrupted'
+        WHERE (
+          episodes.outcome = 'interrupted' OR
+          (episodes.outcome IS NULL AND latest.run_id = episodes.run_id)
+        )
           AND episodes.seed = ? AND episodes.deck = ? AND episodes.stake = ?
-          AND episodes.ended_at >= ?
-        ORDER BY episodes.ended_at DESC, episodes.started_at DESC
-      `).all(seed, deck, stake, earliestEndedAt);
+          AND episodes.run_id <> ?
+          AND COALESCE(episodes.ended_at, latest.created_at, episodes.started_at) >= ?
+        ORDER BY boundary_at DESC, episodes.started_at DESC
+      `).all(seed, deck, stake, runId, earliestEndedAt);
       const matches = [];
       for (const candidate of candidates) {
         const latest = semanticNormalizeFeatures(parseJson(candidate.next_features_json, null));
@@ -796,12 +802,32 @@ export class SemanticRagStore {
         UPDATE semantic_episodes
         SET run_id = ?, outcome = NULL, ended_at = NULL,
             max_ante = MAX(max_ante, ?), max_round = MAX(max_round, ?)
-        WHERE episode_id = ? AND outcome = 'interrupted'
+        WHERE episode_id = ? AND (outcome = 'interrupted' OR outcome IS NULL)
       `).run(runId, ante, round, selected.candidate.episode_id);
       if (Number(updated.changes) !== 1) {
         this.db.exec("ROLLBACK");
         return null;
       }
+      // A forced Windows process-tree restart cannot run the old Node
+      // process's finally block.  If an earlier restart already created an
+      // empty or superseded open episode for this same game, close it now so
+      // it cannot remain an ambiguous live trajectory forever.  Non-empty
+      // segments stay intact and can be linked conservatively at reward time.
+      this.db.prepare(`
+        UPDATE semantic_episodes
+        SET ended_at = COALESCE(ended_at, ?), outcome = 'interrupted'
+        WHERE outcome IS NULL AND episode_id <> ? AND run_id <> ?
+          AND seed = ? AND deck = ? AND stake = ?
+          AND transition_count = 0 AND started_at >= ?
+      `).run(
+        new Date().toISOString(),
+        selected.candidate.episode_id,
+        runId,
+        seed,
+        deck,
+        stake,
+        earliestEndedAt,
+      );
       this.db.exec("COMMIT");
       return {
         episodeId: selected.candidate.episode_id,
