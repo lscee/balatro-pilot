@@ -15,6 +15,19 @@ Balatro Pilot 是一个面向 Windows Steam 版《Balatro》的自动游玩与�
 - 直播组件：Dashboard、牌组 Overlay、中文策略 Overlay，以及无需付费请求的组件 Health Check。
 - 安全执行：F8/Ctrl+C 急停、RPC 后对账、超时不盲目重放、失焦等待。
 
+## 当前实测表现
+
+> 核算于 2026-08-17，对局轨迹截至 2026-08-15。数据来自本地精确对局轨迹，仅计入已结束的 `won` / `lost` 对局；进行中与未续接的中断局已排除，控制器重启产生的同局分段按 Reward v7 归并。这是全历史实测快照，不是游戏、牌组或模型的理论上限；当前 Semantic Policy v6 尚无白注完整样本。
+
+| 指标 | 实测值 |
+| --- | ---: |
+| 历史最高单手得分 | **157,863** |
+| 白注全历史完整对局样本 | **522 局** |
+| 白注全历史平均最大 Round（盲注场次） | **5.93** |
+| 白注全历史平均最大 Ante | **2.35** |
+
+最高单手纪录来自 `Ghost Deck / White Stake`，种子 `5DPQWNM5`：在 Ante 5 / Round 15 单手打出 157,863 分，该局最终到达 Ante 8 / Round 23。随着策略版本和训练样本增长，这些数值会继续变化。
+
 ## 架构
 
 ![Balatro Pilot 当前架构](docs/assets/balatro-pilot-architecture.svg)
