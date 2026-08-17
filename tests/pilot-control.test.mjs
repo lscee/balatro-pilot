@@ -117,6 +117,12 @@ test("watchdog pause/start implementation is scoped and pause-aware", () => {
   assert.match(watchdog, /desiredState -eq "paused"/u);
   assert.match(runner, /ControllerOnly requires Balatro\.exe to already be running/u);
   assert.match(runner, /LocalPort 12346/u);
+  const securityImport = runner.indexOf("Microsoft.PowerShell.Security.psd1");
+  const credentialDecrypt = runner.indexOf("ConvertTo-SecureString");
+  assert.ok(
+    securityImport >= 0 && securityImport < credentialDecrypt,
+    "the Windows security module must be pinned before decrypting DPAPI credentials",
+  );
   const pauseGuard = watchdog.lastIndexOf('$controlState.desiredState -eq "paused"');
   const forceRestart = watchdog.lastIndexOf("if ($ForceRestart)");
   assert.ok(pauseGuard >= 0 && pauseGuard < forceRestart, "pause marker must win over ForceRestart");

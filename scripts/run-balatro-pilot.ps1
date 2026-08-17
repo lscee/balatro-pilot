@@ -27,6 +27,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Codex and other parent processes can prepend a PowerShell 7 module directory
+# to PSModulePath even though this launcher intentionally runs under Windows
+# PowerShell. Import the matching in-box security module explicitly so DPAPI
+# credentials never depend on module auto-discovery order.
+$securityModulePath = Join-Path $PSHOME "Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1"
+if (Test-Path -LiteralPath $securityModulePath -PathType Leaf) {
+  Import-Module -Name $securityModulePath -Force -ErrorAction Stop
+} else {
+  Import-Module -Name "Microsoft.PowerShell.Security" -Force -ErrorAction Stop
+}
+
 if (@($ApiDoctor, $StrategicApiDoctor, $VisionApiDoctor).Where({ $_ }).Count -gt 1) {
   throw "Choose only one API doctor mode."
 }
