@@ -9,7 +9,8 @@ export function localAppDataFile(...segments) {
 
 export function readJsonFile(filePath, fallback, isValid = () => true) {
   try {
-    const value = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const source = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/u, "");
+    const value = JSON.parse(source);
     return isValid(value) ? value : fallback;
   } catch {
     return fallback;

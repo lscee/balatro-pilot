@@ -18,6 +18,8 @@ param(
 
   [switch]$DryRun,
 
+  [switch]$ControllerOnly,
+
   [ValidateRange(0, 10000)]
   [int]$Steps = 0
 )
@@ -30,6 +32,9 @@ if (@($ApiDoctor, $StrategicApiDoctor, $VisionApiDoctor).Where({ $_ }).Count -gt
 }
 if (($ApiDoctor -or $StrategicApiDoctor -or $VisionApiDoctor) -and ($DryRun -or $Steps -gt 0)) {
   throw "API doctor modes cannot be combined with -DryRun or -Steps."
+}
+if ($ControllerOnly -and ($ApiDoctor -or $StrategicApiDoctor -or $VisionApiDoctor)) {
+  throw "ControllerOnly cannot be combined with an API doctor mode."
 }
 
 if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
@@ -144,7 +149,15 @@ if ($ApiDoctor) {
     Add-RequiredRoute -Route "strategic" -Provider $configuredBalatrobotStrategicProvider
   }
 }
-if (-not $ApiDoctor -and -not $StrategicApiDoctor -and -not $VisionApiDoctor -and $configuredBackend -ne "vision") {
+if ($ControllerOnly) {
+  if ($null -eq (Get-Process -Name "Balatro" -ErrorAction SilentlyContinue)) {
+    throw "ControllerOnly requires Balatro.exe to already be running."
+  }
+  $rpcListener = Get-NetTCPConnection -State Listen -LocalPort 12346 -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($null -eq $rpcListener) {
+    throw "ControllerOnly requires the existing BalatroBot JSON-RPC listener on port 12346."
+  }
+} elseif (-not $ApiDoctor -and -not $StrategicApiDoctor -and -not $VisionApiDoctor -and $configuredBackend -ne "vision") {
   $companionStarter = Join-Path $resolvedProject "scripts\start-companion-services.ps1"
   if (Test-Path -LiteralPath $companionStarter -PathType Leaf) {
     & $companionStarter -ProjectRoot $resolvedProject

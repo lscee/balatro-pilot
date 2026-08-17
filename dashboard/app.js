@@ -399,6 +399,134 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 8_000) {
   }
 }
 
+let pilotControlState = null;
+let pilotControlReadPending = null;
+let pilotControlOperationPending = null;
+
+function normalizedPilotControlState(status) {
+  const effectiveState = String(status?.effectiveState ?? status?.state ?? "unknown").toLowerCase();
+  const desiredState = String(status?.desiredState ?? effectiveState).toLowerCase();
+  return { effectiveState, desiredState };
+}
+
+function setPilotControlButtons({ pending = false } = {}) {
+  const pause = byId("pilot-pause");
+  const start = byId("pilot-start");
+  const panel = byId("pilot-control");
+  const { effectiveState, desiredState } = normalizedPilotControlState(pilotControlState);
+  const unreadable = !pilotControlState;
+  const transitional =
+    effectiveState === "pausing" ||
+    effectiveState === "starting" ||
+    (desiredState !== "unknown" && effectiveState !== "unknown" && desiredState !== effectiveState);
+  pause.disabled = pending || unreadable || transitional || effectiveState === "paused";
+  start.disabled = pending || unreadable || transitional || effectiveState === "running";
+  panel.setAttribute("aria-busy", String(pending || transitional));
+}
+
+function renderPilotControl(status) {
+  pilotControlState = status;
+  const badge = byId("pilot-control-status");
+  const detail = byId("pilot-control-detail");
+  const { effectiveState, desiredState } = normalizedPilotControlState(status);
+  const operationError = String(status?.operationError ?? "").trim();
+  const controllerPid = Number(status?.controllerPid) || null;
+
+  if (operationError) {
+    badge.className = "pilot-control-status error";
+    badge.textContent = "操作未完成";
+    detail.textContent = `${operationError} · 游戏与直播页面未被关闭。`;
+  } else if (effectiveState === "running") {
+    badge.className = "pilot-control-status running";
+    badge.textContent = "AI 正在运行";
+    detail.textContent = `AI 正在读取游戏状态并自动决策${controllerPid ? ` · 控制器 PID ${controllerPid}` : ""}。暂停只会停止 AI，不会关闭游戏。`;
+  } else if (effectiveState === "paused") {
+    badge.className = "pilot-control-status paused";
+    badge.textContent = "AI 已暂停";
+    detail.textContent = "AI 不会继续规划、调用模型或发送游戏操作；Balatro 游戏、BalatroBot RPC 和直播页面仍保持运行。";
+  } else if (effectiveState === "starting" || desiredState === "running") {
+    badge.className = "pilot-control-status starting";
+    badge.textContent = "正在启动 AI…";
+    detail.textContent = "正在从当前游戏状态恢复自动控制，请勿重复点击。";
+  } else if (effectiveState === "pausing" || desiredState === "paused") {
+    badge.className = "pilot-control-status pausing";
+    badge.textContent = "正在暂停 AI…";
+    detail.textContent = "正在安全停止决策循环；游戏、RPC 和直播页面不会关闭。";
+  } else {
+    badge.className = "pilot-control-status error";
+    badge.textContent = "状态未知";
+    detail.textContent = "暂时无法确认 AI 控制器状态，已禁用操作以避免误触；游戏本身未受影响。";
+  }
+  setPilotControlButtons({ pending: Boolean(pilotControlOperationPending) });
+}
+
+function renderPilotControlError(error) {
+  const badge = byId("pilot-control-status");
+  badge.className = "pilot-control-status error";
+  badge.textContent = "控制接口不可用";
+  setText("pilot-control-detail", `${error.message} · 游戏和直播页面未受影响。`);
+  if (!pilotControlState) setPilotControlButtons({ pending: true });
+}
+
+function refreshPilotControl() {
+  if (pilotControlOperationPending) return pilotControlOperationPending;
+  if (pilotControlReadPending) return pilotControlReadPending;
+  pilotControlReadPending = (async () => {
+    try {
+      const response = await fetchWithTimeout("/api/pilot-control", { cache: "no-store" });
+      const status = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(status.message || `AI 控制状态 HTTP ${response.status}`);
+      renderPilotControl(status);
+      return status;
+    } catch (error) {
+      renderPilotControlError(error);
+      return null;
+    }
+  })().finally(() => {
+    pilotControlReadPending = null;
+  });
+  return pilotControlReadPending;
+}
+
+function controlPilot(action) {
+  if (pilotControlOperationPending) return pilotControlOperationPending;
+  pilotControlOperationPending = (async () => {
+    setPilotControlButtons({ pending: true });
+    const badge = byId("pilot-control-status");
+    badge.className = `pilot-control-status ${action === "pause" ? "pausing" : "starting"}`;
+    badge.textContent = action === "pause" ? "正在暂停 AI…" : "正在启动 AI…";
+    setText(
+      "pilot-control-detail",
+      action === "pause"
+        ? "正在安全停止决策循环；不会关闭 Balatro 游戏、RPC 或直播页面。"
+        : "正在读取当前游戏状态并恢复自动控制，请勿重复点击。",
+    );
+    try {
+      if (pilotControlReadPending) await pilotControlReadPending;
+      const expectedRevision = pilotControlState?.revision;
+      const body = { action };
+      if (expectedRevision !== undefined && expectedRevision !== null) body.expectedRevision = expectedRevision;
+      const response = await fetchWithTimeout("/api/pilot-control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }, 20_000);
+      const status = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(status.message || `AI 控制操作 HTTP ${response.status}`);
+      renderPilotControl(status);
+      void refreshComponentHealth();
+      return status;
+    } catch (error) {
+      renderPilotControlError(error);
+      return null;
+    }
+  })().finally(() => {
+    pilotControlOperationPending = null;
+    setPilotControlButtons();
+  });
+  return pilotControlOperationPending;
+}
+
 let componentHealthPending = null;
 function refreshComponentHealth() {
   if (componentHealthPending) return componentHealthPending;
@@ -553,6 +681,8 @@ async function switchStrategicBackend(mode) {
 }
 
 byId("refresh-button").addEventListener("click", refresh);
+byId("pilot-pause").addEventListener("click", () => controlPilot("pause"));
+byId("pilot-start").addEventListener("click", () => controlPilot("start"));
 byId("backend-local").addEventListener("click", () => switchBackend("local"));
 byId("backend-deepseek").addEventListener("click", () => switchBackend("deepseek"));
 byId("strategic-kimi").addEventListener("click", () => switchStrategicBackend("kimi"));
@@ -561,6 +691,8 @@ window.addEventListener("resize", () => {
   if (latestStats) renderCharts(latestStats);
 });
 refreshComponentHealth();
+refreshPilotControl();
 refresh();
 setInterval(refreshComponentHealth, 10_000);
+setInterval(refreshPilotControl, 10_000);
 setInterval(refresh, 10_000);

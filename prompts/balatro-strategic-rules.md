@@ -13,6 +13,7 @@ This capsule is for strategic checkpoints. The exact game state, active card and
 ## Build and economy
 
 - Build only from owned or actually appeared support. Locked cards are impossible; unlocked unseen cards are optional future pivots, never current assets.
+- At Gold Stake, cumulative Stake rules and Sticker liabilities are hard arithmetic: reserve two $3 payments per Rental, value Perishable only for its remaining Blind counter, charge Eternal for an effectively locked slot, and normally reject Eternal+Rental. Never call a Rental "cheap" because its sticker price is $1.
 - Compare keeping the build, taking a temporary bridge, and pivoting. Pivot only when exact offered support, cash, slots, deck shape, hand levels, and remaining setup time make the new route stronger and reachable.
 - Early weak Jokers may be skipped when survival is already reliable. Preserve interest and slot flexibility, but spend whenever survival, scaling, or a high-impact synergy is worth more than the reserve.
 - At each shop rank every exact offer by immediate survival, repeatable scoring, scaling, consistency, economy, and opportunity cost. Reroll only with a defined target class and affordable downside.

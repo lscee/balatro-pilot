@@ -9,6 +9,7 @@ import { loadConfig, plannerConfigForBackend } from "./config.mjs";
 import { LearningDatabaseMetrics } from "./learning-metrics.mjs";
 import { RoutineBackendController } from "./models/routine-router.mjs";
 import { StrategicBackendController, strategicModeForProvider } from "./models/strategic-router.mjs";
+import { PilotControlManager, readPilotControlState } from "./pilot-control.mjs";
 
 const modulePath = fileURLToPath(import.meta.url);
 const moduleDirectory = path.dirname(modulePath);
@@ -80,6 +81,7 @@ export function createDashboardServer({
   routineBackend = null,
   strategicBackend = null,
   componentHealth = null,
+  pilotControl = null,
 } = {}) {
   const dashboardDirectory = path.join(projectRoot, "dashboard");
   const config = loadConfig(projectRoot);
@@ -108,7 +110,15 @@ export function createDashboardServer({
     defaultMode: strategicModeForProvider(config.balatrobotStrategicProvider),
     availableModes: availableStrategicModes,
   });
-  componentHealth ??= new ProjectHealthMonitor({ projectRoot, config, routineBackend, strategicBackend, stats });
+  pilotControl ??= new PilotControlManager(projectRoot);
+  componentHealth ??= new ProjectHealthMonitor({
+    projectRoot,
+    config,
+    routineBackend,
+    strategicBackend,
+    stats,
+    controlStateProvider: () => readPilotControlState(),
+  });
   return http.createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     if (url.pathname === "/api/routine-backend" && request.method === "GET") {
@@ -170,6 +180,38 @@ export function createDashboardServer({
         }, { "Cache-Control": "no-store" });
       } catch (error) {
         sendJson(response, 400, { error: "strategic_backend_switch_failed", message: error.message });
+      }
+      return;
+    }
+    if (url.pathname === "/api/pilot-control" && request.method === "GET") {
+      try {
+        sendJson(response, 200, await pilotControl.status(), { "Cache-Control": "no-store" });
+      } catch (error) {
+        sendJson(response, 503, {
+          error: error.code ?? "CONTROL_OPERATION_FAILED",
+          message: error.message,
+          ...(error.currentStatus ? { status: error.currentStatus } : {}),
+        }, { "Cache-Control": "no-store" });
+      }
+      return;
+    }
+    if (url.pathname === "/api/pilot-control" && request.method === "POST") {
+      try {
+        const body = await readJson(request);
+        const state = await pilotControl.operate(body.action, { expectedRevision: body.expectedRevision });
+        componentHealth.invalidate?.();
+        sendJson(response, 200, state, { "Cache-Control": "no-store" });
+      } catch (error) {
+        const statusCode = error.code === "REVISION_CONFLICT" || error.code === "CONTROL_BUSY"
+          ? 409
+          : error.code === "INVALID_ACTION" || error.code === "INVALID_REVISION"
+            ? 400
+            : 503;
+        sendJson(response, statusCode, {
+          error: error.code ?? "CONTROL_OPERATION_FAILED",
+          message: error.message,
+          ...(error.currentStatus ? { status: error.currentStatus } : {}),
+        }, { "Cache-Control": "no-store" });
       }
       return;
     }

@@ -218,9 +218,81 @@ test("Death and Cryptid emit ordered, locally simulated copy targets", () => {
   assert.equal(death.some((candidate) => candidate.action.cards.join(",") === "1,0"), false);
   const copyStrong = death.find((candidate) => candidate.action.cards.join(",") === "0,1");
   assert.match(copyStrong.assessment, /copy card 1 onto card 0/);
+  assert.ok(Number.isFinite(copyStrong.longTermValue));
+  assert.equal(copyStrong.destructive, true);
+  assert.equal(copyStrong.fallbackSafe, false);
+  assert.equal(balatroConsumableCandidateFallbackSafe(copyStrong), false);
   assert.ok(cryptid.length > 0);
   assert.deepEqual(cryptid[0].action.cards, [1]);
   assert.ok(cryptid[0].expectedValue > cryptid.at(-1).expectedValue);
+});
+
+test("Justice, Chariot and Devil expose distinct top-K permanent deck edits", () => {
+  const constantPlay = () => ({ handType: "High Card", conservativeScore: 100 });
+  const exact = state({
+    consumables: [
+      { key: "c_justice", label: "Justice", set: "TAROT" },
+      { key: "c_chariot", label: "The Chariot", set: "TAROT" },
+      { key: "c_devil", label: "The Devil", set: "TAROT" },
+    ],
+    hand: [
+      playing("A", "S"),
+      playing("K", "H"),
+      playing("2", "C", { enhancement: "BONUS" }),
+      playing("3", "D"),
+    ],
+  });
+  const candidates = generateBalatroConsumableUseCandidates(exact, {
+    evaluateBestPlay: constantPlay,
+    limit: 20,
+  });
+  for (const key of ["c_justice", "c_chariot", "c_devil"]) {
+    const targeted = candidates.filter((candidate) => candidate.card.key === key);
+    assert.equal(targeted.length, 3, key);
+    assert.ok(targeted.every((candidate) => candidate.requiresStrategic === true), key);
+    assert.ok(targeted.every((candidate) => Number.isFinite(candidate.longTermValue)), key);
+  }
+  const chariot = candidates.filter((candidate) => candidate.card.key === "c_chariot");
+  const devil = candidates.filter((candidate) => candidate.card.key === "c_devil");
+  assert.deepEqual(chariot[0].action.cards, [0], "Steel favors a durable high-rank held card");
+  assert.deepEqual(devil[0].action.cards, [3], "Gold favors an unenhanced off-hand low-rank economy card");
+
+  const overwriteCandidates = generateBalatroConsumableUseCandidates(state({
+    consumables: [{ key: "c_justice", label: "Justice", set: "TAROT" }],
+    hand: [
+      playing("A", "S"),
+      playing("K", "H"),
+      playing("2", "C", { enhancement: "BONUS" }),
+    ],
+  }), { evaluateBestPlay: constantPlay, limit: 20 });
+  const justiceOverwrite = overwriteCandidates.find((candidate) =>
+    candidate.card.key === "c_justice" && candidate.action.cards[0] === 2);
+  assert.equal(justiceOverwrite.harmful, true);
+  assert.equal(justiceOverwrite.fallbackSafe, false);
+  assert.match(justiceOverwrite.assessment, /replaces an existing enhancement/);
+});
+
+test("targeted top-K generation bounds large-hand combinations and skips no-op suit targets", () => {
+  const largeHand = Array.from({ length: 30 }, (_, index) =>
+    playing(String(2 + (index % 9)), index % 5 === 0 ? "H" : ["S", "D", "C"][index % 3]));
+  let evaluations = 0;
+  const exact = state({
+    consumables: [{ key: "c_sun", label: "The Sun", set: "TAROT" }],
+    hand: largeHand,
+  });
+  const candidates = generateBalatroConsumableUseCandidates(exact, {
+    evaluateBestPlay(current) {
+      evaluations += 1;
+      return { handType: "High Card", conservativeScore: current.hand.cards.length * 10 };
+    },
+    limit: 20,
+  });
+  assert.equal(candidates.length, 3);
+  assert.ok(evaluations <= 73, `expected at most 72 target simulations plus one baseline, got ${evaluations}`);
+  assert.ok(candidates.every((candidate) => candidate.requiresStrategic === true));
+  assert.ok(candidates.every((candidate) => candidate.action.cards.every(
+    (index) => largeHand[index].value.suit !== "H",
+  )));
 });
 
 test("Aura pack targeting excludes cards which already have an edition", () => {
@@ -426,4 +498,19 @@ test("shop Buy & Use works at full consumable capacity without entering fallback
   assert.equal(hermit.fallbackSafe, false);
   assert.equal(choices.some((candidate) => candidate.card.key === "c_emperor"), false,
     "a shop generator cannot pretend that Buy & Use frees an owned consumable slot");
+});
+
+test("shop Buy & Use ignores the overdraft from a debuffed Credit Card", () => {
+  const exact = state({
+    state: "SHOP",
+    money: -13,
+    jokers: [{ key: "j_credit_card", label: "Credit Card", state: { debuff: true } }],
+    shop: { count: 1, cards: [
+      { key: "c_hermit", label: "The Hermit", set: "TAROT", cost: { buy: 3, sell: 1 } },
+    ] },
+  });
+  assert.equal(generateBalatroConsumableShopUseCandidates(exact, { evaluateBestPlay }).length, 0);
+
+  exact.jokers.cards[0].state.debuff = false;
+  assert.equal(generateBalatroConsumableShopUseCandidates(exact, { evaluateBestPlay }).length, 1);
 });

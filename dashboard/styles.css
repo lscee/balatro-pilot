@@ -104,6 +104,65 @@ main { padding-bottom: 42px; }
 .live-facts span { padding: 7px 11px; border-radius: 10px; background: rgba(2, 10, 8, .33); color: var(--muted); font-size: 12px; }
 .live-facts b { margin-left: 4px; color: var(--text); font-size: 13px; }
 
+.pilot-control {
+  display: grid;
+  grid-template-columns: minmax(300px, 1fr) minmax(400px, .95fr);
+  align-items: center;
+  gap: 24px;
+  margin-bottom: 16px;
+  padding: 18px 20px;
+  border: 1px solid rgba(127, 240, 189, .25);
+  border-radius: 18px;
+  background: linear-gradient(112deg, rgba(11, 35, 30, .96), rgba(11, 24, 29, .92));
+  box-shadow: var(--shadow);
+}
+.pilot-control-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.pilot-control-heading strong { font-size: 18px; }
+.pilot-control-copy p { max-width: 760px; margin: 7px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.pilot-control-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 9px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  color: var(--gold);
+  background: rgba(255, 211, 106, .08);
+  font-size: 10px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.pilot-control-status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 11px currentColor; }
+.pilot-control-status.running { color: var(--mint); background: rgba(127, 240, 189, .09); }
+.pilot-control-status.paused { color: var(--blue); background: rgba(120, 168, 255, .09); }
+.pilot-control-status.starting,
+.pilot-control-status.pausing,
+.pilot-control-status.checking { color: var(--gold); }
+.pilot-control-status.starting::before,
+.pilot-control-status.pausing::before,
+.pilot-control-status.checking::before { animation: pulse 1.2s infinite; }
+.pilot-control-status.error { color: var(--coral); background: rgba(255, 128, 108, .09); }
+.pilot-control-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.pilot-control-button {
+  min-height: 58px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  color: var(--text);
+  background: rgba(2, 10, 8, .34);
+  text-align: left;
+  cursor: pointer;
+  transition: .18s ease;
+}
+.pilot-control-button:hover:not(:disabled) { transform: translateY(-1px); }
+.pilot-control-button.pause:hover:not(:disabled) { border-color: var(--coral); background: rgba(255, 128, 108, .08); }
+.pilot-control-button.start:hover:not(:disabled) { border-color: var(--mint); background: rgba(127, 240, 189, .08); }
+.pilot-control-button:disabled { cursor: not-allowed; opacity: .46; transform: none; }
+.pilot-control-button span { display: block; margin-bottom: 3px; font: 700 13px "Segoe UI Variable", "Microsoft YaHei UI", sans-serif; }
+.pilot-control-button.pause span { color: #ffaaa0; }
+.pilot-control-button.start span { color: var(--mint); }
+.pilot-control-button small { display: block; color: var(--muted); font-size: 10px; line-height: 1.35; }
+
 .health-panel { margin-bottom: 16px; padding: 18px 20px; }
 .health-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 14px; }
 .health-heading h2 { font-size: 18px; }
@@ -294,6 +353,7 @@ footer {
 
 @media (max-width: 960px) {
   .health-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .pilot-control { grid-template-columns: 1fr; }
   .backend-switch { grid-template-columns: 1fr; }
   .backend-status { justify-self: start; }
   .hero-grid { grid-template-columns: repeat(2, 1fr); }
@@ -306,6 +366,7 @@ footer {
   .status-stack { justify-items: start; }
   .topbar, .live-strip { flex-direction: column; }
   .health-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pilot-control-actions { grid-template-columns: 1fr; }
   .backend-actions { grid-template-columns: 1fr; }
   .live-strip { align-items: stretch; }
   .live-facts { justify-content: flex-start; }

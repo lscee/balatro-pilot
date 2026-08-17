@@ -27,6 +27,7 @@ import {
   generateBalatroConsumablePackCandidates,
   generateBalatroConsumableShopUseCandidates,
   generateBalatroConsumableUseCandidates,
+  inspectBalatroConsumables,
 } from "./balatro-consumable-strategy.mjs";
 
 export { balatrobotJokerCapability, balatrobotJokerTacticalContext, balatrobotVoucherValue };
@@ -148,6 +149,11 @@ const SCALING_ENGINE_JOKERS = new Set([
   "j_wee", "j_runner", "j_square", "j_green_joker", "j_ride_the_bus", "j_flash", "j_supernova",
   "j_trousers", "j_spare_trousers", "j_red_card", "j_ceremonial", "j_rocket", "j_satellite",
 ]);
+const RECURRING_ECONOMY_JOKERS = new Set([
+  "j_business", "j_business_card", "j_cloud_9", "j_delayed_gratification", "j_faceless",
+  "j_golden", "j_golden_joker", "j_mail", "j_reserved_parking", "j_rocket", "j_satellite",
+  "j_to_the_moon",
+]);
 const FINAL_HAND_GENERATOR_KEYS = new Set(["c_fool", "c_high_priestess", "c_emperor", "c_wheel_of_fortune"]);
 const PLANET_HAND_UPGRADES = new Map([
   ["c_pluto", { handType: "High Card", chips: 10, mult: 1 }],
@@ -187,6 +193,17 @@ const HAND_PLAN_ALIASES = new Map([
   ["Flush Five", ["flush five", "同花五条"]],
 ]);
 const TARGETED_CONSUMABLE_SETS = new Set(["TAROT", "SPECTRAL"]);
+// Fail closed: only the weakest deterministic Tarot currently has a sale
+// path. Everything else (including all rescue/economy/generation Tarot,
+// Planets, Spectrals and unknown future consumables) is retention-protected.
+const CONTROLLED_CONSUMABLE_SALE_KEYS = new Set(["c_tower"]);
+const CONSUMABLE_REVIEW_BLIND_AGE = 2;
+const CONSUMABLE_SALE_BLIND_AGE = 2;
+const DEFAULT_RENTAL_RATE = 3;
+const SHOP_DOLLAR_UTILITY = 20;
+const DEFAULT_PERISHABLE_BLINDS = 5;
+const RED_OR_HIGHER_STAKES = new Set(["RED", "GREEN", "BLACK", "BLUE", "PURPLE", "ORANGE", "GOLD"]);
+const HIGH_VALUE_BLIND_TAG_PATTERN = /(?:Investment|Economy|Negative|Polychrome|Rare|Uncommon|Voucher|Coupon|投资|经济|负片|多彩|稀有|罕见|优惠券)/iu;
 const HAND_ACTION_METHODS = new Set(["play", "discard"]);
 const CANDIDATE_ACTION_STATES = new Set(["BLIND_SELECT", "SHOP", "SMODS_BOOSTER_OPENED", "SELECTING_HAND"]);
 const SHOP_STRATEGY_STATES = new Set(["SHOP", "SMODS_BOOSTER_OPENED"]);
@@ -339,10 +356,269 @@ function cardSellPrice(card) {
   return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
-function availableShopMoney(state) {
+function firstDefined(values) {
+  return values.find((value) => value !== undefined && value !== null);
+}
+
+function finiteStickerTally(value) {
+  if (typeof value === "boolean" || value === "") return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.max(0, Math.floor(numeric)) : null;
+}
+
+function jokerStickerProfile(card) {
+  const modifier = card?.modifier && typeof card.modifier === "object" ? card.modifier : {};
+  const cardState = card?.state && typeof card.state === "object" ? card.state : {};
+  const rawPerishable = firstDefined([
+    modifier.perishable,
+    modifier.isPerishable,
+    modifier.is_perishable,
+    cardState.perishable,
+    cardState.isPerishable,
+    cardState.is_perishable,
+    card?.perishable,
+    card?.isPerishable,
+    card?.is_perishable,
+  ]);
+  const explicitTally = firstDefined([
+    modifier.perishable_tally,
+    modifier.perishableTally,
+    cardState.perishable_tally,
+    cardState.perishableTally,
+    card?.perishable_tally,
+    card?.perishableTally,
+  ]);
+  const perishableTally = finiteStickerTally(explicitTally) ?? finiteStickerTally(rawPerishable);
+  const perishable = rawPerishable === true || perishableTally !== null;
+  const rental = Boolean(modifier.rental ?? card?.rental);
+  const configuredRentalRate = Number(firstDefined([
+    modifier.rental_rate,
+    modifier.rentalRate,
+    cardState.rental_rate,
+    cardState.rentalRate,
+    card?.rental_rate,
+    card?.rentalRate,
+  ]));
+  return {
+    eternal: Boolean(modifier.eternal ?? card?.eternal),
+    perishable,
+    // Do not use a truthiness fallback here: zero is the exact expired tally.
+    perishableTally,
+    rental,
+    rentalRate: rental && Number.isFinite(configuredRentalRate) && configuredRentalRate >= 0
+      ? configuredRentalRate
+      : rental ? DEFAULT_RENTAL_RATE : 0,
+  };
+}
+
+function compactJokerStickers(card) {
+  const stickers = jokerStickerProfile(card);
+  return {
+    eternal: stickers.eternal,
+    perishable: stickers.perishableTally ?? (stickers.perishable ? true : null),
+    perishableTally: stickers.perishableTally,
+    rental: stickers.rental,
+    rentalRate: stickers.rentalRate,
+  };
+}
+
+function expectedJokerHoldBlinds(state, { eternal = false } = {}) {
+  const configured = Number(firstDefined([
+    state?.shop_strategy?.expected_hold_blinds,
+    state?.shopStrategy?.expectedHoldBlinds,
+    state?.expected_joker_hold_blinds,
+    state?.expectedJokerHoldBlinds,
+  ]));
+  if (Number.isFinite(configured) && configured > 0) return Math.max(1, Math.min(24, Math.floor(configured)));
+  const ante = Math.max(1, Number(state?.ante_num ?? state?.ante) || 1);
+  const ordinaryHorizon = ante <= 3 ? 6 : ante <= 6 ? 4 : 2;
+  if (!eternal) return ordinaryHorizon;
+  // Eternal cards cannot be replaced later, so value their occupied slot over
+  // at least the remainder of the Ante-8 clear objective.
+  return Math.max(ordinaryHorizon, Math.min(24, (8 - Math.min(8, ante)) * 3 + 2));
+}
+
+function projectedRentalUpkeep(state, { excludeJokerIndex = null, blinds = 1 } = {}) {
+  const horizon = Math.max(0, Number(blinds) || 0);
+  return cardsIn(state?.jokers).reduce((total, joker, index) => {
+    if (index === excludeJokerIndex) return total;
+    const stickers = jokerStickerProfile(joker);
+    return total + (stickers.rental ? stickers.rentalRate * horizon : 0);
+  }, 0);
+}
+
+function ownedConsumableAge(consumableAges, card) {
+  const rawId = card?.id;
+  if (rawId == null || rawId === "") return null;
+  const id = Number(rawId);
+  if (!Number.isInteger(id) || id < 0) return null;
+  const age = consumableAges?.byId?.[id];
+  if (!age?.tracked || Number(age.id) !== id) return null;
+  if (String(age.key ?? "") !== String(card?.key ?? "").trim().toLowerCase()) return null;
+  return age;
+}
+
+function ownedConsumableSlotFull(state) {
+  const owned = cardsIn(state?.consumables);
+  const limit = Number(state?.consumables?.limit);
+  return Number.isInteger(limit) && limit > 0 && owned.length >= limit;
+}
+
+function decorateOwnedConsumableCandidates(state, candidates, consumableAges) {
+  const owned = cardsIn(state?.consumables);
+  const slotFull = ownedConsumableSlotFull(state);
+  return candidates.map((candidate) => {
+    const index = Number(candidate?.action?.consumable);
+    if (!Number.isInteger(index) || index < 0 || index >= owned.length) return candidate;
+    const card = owned[index];
+    const age = ownedConsumableAge(consumableAges, card);
+    const blindAge = Number(age?.blindAge) || 0;
+    const strategicReview = Boolean(age) && (
+      blindAge >= CONSUMABLE_REVIEW_BLIND_AGE || (slotFull && blindAge >= 1)
+    );
+    return {
+      ...candidate,
+      card: { ...candidate.card, id: card?.id ?? null },
+      ownershipTracked: Boolean(age),
+      heldBlindAge: blindAge,
+      firstSeenRound: age?.firstSeenRound ?? null,
+      consumableSlotFull: slotFull,
+      consumableStrategicReview: strategicReview,
+      strategicReason: strategicReview
+        ? `${candidate.strategicReason}; held across ${blindAge} blind transition(s)${slotFull ? " while consumable slots are full" : ""}`
+        : candidate.strategicReason,
+    };
+  });
+}
+
+function agedConsumableHoldReviews(state, consumableAges, useCandidates = []) {
+  const represented = new Set(
+    (Array.isArray(useCandidates) ? useCandidates : [])
+      .map((candidate) => Number(candidate?.action?.consumable))
+      .filter(Number.isInteger),
+  );
+  const slotFull = ownedConsumableSlotFull(state);
+  return inspectBalatroConsumables(state).flatMap((entry) => {
+    if (represented.has(entry.index)) return [];
+    const age = ownedConsumableAge(consumableAges, entry.card);
+    const blindAge = Number(age?.blindAge) || 0;
+    const strategicReview = Boolean(age) && (
+      blindAge >= CONSUMABLE_REVIEW_BLIND_AGE || (slotFull && blindAge >= 1)
+    );
+    if (!strategicReview) return [];
+    return [{
+      card: {
+        index: entry.index,
+        id: entry.card?.id ?? null,
+        key: entry.card?.key ?? "",
+        label: entry.card?.label ?? entry.label ?? "",
+        set: String(entry.card?.set ?? "").toUpperCase(),
+        effect: cardEffect(entry.card),
+      },
+      ownershipTracked: true,
+      heldBlindAge: blindAge,
+      firstSeenRound: age.firstSeenRound ?? null,
+      consumableSlotFull: slotFull,
+      consumableStrategicReview: true,
+      blockedReason: entry.blockedReason || "no currently valid local use target",
+      strategicReason: `explicit hold review: held across ${blindAge} blind transition(s)${slotFull ? " while consumable slots are full" : ""}; no exact use action is currently legal`,
+    }];
+  });
+}
+
+function attachConsumableHoldReviews(candidates, reviews, preferredMethod) {
+  if (!reviews.length) return candidates;
+  const index = candidates.findIndex((candidate) => candidate.action?.method === preferredMethod);
+  if (index < 0) return candidates;
+  const selected = candidates[index];
+  const updated = [...candidates];
+  updated[index] = {
+    ...selected,
+    consumableStrategicReview: true,
+    consumableHoldReviews: reviews,
+    strategicReason: [
+      selected.strategicReason,
+      `${reviews.length} aged held consumable(s) need an explicit use/hold review`,
+    ].filter(Boolean).join("; "),
+  };
+  return updated;
+}
+
+function protectedConsumableFromSale(card) {
+  const set = String(card?.set ?? "").trim().toUpperCase();
+  const key = String(card?.key ?? "").trim().toLowerCase();
+  const edition = cardModifier(card, "edition");
+  // Planets, Spectrals, suit conversion/rescue Tarot and economy/generation
+  // Tarot are never even proposed for sale. Unknown cards fail closed too.
+  return !key || set !== "TAROT" || !CONTROLLED_CONSUMABLE_SALE_KEYS.has(key) || edition.includes("NEGATIVE");
+}
+
+function generateAgedConsumableSaleCandidates(state, consumableAges) {
+  if (!ownedConsumableSlotFull(state)) return [];
+  return cardsIn(state?.consumables).flatMap((card, index) => {
+    const age = ownedConsumableAge(consumableAges, card);
+    if (!age || Number(age.blindAge) < CONSUMABLE_SALE_BLIND_AGE || protectedConsumableFromSale(card)) return [];
+    const sellPrice = cardSellPrice(card);
+    return [{
+      id: `sell:consumable:${index}`,
+      action: { method: "sell", consumable: index },
+      card: {
+        index,
+        id: card.id,
+        key: card.key ?? "",
+        label: card.label ?? "",
+        set: String(card.set ?? "").toUpperCase(),
+        effect: cardEffect(card),
+        sellPrice,
+      },
+      expectedValue: 330 + Math.min(5, Number(age.blindAge)) * 20 + sellPrice * 10,
+      ownershipTracked: true,
+      heldBlindAge: Number(age.blindAge),
+      firstSeenRound: age.firstSeenRound ?? null,
+      consumableSlotFull: true,
+      consumableStrategicReview: true,
+      fallbackSafe: false,
+      eligibleForEmergency: false,
+      requiresStrategic: true,
+      strategicReason: `optional slot-pressure sale only: tracked across ${age.blindAge} blind transitions with all consumable slots full; preserve it unless a strategist verifies lower retention value`,
+    }];
+  });
+}
+
+function shopBudgetMetadata(state, { excludeJokerIndex = null, additionalUpkeep = 0 } = {}) {
   const money = Number(state?.money);
-  const credit = cardsIn(state?.jokers).some((joker) => jokerKey(joker) === "j_credit_card") ? 20 : 0;
-  return (Number.isFinite(money) ? money : 0) + credit;
+  const credit = cardsIn(state?.jokers).reduce((total, joker, index) =>
+    total + (index !== excludeJokerIndex && jokerKey(joker) === "j_credit_card" && !jokerDebuffed(joker) ? 20 : 0), 0);
+  const rentalUpkeep = projectedRentalUpkeep(state, { excludeJokerIndex, blinds: 1 });
+  const twoBlindUpkeep = projectedRentalUpkeep(state, { excludeJokerIndex, blinds: 2 });
+  // Negative balances are real Gold-stake state, and multiple Credit Cards
+  // stack. Keep both facts intact while reserving the next Rental payment.
+  const cash = Number.isFinite(money) ? money : 0;
+  const newUpkeep = Math.max(0, Number(additionalUpkeep) || 0);
+  return {
+    cash,
+    credit,
+    legalLiquidity: cash + credit,
+    rentalUpkeep,
+    twoBlindUpkeep,
+    projectedRentalUpkeep: twoBlindUpkeep,
+    operatingReserve: twoBlindUpkeep,
+    additionalUpkeep: newUpkeep,
+    cashAfterNextUpkeep: cash - rentalUpkeep,
+    available: cash + credit - twoBlindUpkeep - newUpkeep,
+  };
+}
+
+function availableShopMoney(state, options = {}) {
+  return shopBudgetMetadata(state, options).available;
+}
+
+function jokerSlotOccupancy(state) {
+  const visibleCards = cardsIn(state?.jokers).length;
+  const reportedCount = Number(state?.jokers?.count);
+  return Number.isFinite(reportedCount)
+    ? Math.max(visibleCards, Math.max(0, Math.floor(reportedCount)))
+    : visibleCards;
 }
 
 function shopCardCanFit(state, card) {
@@ -350,7 +626,7 @@ function shopCardCanFit(state, card) {
   if (set === "JOKER") {
     // Stable BalatroBot 1.5.2 rejects even a Negative Joker when the slot count
     // is full, so candidate generation must match the RPC validator exactly.
-    return Number(state?.jokers?.count ?? cardsIn(state?.jokers).length) < Number(state?.jokers?.limit ?? 5);
+    return jokerSlotOccupancy(state) < Number(state?.jokers?.limit ?? 5);
   }
   if (TARGETED_CONSUMABLE_SETS.has(set) || set === "PLANET") {
     return Number(state?.consumables?.count ?? cardsIn(state?.consumables).length) < Number(state?.consumables?.limit ?? 2);
@@ -382,10 +658,22 @@ function jokerEngineTraits(joker) {
   };
 }
 
+function jokerFutureEngineWeight(state, joker) {
+  if (jokerDebuffed(joker)) return 0;
+  const stickers = jokerStickerProfile(joker);
+  if (!stickers.perishable) return 1;
+  const horizon = expectedJokerHoldBlinds(state);
+  const remaining = stickers.perishableTally ?? DEFAULT_PERISHABLE_BLINDS;
+  return horizon > 0 ? Math.max(0, Math.min(1, remaining / horizon)) : 0;
+}
+
 export function balatrobotHighScoreBuildProfile(state) {
   const stage = highScoreStage(state);
   const jokers = cardsIn(state?.jokers).filter((joker) => !jokerDebuffed(joker));
-  const traits = jokers.map(jokerEngineTraits);
+  const traits = jokers.map((joker) => ({
+    ...jokerEngineTraits(joker),
+    futureWeight: jokerFutureEngineWeight(state, joker),
+  }));
   const keys = new Set(traits.map((trait) => trait.key));
   const levels = Object.values(state?.hands ?? state?.pokerHands ?? {})
     .map((hand) => Number(hand?.level) || 0);
@@ -395,28 +683,40 @@ export function balatrobotHighScoreBuildProfile(state) {
   const retriggerSources = traits.filter((trait) => trait.retrigger).length;
   const copySources = traits.filter((trait) => trait.copy).length;
   const scalingSources = traits.filter((trait) => trait.scaling).length;
+  const futureFlatScoringSources = traits.reduce((total, trait) => total + (trait.flatScoring ? trait.futureWeight : 0), 0);
+  const futureXMultSources = traits.reduce((total, trait) => total + (trait.xMult ? trait.futureWeight : 0), 0);
+  const futureRetriggerSources = traits.reduce((total, trait) => total + (trait.retrigger ? trait.futureWeight : 0), 0);
+  const futureCopySources = traits.reduce((total, trait) => total + (trait.copy ? trait.futureWeight : 0), 0);
+  const futureScalingSources = traits.reduce((total, trait) => total + (trait.scaling ? trait.futureWeight : 0), 0);
   const stageWeights = stage === "survival"
     ? { flat: 2.4, x: 2.0, retrigger: 1.3, copy: 1.5, scaling: 1.2, level: 0.45 }
     : stage === "scaling"
       ? { flat: 0.9, x: 3.8, retrigger: 3.1, copy: 3.4, scaling: 2.6, level: 0.7 }
       : { flat: 0.25, x: 5.2, retrigger: 4.8, copy: 4.8, scaling: 3.1, level: 0.9 };
+  const weightForKey = (key) => Math.max(0, ...traits.filter((trait) => trait.key === key).map((trait) => trait.futureWeight));
   let synergy = 0;
-  if (keys.has("j_photograph") && keys.has("j_hanging_chad")) synergy += 4;
-  if (keys.has("j_baron") && keys.has("j_mime")) synergy += 4;
-  if (copySources && (xMultSources || retriggerSources)) synergy += 2.5;
-  if (xMultSources && retriggerSources) synergy += 2;
-  const engineScore = flatScoringSources * stageWeights.flat +
-    xMultSources * stageWeights.x +
-    retriggerSources * stageWeights.retrigger +
-    copySources * stageWeights.copy +
-    scalingSources * stageWeights.scaling +
+  if (keys.has("j_photograph") && keys.has("j_hanging_chad")) {
+    synergy += 4 * Math.min(weightForKey("j_photograph"), weightForKey("j_hanging_chad"));
+  }
+  if (keys.has("j_baron") && keys.has("j_mime")) {
+    synergy += 4 * Math.min(weightForKey("j_baron"), weightForKey("j_mime"));
+  }
+  if (futureCopySources && (futureXMultSources || futureRetriggerSources)) {
+    synergy += 2.5 * Math.min(1, futureCopySources, Math.max(futureXMultSources, futureRetriggerSources));
+  }
+  if (futureXMultSources && futureRetriggerSources) synergy += 2 * Math.min(1, futureXMultSources, futureRetriggerSources);
+  const engineScore = futureFlatScoringSources * stageWeights.flat +
+    futureXMultSources * stageWeights.x +
+    futureRetriggerSources * stageWeights.retrigger +
+    futureCopySources * stageWeights.copy +
+    futureScalingSources * stageWeights.scaling +
     Math.min(12, peakHandLevel) * stageWeights.level + synergy;
   const layers = {
-    base: flatScoringSources > 0 || peakHandLevel >= 3,
-    xMult: xMultSources > 0,
-    retrigger: retriggerSources > 0,
-    copy: copySources > 0,
-    scaling: scalingSources > 0 || peakHandLevel >= 5,
+    base: futureFlatScoringSources >= 0.5 || peakHandLevel >= 3,
+    xMult: futureXMultSources >= 0.5,
+    retrigger: futureRetriggerSources >= 0.5,
+    copy: futureCopySources >= 0.5,
+    scaling: futureScalingSources >= 0.5 || peakHandLevel >= 5,
   };
   const missing = Object.entries(layers).filter(([, present]) => !present).map(([name]) => name);
   return {
@@ -428,6 +728,14 @@ export function balatrobotHighScoreBuildProfile(state) {
     retriggerSources,
     copySources,
     scalingSources,
+    futureFlatScoringSources: Math.round(futureFlatScoringSources * 1_000) / 1_000,
+    futureXMultSources: Math.round(futureXMultSources * 1_000) / 1_000,
+    futureRetriggerSources: Math.round(futureRetriggerSources * 1_000) / 1_000,
+    futureCopySources: Math.round(futureCopySources * 1_000) / 1_000,
+    futureScalingSources: Math.round(futureScalingSources * 1_000) / 1_000,
+    rentalUpkeepPerBlind: projectedRentalUpkeep(state),
+    projectedRentalUpkeep: projectedRentalUpkeep(state, { blinds: expectedJokerHoldBlinds(state) }),
+    expiringJokers: traits.filter((trait) => trait.futureWeight < 1).length,
     peakHandLevel,
     layers,
     missing,
@@ -467,6 +775,154 @@ function benchmarkScoreDelta(state, beforeJokers, afterJokers, benchmarks) {
   };
 }
 
+function nextBlindTarget(state) {
+  const ordered = [state?.blinds?.small, state?.blinds?.big, state?.blinds?.boss].filter(Boolean);
+  const next = ordered.find((blind) => {
+    const status = String(blind?.status ?? "").toUpperCase();
+    return !status.includes("DEFEATED") && !status.includes("SKIPPED") && !status.includes("DISABLED");
+  });
+  const target = Number(next?.score ?? next?.target);
+  return {
+    blind: next ?? null,
+    target: Number.isFinite(target) ? Math.max(0, target) : 0,
+  };
+}
+
+function nextBlindHandCapacity(state, blind) {
+  const blindName = String(blind?.name ?? "").trim().toLowerCase();
+  if (blindName === "the needle" || blindName === "needle") return 1;
+  let capacity = 4;
+  const deck = String(state?.deck?.key ?? state?.deck?.name ?? state?.deck ?? "").toLowerCase();
+  if (/(?:^|[_\s])blue(?:[_\s]|$)/u.test(deck)) capacity += 1;
+  if (/(?:^|[_\s])black(?:[_\s]|$)/u.test(deck)) capacity -= 1;
+  const voucherKeys = new Set(Object.keys(state?.used_vouchers ?? state?.usedVouchers ?? {}));
+  if (voucherKeys.has("v_grabber")) capacity += 1;
+  if (voucherKeys.has("v_nacho_tong")) capacity += 1;
+  if (cardsIn(state?.jokers).some((joker) => jokerKey(joker) === "j_burglar")) capacity += 3;
+  return Math.max(1, capacity);
+}
+
+function jokerImmediateSurvivalEvidence(state, card, benchmarks = []) {
+  const owned = cardsIn(state?.jokers);
+  const { blind, target } = nextBlindTarget(state);
+  const beforeScores = [];
+  const afterScores = [];
+  for (const benchmark of Array.isArray(benchmarks) ? benchmarks : []) {
+    if (!benchmark?.state || benchmark?.candidate?.action?.method !== "play") continue;
+    const baseState = stateWithJokers(benchmark.state, owned);
+    const hypotheticalState = stateWithJokers(benchmark.state, [...owned, card]);
+    const before = estimateBalatrobotCandidateScore(baseState, benchmark.candidate)?.conservativeScore;
+    const after = estimateBalatrobotCandidateScore(hypotheticalState, benchmark.candidate)?.conservativeScore;
+    if (!Number.isFinite(before) || !Number.isFinite(after)) continue;
+    beforeScores.push(before);
+    afterScores.push(after);
+  }
+  // The next Blind owns the hand cap. Historical benchmark states may have
+  // four hands, but The Needle still permits exactly one.
+  const hands = nextBlindHandCapacity(state, blind);
+  const beforePerHand = median(beforeScores);
+  const afterPerHand = median(afterScores);
+  const beforeCapacity = beforePerHand * hands;
+  const afterCapacity = afterPerHand * hands;
+  const bossUncertainty = String(blind?.type ?? "").toUpperCase() === "BOSS";
+  const proven = !bossUncertainty && target > 0 && beforeScores.length > 0 && beforeCapacity < target && afterCapacity >= target;
+  return {
+    proven,
+    samples: beforeScores.length,
+    blind: blind?.name ?? blind?.type ?? null,
+    target,
+    hands,
+    beforeCapacity: Math.round(beforeCapacity),
+    afterCapacity: Math.round(afterCapacity),
+    bossUncertainty,
+  };
+}
+
+function jokerRemovalEvidence(state, removedIndex, benchmarks = []) {
+  const owned = cardsIn(state?.jokers);
+  const afterJokers = owned.filter((_, index) => index !== removedIndex);
+  const { blind, target } = nextBlindTarget(state);
+  const hands = nextBlindHandCapacity(state, blind);
+  const beforeScores = [];
+  const afterScores = [];
+  for (const benchmark of Array.isArray(benchmarks) ? benchmarks : []) {
+    if (!benchmark?.state || benchmark?.candidate?.action?.method !== "play") continue;
+    const before = estimateBalatrobotCandidateScore(
+      stateWithJokers(benchmark.state, owned),
+      benchmark.candidate,
+    )?.conservativeScore;
+    const after = estimateBalatrobotCandidateScore(
+      stateWithJokers(benchmark.state, afterJokers),
+      benchmark.candidate,
+    )?.conservativeScore;
+    if (!Number.isFinite(before) || !Number.isFinite(after)) continue;
+    beforeScores.push(before);
+    afterScores.push(after);
+  }
+  const beforeCapacity = median(beforeScores) * hands;
+  const afterCapacity = median(afterScores) * hands;
+  const beforeProfile = balatrobotHighScoreBuildProfile(state);
+  const afterProfile = balatrobotHighScoreBuildProfile(stateWithJokers(state, afterJokers));
+  return {
+    samples: beforeScores.length,
+    blind: blind?.name ?? blind?.type ?? null,
+    target,
+    hands,
+    beforeCapacity: Math.round(beforeCapacity),
+    afterCapacity: Math.round(afterCapacity),
+    currentLineCanClear: target > 0 && beforeScores.length > 0 && beforeCapacity >= target,
+    afterRemovalCanClear: target > 0 && beforeScores.length > 0 && afterCapacity >= target,
+    breaksImmediateSurvival: target > 0 && beforeScores.length > 0 && beforeCapacity >= target && afterCapacity < target,
+    engineLoss: Math.round(Math.max(0, beforeProfile.engineScore - afterProfile.engineScore) * 1_000) / 1_000,
+  };
+}
+
+function eternalSlotUtilityCost(state) {
+  const owned = jokerSlotOccupancy(state);
+  const limit = Math.max(1, Number(state?.jokers?.limit) || 5);
+  const occupancy = Math.min(1, (owned + 1) / limit);
+  return Math.round(80 + occupancy * 120);
+}
+
+function stickerAwareJokerValuation(state, card, baseValue, { immediateSurvival = null } = {}) {
+  const stickers = jokerStickerProfile(card);
+  const expectedHoldBlinds = expectedJokerHoldBlinds(state, { eternal: stickers.eternal });
+  const remainingPerishableBlinds = stickers.perishable
+    ? stickers.perishableTally ?? DEFAULT_PERISHABLE_BLINDS
+    : null;
+  const effectiveHoldBlinds = stickers.perishable
+    ? Math.min(expectedHoldBlinds, remainingPerishableBlinds)
+    : expectedHoldBlinds;
+  const lifespanDiscount = expectedHoldBlinds > 0 ? effectiveHoldBlinds / expectedHoldBlinds : 0;
+  const projectedRentalCost = stickers.rental ? stickers.rentalRate * effectiveHoldBlinds : 0;
+  const eternalSlotCost = stickers.eternal ? eternalSlotUtilityCost(state) : 0;
+  const upfrontCost = cardBuyPrice(card);
+  const discountedBenefit = Math.max(0, Number(baseValue) || 0) * lifespanDiscount;
+  const netPresentValue = discountedBenefit -
+    (Number.isFinite(upfrontCost) ? upfrontCost * SHOP_DOLLAR_UTILITY : 0) -
+    projectedRentalCost * SHOP_DOLLAR_UTILITY -
+    eternalSlotCost;
+  // Eternal+Rental is irreversible recurring debt. Local hand benchmarks do
+  // not model every upcoming Boss rule (for example The Plant debuffing the
+  // face card that powers Photograph), so there is no safe local exception.
+  const immediateSurvivalException = false;
+  return {
+    ...stickers,
+    baseValue: Math.round((Number(baseValue) || 0) * 100) / 100,
+    expectedHoldBlinds,
+    effectiveHoldBlinds,
+    remainingPerishableBlinds,
+    lifespanDiscount: Math.round(lifespanDiscount * 1_000) / 1_000,
+    upfrontCost: Number.isFinite(upfrontCost) ? upfrontCost : null,
+    projectedRentalCost,
+    eternalSlotCost,
+    netPresentValue: Math.round(netPresentValue * 100) / 100,
+    hardRejected: stickers.eternal && stickers.rental,
+    immediateSurvivalException,
+    immediateSurvival: immediateSurvival ?? null,
+  };
+}
+
 function jokerPurchaseCounterfactual(state, card, benchmarks = []) {
   const owned = cardsIn(state?.jokers);
   const before = balatrobotHighScoreBuildProfile(state);
@@ -480,7 +936,48 @@ function jokerPurchaseCounterfactual(state, card, benchmarks = []) {
     before,
     after,
     capability,
+    immediateSurvival: jokerImmediateSurvivalEvidence(state, card, benchmarks),
   };
+}
+
+function readableBlindTag(blind) {
+  const value = firstDefined([
+    blind?.tag?.name,
+    blind?.tagName,
+    blind?.tag_name,
+    blind?.tag?.effect,
+    blind?.tagEffect,
+    blind?.tag_effect,
+  ]);
+  return String(value ?? "").trim();
+}
+
+function blindSelectionEconomy(state, blind) {
+  const stake = String(state?.stake ?? "WHITE").trim().toUpperCase() || "WHITE";
+  const type = String(blind?.type ?? "").trim().toUpperCase();
+  const fixedSmallReward = type === "SMALL" && RED_OR_HIGHER_STAKES.has(stake) ? 0 : null;
+  const explicitReward = Number(firstDefined([blind?.reward, blind?.dollars, blind?.money]));
+  const defaultReward = type === "SMALL" ? 3 : type === "BIG" ? 4 : type === "BOSS" ? 5 : 0;
+  const blindReward = fixedSmallReward ?? (Number.isFinite(explicitReward) ? Math.max(0, explicitReward) : defaultReward);
+  const hands = Math.max(0, Number(state?.round?.hands_left) || 0);
+  return {
+    stake,
+    blindType: type || null,
+    blindReward,
+    smallBlindReward: type === "SMALL" ? blindReward : null,
+    remainingHandDollarRate: 1,
+    maximumRemainingHandMoney: hands,
+    shopAccessAfterPlay: true,
+    forfeitsShopOnSkip: true,
+  };
+}
+
+function blindEconomyReason(blind, economy) {
+  const name = blind?.name || blind?.type || "current blind";
+  const smallReward = economy.blindType === "SMALL"
+    ? `Small Blind fixed reward is $${economy.smallBlindReward} on ${economy.stake}`
+    : `${name} fixed reward is $${economy.blindReward}`;
+  return `${smallReward}; playing keeps the post-blind shop and can earn up to $${economy.maximumRemainingHandMoney} from unused hands; skipping forfeits that reward, unused-hand money, and the shop`;
 }
 
 function generateBlindSelectCandidates(state) {
@@ -488,12 +985,39 @@ function generateBlindSelectCandidates(state) {
   const blind = [state?.blinds?.small, state?.blinds?.big, state?.blinds?.boss]
     .filter(Boolean)
     .find((item) => String(item?.status ?? "").toUpperCase().includes("SELECT"));
+  const economy = blindSelectionEconomy(state, blind);
+  const economyReason = blindEconomyReason(blind, economy);
   const candidates = [{
     id: "select:current",
     action: { method: "select" },
     target: `challenge ${blind?.name || blind?.type || "the current blind"}`,
     expectedValue: 1_000,
+    economy,
+    strategicReason: economyReason,
   }];
+  const blindType = String(blind?.type ?? "").toUpperCase();
+  const tag = readableBlindTag(blind);
+  const ante = Number(state?.ante_num ?? state?.ante);
+  const activeJokers = cardsIn(state?.jokers).filter((joker) => !jokerDebuffed(joker)).length;
+  const matureBuild = activeJokers >= 3 && balatrobotScoringJokerCount(state) >= 2;
+  const skipContractSatisfied = blindType !== "BOSS" &&
+    Number.isFinite(ante) && ante >= 2 &&
+    HIGH_VALUE_BLIND_TAG_PATTERN.test(tag) &&
+    matureBuild;
+  if (skipContractSatisfied) {
+    candidates.push({
+      id: "skip:current",
+      action: { method: "skip" },
+      target: `skip ${blind?.name || blind?.type || "the current blind"} for ${tag}`,
+      expectedValue: 560,
+      economy,
+      tag,
+      skipEligibility: { ante, activeJokers, scoringJokers: balatrobotScoringJokerCount(state), highValueTag: true, matureBuild },
+      requiresStrategic: true,
+      fallbackSafe: false,
+      strategicReason: `Skipping for ${tag} requires a fresh strategic tag evaluation; ${economyReason}`,
+    });
+  }
   const vouchers = state?.used_vouchers && typeof state.used_vouchers === "object"
     ? state.used_vouchers
     : {};
@@ -501,10 +1025,10 @@ function generateBlindSelectCandidates(state) {
   const hasDirectorsCut = Object.hasOwn(vouchers, "v_directors_cut");
   const boss = state?.blinds?.boss ?? (String(blind?.type ?? "").toUpperCase() === "BOSS" ? blind : null);
   const bossRestriction = String(boss?.effect ?? boss?.description ?? "").trim();
-  const money = Number(state?.money);
+  const legalLiquidity = shopBudgetMetadata(state).legalLiquidity;
   if (
-    String(blind?.type ?? "").toUpperCase() === "BOSS" &&
-    Number.isFinite(money) && money >= 10 &&
+    blindType === "BOSS" &&
+    legalLiquidity >= 10 &&
     (hasRetcon || (hasDirectorsCut && state?.boss_rerolled !== true)) &&
     (bossRestriction || String(boss?.name ?? "").trim())
   ) {
@@ -520,16 +1044,257 @@ function generateBlindSelectCandidates(state) {
   return candidates;
 }
 
-export function generateBalatrobotShopCandidates(state, { limit = 16, benchmarks = [], includeConsumables = true } = {}) {
+function recurringJokerIncomePerBlind(joker) {
+  const effect = cardEffect(joker);
+  const matches = [
+    /(?:end of (?:the )?(?:round|blind)|round ends?).{0,24}\$(\d+(?:\.\d+)?)/iu,
+    /(?:每(?:个)?回合结束|回合结束时).{0,24}\$(\d+(?:\.\d+)?)/u,
+    /(?:earn|gain|获得).{0,12}\$(\d+(?:\.\d+)?).{0,24}(?:round|blind|回合)/iu,
+  ];
+  for (const pattern of matches) {
+    const value = Number(effect.match(pattern)?.[1]);
+    if (Number.isFinite(value) && value >= 0) return value;
+  }
+  return 0;
+}
+
+function hasUnquantifiedRecurringEconomy(joker, parsedIncome) {
+  if (parsedIncome > 0) return false;
+  if (RECURRING_ECONOMY_JOKERS.has(jokerKey(joker))) return true;
+  const effect = cardEffect(joker);
+  return /(?:earn|gain|give|payout|interest|money|cash|dollars?|\$\s*\d)/iu.test(effect);
+}
+
+function generateJokerStopLossSaleCandidates(state, benchmarks = []) {
+  return cardsIn(state?.jokers).flatMap((joker, index) => {
+    const stickers = jokerStickerProfile(joker);
+    if (stickers.eternal) return [];
+    const expired = stickers.perishable && (
+      stickers.perishableTally === 0 || jokerDebuffed(joker)
+    );
+    const nearExpiry = stickers.perishable && stickers.perishableTally !== null && stickers.perishableTally <= 1;
+    if (!stickers.rental && !expired && !nearExpiry) return [];
+    const expectedHoldBlinds = expectedJokerHoldBlinds(state);
+    const avoidedRentalCost = stickers.rental ? stickers.rentalRate * expectedHoldBlinds : 0;
+    const recurringIncome = recurringJokerIncomePerBlind(joker);
+    const lostRecurringIncome = recurringIncome * expectedHoldBlinds;
+    const uncertainEconomy = hasUnquantifiedRecurringEconomy(joker, recurringIncome);
+    const netCashBenefit = avoidedRentalCost - lostRecurringIncome;
+    const removal = jokerRemovalEvidence(state, index, benchmarks);
+    if (!expired) {
+      // Clearing one immediate Blind is not enough evidence to liquidate a
+      // long-lived scoring/economy engine. Keep these fail-closed even when a
+      // weaker line happens to clear the next target.
+      if (scoringJoker(joker) || removal.engineLoss > 0.75 || uncertainEconomy) return [];
+      if (lostRecurringIncome >= avoidedRentalCost) return [];
+      if (removal.samples > 0 && !removal.afterRemovalCanClear) return [];
+    }
+    const sellPrice = cardSellPrice(joker);
+    const reasons = [
+      stickers.rental && `avoid about $${avoidedRentalCost} Rental upkeep over ${expectedHoldBlinds} expected blind(s)`,
+      lostRecurringIncome > 0 && `lose about $${lostRecurringIncome} recurring income over the same horizon`,
+      removal.engineLoss > 0 && `future engine score falls by ${removal.engineLoss}`,
+      expired && "the Perishable Joker is already disabled",
+      !expired && nearExpiry && `only ${stickers.perishableTally} Perishable blind remains`,
+    ].filter(Boolean);
+    return [{
+      id: `sell:joker:${index}`,
+      action: { method: "sell", joker: index },
+      card: {
+        index,
+        id: joker?.id ?? null,
+        key: joker?.key ?? "",
+        label: joker?.label ?? "",
+        set: "JOKER",
+        effect: cardEffect(joker),
+        sellPrice,
+        ...compactJokerStickers(joker),
+      },
+      expectedValue: (expired ? 1_100 : nearExpiry ? 900 : 430) +
+        netCashBenefit * 15 + sellPrice * 10 - removal.engineLoss * 180,
+      stopLoss: {
+        expired,
+        nearExpiry,
+        expectedHoldBlinds,
+        avoidedRentalCost,
+        lostRecurringIncome,
+        uncertainEconomy,
+        netCashBenefit,
+        removal,
+      },
+      requiresStrategic: true,
+      fallbackSafe: false,
+      eligibleForEmergency: false,
+      strategicReason: `Joker stop-loss review: ${reasons.join("; ")}`,
+    }];
+  });
+}
+
+function lowerQuartile(values) {
+  const sorted = values.filter((value) => Number.isFinite(value) && value > 0).toSorted((left, right) => left - right);
+  return sorted.length ? sorted[Math.floor((sorted.length - 1) * 0.25)] : 0;
+}
+
+function jokerBuildSignature(state) {
+  return cardsIn(state?.jokers)
+    .map((joker) => [
+      String(joker?.key ?? joker?.label ?? "").trim().toLowerCase(),
+      cardModifier(joker, "edition").toLowerCase(),
+      jokerDebuffed(joker) ? "debuff" : "active",
+      cardEffect(joker).trim().toLowerCase(),
+    ].join(":"))
+    .filter(Boolean)
+    .toSorted()
+    .join("|");
+}
+
+function shopScoreEvidence(state, benchmarks) {
+  const currentBuild = jokerBuildSignature(state);
+  const recent = (Array.isArray(benchmarks)
+    ? benchmarks
+    : Array.isArray(state?.__scoreBenchmarks) ? state.__scoreBenchmarks : [])
+    .filter((benchmark) => benchmark?.state && jokerBuildSignature(benchmark.state) === currentBuild)
+    .slice(-8);
+  const actual = recent.map((benchmark) => Number(benchmark?.actualScore)).filter((value) => value > 0);
+  if (actual.length) return { perHand: lowerQuartile(actual), source: "recent_actual", samples: actual.length };
+  const predicted = recent
+    .map((benchmark) => Number(benchmark?.candidate?.conservativeScore))
+    .filter((value) => value > 0);
+  return predicted.length
+    ? { perHand: lowerQuartile(predicted) * 0.7, source: "local_candidate", samples: predicted.length }
+    : { perHand: 0, source: "hand_level_proxy", samples: 0 };
+}
+
+function solverShopRerollBudget(state, benchmarks, shopBudget) {
+  const { blind, target } = nextBlindTarget(state);
+  const hands = state?.hands ?? state?.pokerHands ?? {};
+  const playedHands = Object.entries(hands)
+    .map(([name, hand]) => ({
+      name,
+      chips: Math.max(0, Number(hand?.chips) || 0),
+      mult: Math.max(1, Number(hand?.mult) || 1),
+      played: Math.max(0, Number(hand?.played) || 0),
+    }))
+    .filter((hand) => hand.played > 0);
+  const repeatabilityOf = (hand) => new Map([
+    ["high card", 1], ["pair", 0.9], ["two pair", 0.75], ["three of a kind", 0.65],
+    ["straight", 0.45], ["flush", 0.45], ["full house", 0.35], ["four of a kind", 0.25],
+    ["straight flush", 0.15], ["five of a kind", 0.2], ["flush house", 0.15], ["flush five", 0.12],
+  ]).get(String(hand?.name ?? "").toLowerCase()) ?? 0.4;
+  const representative = playedHands.toSorted(
+    (left, right) => right.played - left.played || repeatabilityOf(right) - repeatabilityOf(left),
+  )[0] ?? { name: "High Card", chips: 5, mult: 1, played: 0 };
+  const scoringJokers = balatrobotScoringJokerCount(state);
+  const activeJokers = cardsIn(state?.jokers).filter((joker) => !jokerDebuffed(joker)).length;
+  const effectiveHands = nextBlindHandCapacity(state, blind);
+  const repeatability = repeatabilityOf(representative);
+  const basePerHand = Math.max(35, (representative.chips + 30) * representative.mult * repeatability);
+  const recognitionFactor = 1 + Math.min(5, scoringJokers) * 0.45 + Math.max(0, activeJokers - scoringJokers) * 0.08;
+  const proxyPerHand = Math.max(50, Math.round(basePerHand * recognitionFactor));
+  const evidence = shopScoreEvidence(state, benchmarks);
+  const estimatedPerHand = Math.max(proxyPerHand, Math.round(evidence.perHand));
+  const estimatedRoundCapacity = Math.max(1, estimatedPerHand * effectiveHands);
+  const pressure = target > 0 ? target / estimatedRoundCapacity : 0;
+  // Debuffed/expired Perishable Jokers still occupy a physical slot. Active
+  // Jokers are useful for score estimation only, never for slot accounting.
+  const occupiedSlots = jokerSlotOccupancy(state);
+  const openSlots = Math.max(0, (Number(state?.jokers?.limit) || occupiedSlots) - occupiedSlots);
+  const rawRerollCost = firstDefined([state?.round?.reroll_cost, state?.round?.rerollCost]);
+  const parsedRerollCost = Number(rawRerollCost);
+  const rerollCostKnown = rawRerollCost !== undefined && rawRerollCost !== null &&
+    Number.isFinite(parsedRerollCost) && parsedRerollCost >= 0;
+  const rerollCost = rerollCostKnown ? parsedRerollCost : null;
+  let desiredRerolls = target > 0
+    ? Math.max(
+      0,
+      Math.ceil(Math.log2(Math.max(1, pressure))),
+      Math.ceil(Math.max(0, pressure - 1) * 2),
+    )
+    : 0;
+  if (openSlots > 0 && pressure >= 0.65) desiredRerolls += 1;
+  if (pressure >= 2.5) desiredRerolls = Math.max(desiredRerolls, 2);
+  if (pressure >= 5) desiredRerolls = Math.max(desiredRerolls, 3);
+  desiredRerolls = Math.min(5, desiredRerolls);
+  const voucherKeys = new Set(Object.keys(state?.used_vouchers ?? state?.usedVouchers ?? {}));
+  const normalRerollCost = Math.max(
+    1,
+    5 - (voucherKeys.has("v_reroll_surplus") ? 2 : 0) - (voucherKeys.has("v_reroll_glut") ? 2 : 0),
+  );
+  const rerollsUsed = rerollCost > 0 ? Math.max(0, Math.round(rerollCost - normalRerollCost)) : 0;
+  const remainingDesiredRerolls = Math.max(0, desiredRerolls - rerollsUsed);
+  const survivalUrgency = Math.max(0, Math.min(1, (pressure - 0.75) / 3));
+  const interestAndSafetyReserve = Math.round(15 - survivalUrgency * 10);
+  const operatingReserve = shopBudget.twoBlindUpkeep;
+  // Paid rerolls cannot borrow from Credit Card: match policy by using actual
+  // non-negative cash after both reserves. A free reroll is the sole exception.
+  const cash = Math.max(0, Number(state?.money) || 0);
+  const spendable = Math.max(0, cash - interestAndSafetyReserve - operatingReserve);
+  const requestedBudget = rerollCost > 0 ? remainingDesiredRerolls * rerollCost : 0;
+  const budget = rerollCost > 0
+    ? Math.floor(Math.min(spendable, requestedBudget) / rerollCost) * rerollCost
+    : 0;
+  return {
+    blind: blind?.name ?? null,
+    target,
+    effectiveHands,
+    estimatedPerHand,
+    estimatedRoundCapacity,
+    pressure: Math.round(pressure * 100) / 100,
+    rerollCost,
+    rerollCostKnown,
+    desiredRerolls,
+    remainingDesiredRerolls,
+    interestAndSafetyReserve,
+    operatingReserve,
+    reserve: interestAndSafetyReserve + operatingReserve,
+    spendable,
+    budget,
+    shouldReroll: rerollCostKnown && (rerollCost === 0 || budget >= rerollCost),
+  };
+}
+
+export function generateBalatrobotShopCandidates(
+  state,
+  { limit = 16, benchmarks = [], includeConsumables = true, consumableAges = null } = {},
+) {
   if (state?.state !== "SHOP") return [];
-  const money = availableShopMoney(state);
+  const baseShopBudget = shopBudgetMetadata(state);
+  const rerollDecision = solverShopRerollBudget(state, benchmarks, baseShopBudget);
+  const shopBudget = {
+    ...baseShopBudget,
+    interestAndSafetyReserve: rerollDecision.interestAndSafetyReserve,
+    reserve: rerollDecision.reserve,
+    rerollBudget: rerollDecision.budget,
+    rerollDecision,
+  };
+  const money = shopBudget.available;
   const candidates = [];
   for (const [index, card] of cardsIn(state?.shop).entries()) {
     const price = cardBuyPrice(card);
-    if (price > money) continue;
     const set = String(card?.set ?? "").toUpperCase();
     const counterfactual = set === "JOKER" ? jokerPurchaseCounterfactual(state, card, benchmarks) : null;
+    const stickers = set === "JOKER" ? jokerStickerProfile(card) : null;
+    const purchaseCommitment = price + (stickers?.rental ? stickers.rentalRate * 2 : 0);
+    const requiredLiquidity = set === "JOKER" ? purchaseCommitment : price;
+    if (requiredLiquidity > 0 && requiredLiquidity > money) continue;
     if (!shopCardCanFit(state, card)) continue;
+    const baseExpectedValue = set === "JOKER"
+      ? 420 + Math.max(0, counterfactual.engineDelta) * 95 +
+        Math.max(0, counterfactual.scoreLogDelta) * 1_100 + (scoringJoker(card) ? 90 : 0)
+      : 520;
+    const stickerValuation = set === "JOKER"
+      ? stickerAwareJokerValuation(state, card, baseExpectedValue, {
+        immediateSurvival: counterfactual.immediateSurvival,
+      })
+      : null;
+    if (stickerValuation?.hardRejected) continue;
+    const stickerReason = stickerValuation && (stickerValuation.eternal || stickerValuation.perishable || stickerValuation.rental)
+      ? [
+        stickerValuation.eternal && `Eternal slot cost ${stickerValuation.eternalSlotCost}`,
+        stickerValuation.perishable && `Perishable life ${stickerValuation.remainingPerishableBlinds} blind(s)`,
+        stickerValuation.rental && `Rental $${stickerValuation.rentalRate}/blind, projected $${stickerValuation.projectedRentalCost}`,
+      ].filter(Boolean).join("; ")
+      : "";
     candidates.push({
       id: `buy:card:${index}`,
       action: { method: "buy", card: index },
@@ -542,26 +1307,58 @@ export function generateBalatrobotShopCandidates(state, { limit = 16, benchmarks
         edition: cardModifier(card, "edition"),
         price,
         effect: cardEffect(card),
+        ...(set === "JOKER" ? compactJokerStickers(card) : {}),
       },
-      expectedValue: set === "JOKER"
-        ? 420 + Math.max(0, counterfactual.engineDelta) * 95 +
-          Math.max(0, counterfactual.scoreLogDelta) * 1_100 + (scoringJoker(card) ? 90 : 0)
-        : 520,
+      expectedValue: stickerValuation?.netPresentValue ?? baseExpectedValue,
       counterfactual,
+      stickerValuation,
+      shopBudget: {
+        ...shopBudget,
+        purchaseCommitment,
+        availableAfterPurchase: money - purchaseCommitment,
+      },
       requiresStrategic: true,
+      fallbackSafe: false,
       tacticalConstraint: counterfactual?.capability?.constraint ?? null,
-      strategicReason: counterfactual?.capability
-        ? `behavioral Joker requires a plan: ${counterfactual.capability.kind}`
-        : "a shop purchase changes the build or economy",
+      strategicReason: [
+        counterfactual?.capability
+          ? `behavioral Joker requires a plan: ${counterfactual.capability.kind}`
+          : "a shop purchase changes the build or economy",
+        stickerReason,
+      ].filter(Boolean).join("; "),
     });
   }
   if (includeConsumables) {
-    candidates.push(...generateBalatroConsumableShopUseCandidates(state, {
+    const activeCredit = shopBudget.credit;
+    const generatorState = shopBudget.legalLiquidity < 0
+      ? { ...state, money: -activeCredit }
+      : state;
+    const buyUseCandidates = generateBalatroConsumableShopUseCandidates(generatorState, {
       evaluateBestPlay: (candidateState) => bestPlayCandidates(candidateState, 30)[0] ?? null,
       limit: Math.max(4, Math.min(12, Number(limit) || 16)),
-    }));
+    }).filter((candidate) => {
+      const offered = cardsIn(state?.shop)[Number(candidate?.action?.card)];
+      const price = cardBuyPrice(offered);
+      return price === 0 || price <= money;
+    }).map((candidate) => {
+      const offered = cardsIn(state?.shop)[Number(candidate?.action?.card)];
+      const price = cardBuyPrice(offered);
+      return {
+        ...candidate,
+        card: { ...candidate.card, price },
+        shopBudget: {
+          ...shopBudget,
+          purchaseCommitment: price,
+          availableAfterPurchase: money - price,
+        },
+      };
+    });
+    candidates.push(...buyUseCandidates);
   }
   const ownedJokers = cardsIn(state?.jokers);
+  const generatedStopLossSales = generateJokerStopLossSaleCandidates(state, benchmarks);
+  const stopLossSaleIds = new Set(generatedStopLossSales.map((candidate) => candidate.id));
+  candidates.push(...generatedStopLossSales);
   const jokerLimit = Number(state?.jokers?.limit ?? 5);
   if (ownedJokers.length >= jokerLimit) {
     const blockedOffers = cardsIn(state?.shop)
@@ -569,22 +1366,27 @@ export function generateBalatrobotShopCandidates(state, { limit = 16, benchmarks
       .filter(({ card }) => String(card?.set ?? "").toUpperCase() === "JOKER");
     const currentProfile = balatrobotHighScoreBuildProfile(state);
     for (const [ownedIndex, owned] of ownedJokers.entries()) {
-      if (Boolean(owned?.modifier?.eternal)) continue;
-      const remainingCredit = ownedJokers.some((joker, index) =>
-        index !== ownedIndex && jokerKey(joker) === "j_credit_card") ? 20 : 0;
-      const moneyAfterSale = Math.max(0, Number(state?.money) || 0) + cardSellPrice(owned) + remainingCredit;
+      if (jokerStickerProfile(owned).eternal || stopLossSaleIds.has(`sell:joker:${ownedIndex}`)) continue;
+      const moneyAfterSale = availableShopMoney(state, { excludeJokerIndex: ownedIndex }) + cardSellPrice(owned);
       let bestReplacement = null;
       for (const offer of blockedOffers) {
-        if (offer.price > moneyAfterSale) continue;
+        const offerStickers = jokerStickerProfile(offer.card);
+        const immediateSurvival = jokerImmediateSurvivalEvidence(state, offer.card, benchmarks);
+        if (offerStickers.eternal && offerStickers.rental) continue;
+        const replacementCommitment = offer.price + (offerStickers.rental ? offerStickers.rentalRate * 2 : 0);
+        if (replacementCommitment > 0 && replacementCommitment > moneyAfterSale) continue;
         const replacement = [...ownedJokers];
         replacement.splice(ownedIndex, 1, offer.card);
         const afterState = stateWithJokers(state, replacement);
         const after = balatrobotHighScoreBuildProfile(afterState);
         const gain = after.engineScore - currentProfile.engineScore;
         const scoreDelta = benchmarkScoreDelta(state, ownedJokers, replacement, benchmarks);
-        const replacementValue = gain + scoreDelta.scoreLogDelta * 4;
+        const baseExpectedValue = 420 + Math.max(0, gain) * 95 + Math.max(0, scoreDelta.scoreLogDelta) * 1_100;
+        const stickerValuation = stickerAwareJokerValuation(state, offer.card, baseExpectedValue, { immediateSurvival });
+        const replacementValue = gain + scoreDelta.scoreLogDelta * 4 +
+          (stickerValuation.netPresentValue - baseExpectedValue) / 100;
         if (!bestReplacement || replacementValue > bestReplacement.replacementValue) {
-          bestReplacement = { ...offer, after, gain, replacementValue, scoreDelta };
+          bestReplacement = { ...offer, after, gain, replacementValue, scoreDelta, stickerValuation };
         }
       }
       if (!bestReplacement || bestReplacement.gain <= 0.75) continue;
@@ -597,6 +1399,7 @@ export function generateBalatrobotShopCandidates(state, { limit = 16, benchmarks
           label: owned?.label ?? "",
           set: "JOKER",
           effect: cardEffect(owned),
+          ...compactJokerStickers(owned),
         },
         replacement: {
           shopIndex: bestReplacement.index,
@@ -605,18 +1408,21 @@ export function generateBalatrobotShopCandidates(state, { limit = 16, benchmarks
           label: bestReplacement.card?.label ?? "",
           edition: cardModifier(bestReplacement.card, "edition"),
           price: bestReplacement.price,
+          ...compactJokerStickers(bestReplacement.card),
           engineDelta: Math.round(bestReplacement.gain * 100) / 100,
           ...bestReplacement.scoreDelta,
+          stickerValuation: bestReplacement.stickerValuation,
         },
         expectedValue: 450 + bestReplacement.gain * 90,
         requiresStrategic: true,
+        fallbackSafe: false,
         strategicReason: "selling a Joker is allowed only for a verified higher-ceiling replacement",
       });
     }
   }
   for (const [index, card] of cardsIn(state?.vouchers).entries()) {
     const price = cardBuyPrice(card);
-    if (price > money) continue;
+    if (price > 0 && price > money) continue;
     const valuation = balatrobotVoucherValue(state, card, { price });
     candidates.push({
       id: `buy:voucher:${index}`,
@@ -630,7 +1436,7 @@ export function generateBalatrobotShopCandidates(state, { limit = 16, benchmarks
   }
   for (const [index, card] of cardsIn(state?.packs).entries()) {
     const price = cardBuyPrice(card);
-    if (price > money) continue;
+    if (price > 0 && price > money) continue;
     candidates.push({
       id: `buy:pack:${index}`,
       action: { method: "buy", pack: index },
@@ -640,13 +1446,15 @@ export function generateBalatrobotShopCandidates(state, { limit = 16, benchmarks
       strategicReason: "a booster purchase spends run economy",
     });
   }
-  const rerollCost = Number(state?.round?.reroll_cost);
-  if (Number.isFinite(rerollCost) && rerollCost >= 0 && rerollCost <= money) {
+  const rerollCost = rerollDecision.rerollCost;
+  if (rerollDecision.shouldReroll) {
     candidates.push({
       id: "reroll:shop",
       action: { method: "reroll" },
       target: `search new shop offers for $${rerollCost}`,
       expectedValue: 300 + balatrobotHighScoreBuildProfile(state).missing.length * 45,
+      shopBudget,
+      rerollDecision,
       requiresStrategic: true,
       strategicReason: "reroll budget depends on score pressure and reserves",
     });
@@ -661,14 +1469,55 @@ export function generateBalatrobotShopCandidates(state, { limit = 16, benchmarks
     strategicReason: hasStrategicOpportunity ? "leaving a shop with affordable alternatives needs strategic approval" : "",
   });
   if (includeConsumables) {
-    candidates.push(...generateBalatroConsumableUseCandidates(state, {
+    const ownedUseCandidates = decorateOwnedConsumableCandidates(state, generateBalatroConsumableUseCandidates(state, {
       evaluateBestPlay: (candidateState) => bestPlayCandidates(candidateState, 30)[0] ?? null,
       limit: Math.max(4, Math.min(12, Number(limit) || 16)),
-    }));
+    }), consumableAges);
+    candidates.push(...ownedUseCandidates);
+    candidates.push(...generateAgedConsumableSaleCandidates(state, consumableAges));
+    const normalizedLimit = Math.max(1, Number(limit) || 16);
+    const sorted = candidates
+      .toSorted((left, right) => (Number(right.expectedValue) || 0) - (Number(left.expectedValue) || 0) || left.id.localeCompare(right.id));
+    const safeExit = sorted.find((candidate) => candidate.action?.method === "next_round") ?? null;
+    const stopLossSales = sorted.filter((candidate) => candidate.stopLoss && candidate.action?.joker != null);
+    const consumableSale = sorted.find((candidate) => candidate.action?.method === "sell" && candidate.action?.consumable != null) ?? null;
+    const saleBudget = Math.max(0, normalizedLimit - 1);
+    const preservedSales = [...stopLossSales, consumableSale]
+      .filter((candidate, item, values) => candidate && values.indexOf(candidate) === item)
+      .slice(0, saleBudget);
+    const mandatory = normalizedLimit === 1
+      ? [safeExit].filter(Boolean)
+      : [...preservedSales, safeExit].filter((candidate, item, values) => candidate && values.indexOf(candidate) === item);
+    const mandatoryIds = new Set(mandatory.map((candidate) => candidate.id));
+    const selected = [
+      ...sorted.filter((candidate) => !mandatoryIds.has(candidate.id)).slice(0, Math.max(0, normalizedLimit - mandatory.length)),
+      ...mandatory,
+    ];
+    const holdReviews = agedConsumableHoldReviews(
+      state,
+      consumableAges,
+      selected.filter((candidate) => candidate.action?.method === "use"),
+    );
+    return attachConsumableHoldReviews(
+      selected.map((candidate) => ({ ...candidate, shopBudget: candidate.shopBudget ?? shopBudget })),
+      holdReviews,
+      "next_round",
+    );
   }
-  return candidates
-    .toSorted((left, right) => (Number(right.expectedValue) || 0) - (Number(left.expectedValue) || 0) || left.id.localeCompare(right.id))
-    .slice(0, Math.max(1, Number(limit) || 16));
+  const normalizedLimit = Math.max(1, Number(limit) || 16);
+  const sorted = candidates
+    .toSorted((left, right) => (Number(right.expectedValue) || 0) - (Number(left.expectedValue) || 0) || left.id.localeCompare(right.id));
+  const safeExit = sorted.find((candidate) => candidate.action?.method === "next_round") ?? null;
+  const preservedStopLossSales = sorted.filter((candidate) => candidate.stopLoss && candidate.action?.joker != null);
+  const mandatory = normalizedLimit === 1
+    ? [safeExit].filter(Boolean)
+    : [...preservedStopLossSales.slice(0, normalizedLimit - 1), safeExit]
+      .filter((candidate, item, values) => candidate && values.indexOf(candidate) === item);
+  const mandatoryIds = new Set(mandatory.map((candidate) => candidate.id));
+  return [
+    ...sorted.filter((candidate) => !mandatoryIds.has(candidate.id)).slice(0, Math.max(0, normalizedLimit - mandatory.length)),
+    ...mandatory,
+  ].map((candidate) => ({ ...candidate, shopBudget: candidate.shopBudget ?? shopBudget }));
 }
 
 export function balatrobotScoringJokerCount(state) {
@@ -1477,7 +2326,7 @@ function planetPlanValue(state, upgrade, runPlan) {
   return { relevance, priority, planBonus, scoreDelta, played };
 }
 
-export function generateBalatrobotPackCandidates(state, { limit = 12, runPlan = null } = {}) {
+export function generateBalatrobotPackCandidates(state, { limit = 12, runPlan = null, benchmarks = [] } = {}) {
   if (state?.state !== "SMODS_BOOSTER_OPENED") return [];
   const offered = cardsIn(state?.pack);
   // Tarot and Spectral choices use the dedicated stateful evaluator. It
@@ -1495,21 +2344,56 @@ export function generateBalatrobotPackCandidates(state, { limit = 12, runPlan = 
     // Known Tarot/Spectral cards were handled above. Unknown modded
     // consumables fail closed instead of receiving a fabricated flat value.
     if (TARGETED_CONSUMABLE_SETS.has(set)) continue;
-    if (set === "JOKER" && Number(state?.jokers?.count) >= Number(state?.jokers?.limit)) continue;
+    if (set === "JOKER" && jokerSlotOccupancy(state) >= Number(state?.jokers?.limit ?? 5)) continue;
     const planetUpgrade = set === "PLANET" ? PLANET_HAND_UPGRADES.get(String(card?.key ?? "").toLowerCase()) : null;
     const planetValue = planetUpgrade ? planetPlanValue(state, planetUpgrade, activeRunPlan) : null;
+    const jokerCounterfactual = set === "JOKER" ? jokerPurchaseCounterfactual(state, card, benchmarks) : null;
+    const baseExpectedValue = set === "PLANET"
+      ? 200 + (planetValue?.priority ?? 0)
+      : set === "JOKER" && scoringJoker(card) ? 900 : 500;
+    const freePackCard = set === "JOKER"
+      ? { ...card, buy: 0, cost: { ...(card?.cost ?? {}), buy: 0 } }
+      : card;
+    const stickerValuation = set === "JOKER"
+      ? stickerAwareJokerValuation(state, freePackCard, baseExpectedValue, {
+        immediateSurvival: jokerCounterfactual.immediateSurvival,
+      })
+      : null;
+    if (stickerValuation?.hardRejected) continue;
+    const hasStickerLiability = Boolean(
+      stickerValuation?.eternal || stickerValuation?.perishable || stickerValuation?.rental,
+    );
+    const harmfulSticker = Boolean(stickerValuation && stickerValuation.netPresentValue <= 0);
     candidates.push({
       id: `pack:${index}`,
       action: { method: "pack", card: index, targets: [] },
-      card: { index, key: card?.key ?? "", label: card?.label ?? "", set },
+      card: {
+        index,
+        id: card?.id ?? null,
+        key: card?.key ?? "",
+        label: card?.label ?? "",
+        set,
+        effect: cardEffect(card),
+        ...(set === "JOKER" ? compactJokerStickers(card) : {}),
+      },
       handType: planetUpgrade?.handType ?? null,
       planRelevance: planetValue?.relevance ?? null,
       upgradeScoreDelta: planetValue?.scoreDelta ?? null,
       handPlayed: planetValue?.played ?? null,
-      expectedValue: set === "PLANET"
-        ? 200 + (planetValue?.priority ?? 0)
-        : set === "JOKER" && scoringJoker(card) ? 900 : 500,
-      safeChoice: true,
+      expectedValue: stickerValuation?.netPresentValue ?? baseExpectedValue,
+      counterfactual: jokerCounterfactual,
+      stickerValuation,
+      safeChoice: !hasStickerLiability && !harmfulSticker,
+      fallbackSafe: !hasStickerLiability && !harmfulSticker,
+      harmful: harmfulSticker,
+      requiresStrategic: hasStickerLiability,
+      strategicReason: hasStickerLiability
+        ? [
+          stickerValuation.eternal && `Eternal slot cost ${stickerValuation.eternalSlotCost}`,
+          stickerValuation.perishable && `Perishable life ${stickerValuation.remainingPerishableBlinds} blind(s)`,
+          stickerValuation.rental && `Rental $${stickerValuation.rentalRate}/blind, projected $${stickerValuation.projectedRentalCost}`,
+        ].filter(Boolean).join("; ")
+        : "",
     });
   }
   const skip = consumableCandidates.find((candidate) => candidate.action?.skip) ?? {
@@ -1532,7 +2416,7 @@ function emergencyBossCandidates(state) {
   if (!cardsIn(state?.hand).some(cardDebuffed)) return [];
   const sellable = cardsIn(state?.jokers)
     .map((joker, index) => ({ joker, index }))
-    .filter(({ joker }) => !joker?.modifier?.eternal)
+    .filter(({ joker }) => !jokerStickerProfile(joker).eternal)
     .sort((left, right) =>
       Number(balatrobotIsScoringJoker(left.joker)) - Number(balatrobotIsScoringJoker(right.joker)) ||
       (Number(left.joker?.cost?.sell) || 0) - (Number(right.joker?.cost?.sell) || 0));
@@ -1544,6 +2428,7 @@ function emergencyBossCandidates(state) {
     target: "disable Verdant Leaf before relying on debuffed cards",
     expectedValue: 2_000,
     requiresStrategic: true,
+    fallbackSafe: false,
     strategicReason: "selling a Joker to disable Verdant Leaf is irreversible",
     destructive: true,
     requiredForSurvival: true,
@@ -1832,6 +2717,7 @@ function luchadorBossCandidate(state, bestPlay) {
     behavioralJoker: behavior.capability,
     bossRestriction: restriction,
     requiresStrategic: true,
+    fallbackSafe: false,
     strategicReason: `selling Luchador is irreversible; approve only if disabling ${blind?.name ?? "this Boss"} is worth the slot loss`,
     destructive: true,
     requiredForSurvival: false,
@@ -1861,17 +2747,24 @@ function behavioralJokerCandidates(state, plays, { runPlan = null } = {}) {
   ].filter(Boolean);
 }
 
-export function generateBalatrobotCandidates(state, { limit = 14, benchmarks = [], runPlan = null } = {}) {
+export function generateBalatrobotCandidates(
+  state,
+  { limit = 14, benchmarks = [], runPlan = null, consumableAges = null } = {},
+) {
   if (state?.state === "BLIND_SELECT") return generateBlindSelectCandidates(state);
-  if (state?.state === "SHOP") return generateBalatrobotShopCandidates(state, { limit, benchmarks });
+  if (state?.state === "SHOP") return generateBalatrobotShopCandidates(state, { limit, benchmarks, consumableAges });
   if (state?.state === "SMODS_BOOSTER_OPENED") {
-    return generateBalatrobotPackCandidates(state, { limit, runPlan });
+    return generateBalatrobotPackCandidates(state, { limit, runPlan, benchmarks });
   }
   if (state?.state !== "SELECTING_HAND") return [];
   const normalizedLimit = Math.max(2, Math.min(30, Number(limit) || 14));
-  const discardLimit = Math.min(5, Math.max(2, Math.floor(normalizedLimit / 3)));
-  const discards = discardCandidates(state, discardLimit);
-  const plays = bestPlayCandidates(state, normalizedLimit - discards.length);
+  // Reserve one generation slot for a legal play before spending the bounded
+  // candidate budget on discards. The former minimum of two discards made a
+  // limit=2 request call bestPlayCandidates(..., 0), leaving no progress
+  // action for either the routine ranker or a strategic use/hold review.
+  const discardLimit = Math.min(5, Math.max(0, Math.floor(normalizedLimit / 3)), normalizedLimit - 1);
+  const discards = discardLimit > 0 ? discardCandidates(state, discardLimit) : [];
+  const plays = bestPlayCandidates(state, Math.max(1, normalizedLimit - discards.length));
   const jokerActions = behavioralJokerCandidates(state, plays, { runPlan });
   // A behavioral setup must not also be exposed as an unmarked routine hand
   // action. Otherwise the same cards could bypass strategic approval simply by
@@ -1879,13 +2772,42 @@ export function generateBalatrobotCandidates(state, { limit = 14, benchmarks = [
   const protectedActions = new Set(jokerActions.map(candidateCardsSignature).filter(Boolean));
   const ordinaryHandActions = [...plays, ...discards]
     .filter((candidate) => !protectedActions.has(candidateCardsSignature(candidate)));
-  const consumables = generateBalatroConsumableUseCandidates(state, {
+  const consumables = decorateOwnedConsumableCandidates(state, generateBalatroConsumableUseCandidates(state, {
     evaluateBestPlay: (candidateState) => bestPlayCandidates(candidateState, 30)[0] ?? null,
     limit: Math.max(4, Math.min(10, normalizedLimit - 2)),
-  });
+  }), consumableAges);
   const semanticActions = [...emergencyBossCandidates(state), ...jokerActions, ...consumables];
-  const handActions = ordinaryHandActions.slice(0, Math.max(0, normalizedLimit - semanticActions.length));
-  let result = [...handActions, ...semanticActions].slice(0, normalizedLimit);
+  // Always leave the strategic model a legal way to retain a consumable and
+  // continue the blind. A large Negative-consumable inventory must not crowd
+  // every play/discard action out of the bounded candidate list.
+  const bestPlay = ordinaryHandActions.find((candidate) => candidate.action?.method === "play") ?? null;
+  const bestDiscard = normalizedLimit >= 3
+    ? ordinaryHandActions.find((candidate) => candidate.action?.method === "discard") ?? null
+    : null;
+  const mandatoryHandActions = [bestPlay, bestDiscard].filter(Boolean);
+  const mandatoryIds = new Set(mandatoryHandActions.map((candidate) => candidate.id));
+  const semanticBudget = Math.max(0, normalizedLimit - mandatoryHandActions.length);
+  const reviewActions = semanticActions.filter((candidate) => candidate.consumableStrategicReview === true);
+  const reviewIds = new Set(reviewActions.map((candidate) => candidate.id));
+  const selectedSemantic = [
+    ...reviewActions,
+    ...semanticActions.filter((candidate) => !reviewIds.has(candidate.id)),
+  ].slice(0, semanticBudget);
+  const selectedIds = new Set([...mandatoryIds, ...selectedSemantic.map((candidate) => candidate.id)]);
+  const filler = ordinaryHandActions
+    .filter((candidate) => !selectedIds.has(candidate.id))
+    .slice(0, Math.max(0, normalizedLimit - mandatoryHandActions.length - selectedSemantic.length));
+  let result = [...mandatoryHandActions, ...selectedSemantic, ...filler].slice(0, normalizedLimit);
+  const consumableHoldReviews = agedConsumableHoldReviews(
+    state,
+    consumableAges,
+    result.filter((candidate) => candidate.action?.method === "use"),
+  );
+  result = attachConsumableHoldReviews(
+    result,
+    consumableHoldReviews,
+    "play",
+  );
   const mouthLocked = balatrobotMouthLockedHandType(state);
   if (
     mouthLocked &&
@@ -2240,7 +3162,15 @@ export function balatrobotThinkingMode(state, candidates, config = {}) {
     return { strategic: false, effort: routine, reason: "strategic thinking disabled" };
   }
   if (SHOP_STRATEGY_STATES.has(state?.state)) {
-    return { strategic: true, effort: strategic, reason: `${state.state.toLowerCase()} changes the run build` };
+    const consumableReview = candidates.some((candidate) => candidate.consumableStrategicReview === true);
+    return {
+      strategic: true,
+      effort: strategic,
+      reason: consumableReview
+        ? `${state.state.toLowerCase()} changes the run build; an aged or full-slot consumable needs an explicit use/hold review`
+        : `${state.state.toLowerCase()} changes the run build`,
+      ignorePersistedCheckpoint: consumableReview,
+    };
   }
   if (state?.state === "BLIND_SELECT") {
     if (candidates.some((candidate) => candidate.action?.method === "reroll_boss" && candidate.requiresStrategic)) {
@@ -2250,7 +3180,7 @@ export function balatrobotThinkingMode(state, candidates, config = {}) {
       .filter(Boolean)
       .find((blind) => String(blind.status ?? "").toUpperCase().includes("SELECT"));
     const canSkip = selectable && String(selectable.type ?? "").toUpperCase() !== "BOSS";
-    const hasSkipReward = Boolean(String(selectable?.tagName ?? selectable?.tag_name ?? "").trim());
+    const hasSkipReward = Boolean(readableBlindTag(selectable));
     const developedRun = Number(state?.ante_num ?? state?.ante) >= 2;
     if (canSkip && hasSkipReward && developedRun) {
       return { strategic: true, effort: strategic, reason: "developed-run skip reward needs valuation" };
@@ -2269,13 +3199,21 @@ export function balatrobotThinkingMode(state, candidates, config = {}) {
   const belowPace = requiredPace > 0 && bestBase < requiredPace;
   const survival = balatrobotSurvivalAssessment(state, candidates);
   const rescue = survival.shouldUseConsumable && survival.consumableClearsBlind;
-  if (boss || rescue || jokerTactics.requiresStrategic) {
+  const consumableReview = candidates.some((candidate) => candidate.consumableStrategicReview === true);
+  if (boss || rescue || jokerTactics.requiresStrategic || consumableReview) {
     const reasons = [
       boss && "one strategic package for this Boss blind",
       rescue && `consumable can clear the remaining ${survival.deficit}`,
       jokerTactics.requiresStrategic && "an active behavioral Joker changes hand/discard sequencing",
+      consumableReview && "an aged or full-slot consumable needs an explicit use/hold review",
     ].filter(Boolean);
-    return { strategic: true, effort: strategic, reason: reasons.join(", "), checkpointPhase: "blind" };
+    return {
+      strategic: true,
+      effort: strategic,
+      reason: reasons.join(", "),
+      checkpointPhase: "blind",
+      ignorePersistedCheckpoint: consumableReview,
+    };
   }
   const pressure = belowPace
     ? `local survival solver handles score ${bestBase} below pace ${Math.ceil(requiredPace)}`

@@ -254,6 +254,63 @@ test("component health fails independently and marks a stopped project as idle",
   }
 });
 
+test("paused control marks only an absent controller idle while game and RPC stay independently healthy", async () => {
+  const { root, credentials } = fixture();
+  const monitor = new ProjectHealthMonitor({
+    projectRoot: root,
+    config: config(),
+    credentialDirectory: credentials,
+    processProvider: async () => ({
+      processes: [{ Name: "Balatro.exe", ProcessId: 101, CommandLine: "Balatro.exe" }],
+      listeners: [
+        { LocalPort: 4312, OwningProcess: 100 },
+        { LocalPort: 12346, OwningProcess: 101 },
+        { LocalPort: 4313, OwningProcess: 103 },
+      ],
+    }),
+    controlStateProvider: () => ({ desiredState: "paused" }),
+    routineBackend: { async status() { return { mode: "deepseek", ollama: { reachable: true } }; } },
+    strategicBackend: { status() { return { mode: "deepseek" }; } },
+    stats: { refresh() { return { coverage: { totalEvents: 1, runDirectories: 1 } }; } },
+    fetchImpl: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+  });
+  try {
+    const result = await monitor.refresh();
+    assert.equal(result.components.find((item) => item.id === "game").status, "healthy");
+    assert.equal(result.components.find((item) => item.id === "balatrobot").status, "healthy");
+    assert.equal(result.components.find((item) => item.id === "controller").status, "idle");
+    assert.equal(result.overall.status, "idle");
+    assert.equal(result.overall.label, "AI 已暂停");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("paused control does not hide a game or RPC failure", async () => {
+  const { root, credentials } = fixture();
+  const monitor = new ProjectHealthMonitor({
+    projectRoot: root,
+    config: config(),
+    credentialDirectory: credentials,
+    processProvider: async () => ({ processes: [], listeners: [] }),
+    controlStateProvider: () => ({ desiredState: "paused" }),
+    routineBackend: { async status() { return { mode: "deepseek", ollama: { reachable: true } }; } },
+    strategicBackend: { status() { return { mode: "deepseek" }; } },
+    stats: { refresh() { return { coverage: { totalEvents: 1, runDirectories: 1 } }; } },
+    fetchImpl: async () => { throw new Error("overlay unavailable"); },
+  });
+  try {
+    const result = await monitor.refresh();
+    assert.equal(result.components.find((item) => item.id === "controller").status, "idle");
+    assert.equal(result.components.find((item) => item.id === "game").status, "offline");
+    assert.equal(result.components.find((item) => item.id === "balatrobot").status, "offline");
+    assert.equal(result.overall.status, "degraded");
+    assert.equal(result.overall.label, "部分组件需关注");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("component health preserves the last good process snapshot when the Windows probe fails", async () => {
   const { root, credentials } = fixture();
   let now = Date.parse("2026-08-11T10:00:10.000Z");

@@ -8,20 +8,21 @@ import {
   semanticCandidateActionKey,
   semanticDecisionKey,
   semanticDecisionState,
+  semanticHistoricalActionKey,
   semanticPriorEvidenceForState,
 } from "../src/semantic-prior.mjs";
 import { semanticActionTemplate, semanticStateFeatures } from "../src/semantic-experience.mjs";
 
-function card(key) {
+function card(key, { modifier = {}, buy = 1, set = "DEFAULT" } = {}) {
   const [suit, rank] = key.split("_");
   return {
     key,
-    set: "DEFAULT",
+    set,
     label: key,
     value: { suit, rank },
-    modifier: {},
+    modifier,
     state: {},
-    cost: { buy: 1, sell: 1 },
+    cost: { buy, sell: 1 },
   };
 }
 
@@ -74,6 +75,58 @@ test("decision buckets generalize across seed, round id and exact card order", (
   assert.equal(Object.hasOwn(semanticDecisionState(first), "roundNumber"), false);
 });
 
+test("decision buckets isolate Gold sticker economy and cumulative rules", () => {
+  const gold = state("gold", {
+    stake: "GOLD",
+    jokers: {
+      count: 3,
+      limit: 5,
+      cards: [
+        card("j_rental", { set: "JOKER", modifier: { rental: true } }),
+        card("j_short", { set: "JOKER", modifier: { perishable: 2 } }),
+        card("j_eternal", { set: "JOKER", modifier: { eternal: true } }),
+      ],
+    },
+  });
+  const decision = semanticDecisionState(gold);
+  assert.match(decision.stakeRuleSignature, /WHITE>RED>GREEN>BLACK>BLUE>PURPLE>ORANGE>GOLD/);
+  assert.equal(decision.rentalCount, 1);
+  assert.equal(decision.rentalUpkeep, 3);
+  assert.deepEqual(decision.perishableTtls, [2]);
+  assert.equal(decision.perishableExpired, 0);
+  assert.equal(decision.eternalLockedSlots, 1);
+  assert.notEqual(semanticDecisionKey(gold), semanticDecisionKey(state("white")));
+});
+
+test("legacy Gold prior shares the canonical cumulative-rule bucket without crossing changed rules", () => {
+  const gold = state("gold", { stake: "GOLD" });
+  const legacyGold = semanticStateFeatures(gold);
+  legacyGold.version = 5;
+  delete legacyGold.stakeRules;
+  delete legacyGold.stickerEconomy;
+
+  assert.equal(semanticDecisionKey(legacyGold), semanticDecisionKey(gold));
+  assert.notEqual(semanticDecisionKey(legacyGold), semanticDecisionKey(state("white")));
+  assert.notEqual(
+    semanticDecisionKey(legacyGold),
+    semanticDecisionKey(state("changed-rental", {
+      stake: "GOLD",
+      run_modifiers: { rental_rate: 4 },
+    })),
+  );
+
+  const index = buildSemanticPriorIndex([{
+    episodeId: "legacy-gold",
+    outcome: "won",
+    returnReward: 2,
+    source: "balatrobot_model",
+    features: legacyGold,
+    actionTemplate: { method: "next_round" },
+  }]);
+  assert.equal(semanticPriorEvidenceForState(index, gold).length, 1);
+  assert.equal(semanticPriorEvidenceForState(index, state("white")).length, 0);
+});
+
 test("action templates generalize play and discard indices while preserving intent", () => {
   const first = state();
   const reordered = state("seed-b", {
@@ -91,6 +144,37 @@ test("action templates generalize play and discard indices while preserving inte
   assert.equal(
     semanticCandidateActionKey(first, { action: { method: "discard", cards: [2, 3] } }),
     semanticCandidateActionKey(reordered, { action: { method: "discard", cards: [0, 1] } }),
+  );
+});
+
+test("shop and inventory priors preserve sticker and price identity", () => {
+  const shopState = state("shop", {
+    state: "SHOP",
+    shop: {
+      count: 1,
+      limit: 2,
+      cards: [card("j_joker", { set: "JOKER", buy: 1, modifier: { rental: true } })],
+    },
+  });
+  const plainState = state("plain", {
+    state: "SHOP",
+    shop: {
+      count: 1,
+      limit: 2,
+      cards: [card("j_joker", { set: "JOKER", buy: 4 })],
+    },
+  });
+  const rentalKey = semanticCandidateActionKey(shopState, { action: { method: "buy", card: 0 } });
+  const plainKey = semanticCandidateActionKey(plainState, { action: { method: "buy", card: 0 } });
+  assert.match(rentalKey, /j_joker\+rental@1/);
+  assert.match(plainKey, /j_joker@4/);
+  assert.notEqual(rentalKey, plainKey);
+  assert.equal(
+    semanticHistoricalActionKey({
+      features: semanticStateFeatures(shopState),
+      actionTemplate: { method: "sell", choice: "joker", item: "j_joker+eternal" },
+    }),
+    JSON.stringify({ method: "sell", choice: "joker", item: "j_joker+eternal" }),
   );
 });
 

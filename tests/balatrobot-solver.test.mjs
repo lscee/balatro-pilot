@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   assertBalatrobotCandidateAction,
+  balatrobotHighScoreBuildProfile,
   balatrobotMouthLockedHandType,
   balatrobotJokerOrderAction,
   balatrobotSurvivalAssessment,
@@ -715,6 +716,26 @@ test("Director's Cut and Retcon expose an exact strategic Boss reroll candidate"
   }).some((candidate) => candidate.action.method === "reroll_boss"));
   assert.equal(generateBalatrobotCandidates({ ...base, money: 9 }).some(
     (candidate) => candidate.action.method === "reroll_boss"), false);
+
+  const creditCard = () => ({
+    key: "j_credit_card",
+    label: "Credit Card",
+    set: "JOKER",
+    modifier: {},
+    state: {},
+  });
+  const stackedCredit = {
+    ...base,
+    money: -25,
+    jokers: { count: 2, limit: 5, cards: [creditCard(), creditCard()] },
+  };
+  assert.ok(generateBalatrobotCandidates(stackedCredit).some(
+    (candidate) => candidate.action.method === "reroll_boss"),
+  "a strategic Boss reroll may use the exact legal liquidity from multiple Credit Cards");
+  assert.equal(generateBalatrobotCandidates({
+    ...stackedCredit,
+    jokers: { count: 1, limit: 5, cards: [creditCard()] },
+  }).some((candidate) => candidate.action.method === "reroll_boss"), false);
 });
 
 test("routine navigation and shop choices are exposed only as local candidate ids", () => {
@@ -738,7 +759,7 @@ test("routine navigation and shop choices are exposed only as local candidate id
   };
   const candidates = generateBalatrobotCandidates(shop);
   assert.ok(candidates.some((candidate) => candidate.id === "buy:card:0" && candidate.requiresStrategic));
-  assert.ok(candidates.some((candidate) => candidate.id === "reroll:shop" && candidate.requiresStrategic));
+  assert.equal(candidates.some((candidate) => candidate.id === "reroll:shop"), false);
   assert.ok(candidates.some((candidate) => candidate.id === "next_round:shop" && candidate.requiresStrategic));
   assert.equal(candidates.some((candidate) => candidate.action.method === "sell"), false);
   assert.doesNotThrow(() => assertBalatrobotCandidateAction(
@@ -750,6 +771,766 @@ test("routine navigation and shop choices are exposed only as local candidate id
     () => assertBalatrobotCandidateAction({ method: "buy", params: { card: 1 } }, candidates, shop),
     /must exactly match one locally enumerated candidate/,
   );
+});
+
+test("Gold blind candidates expose the zero Small Blind reward and exact skip opportunity cost", () => {
+  const gold = {
+    state: "BLIND_SELECT",
+    stake: "GOLD",
+    ante_num: 2,
+    round: { hands_left: 4 },
+    jokers: { count: 3, limit: 5, cards: [
+      { key: "j_joker", set: "JOKER", modifier: {}, state: {} },
+      { key: "j_walkie_talkie", set: "JOKER", modifier: {}, state: {} },
+      { key: "j_credit_card", set: "JOKER", modifier: {}, state: {} },
+    ] },
+    blinds: {
+      small: {
+        type: "SMALL",
+        status: "SELECT",
+        name: "Small Blind",
+        tagName: "Rare Tag",
+        tagEffect: "The shop has a free Rare Joker",
+      },
+    },
+  };
+  const candidates = generateBalatrobotCandidates(gold);
+  const select = candidates.find((candidate) => candidate.action.method === "select");
+  const skip = candidates.find((candidate) => candidate.action.method === "skip");
+  assert.equal(select.economy.smallBlindReward, 0);
+  assert.equal(select.economy.maximumRemainingHandMoney, 4);
+  assert.match(select.strategicReason, /fixed reward is \$0.*post-blind shop.*unused hands/iu);
+  assert.equal(skip.requiresStrategic, true);
+  assert.equal(skip.fallbackSafe, false);
+  assert.deepEqual(skip.skipEligibility, {
+    ante: 2,
+    activeJokers: 3,
+    scoringJokers: 2,
+    highValueTag: true,
+    matureBuild: true,
+  });
+  assert.match(skip.strategicReason, /forfeits.*unused-hand money.*shop/iu);
+
+  const whiteSelect = generateBalatrobotCandidates({ ...gold, stake: "WHITE" })
+    .find((candidate) => candidate.action.method === "select");
+  assert.equal(whiteSelect.economy.smallBlindReward, 3);
+  const boss = generateBalatrobotCandidates({
+    ...gold,
+    blinds: { boss: { type: "BOSS", status: "SELECT", name: "The Wall", tagName: "Rare Tag" } },
+  });
+  assert.equal(boss.some((candidate) => candidate.action.method === "skip"), false);
+
+  const noSkip = (stateValue) => generateBalatrobotCandidates(stateValue)
+    .some((candidate) => candidate.action.method === "skip");
+  assert.equal(noSkip({ ...gold, ante_num: 1 }), false);
+  assert.equal(noSkip({ ...gold, jokers: { count: 0, limit: 5, cards: [] } }), false);
+  assert.equal(noSkip({
+    ...gold,
+    blinds: { small: { ...gold.blinds.small, tagName: "Double Tag" } },
+  }), false);
+});
+
+test("identical Joker offers receive distinct Eternal, Perishable, and Rental NPV", () => {
+  const offer = (id, modifier) => ({
+    id,
+    key: "j_jolly",
+    label: "Jolly Joker",
+    set: "JOKER",
+    value: { effect: "+8 Mult if hand contains a Pair" },
+    modifier,
+    state: {},
+    cost: { buy: 1, sell: 1 },
+  });
+  const shop = {
+    state: "SHOP",
+    ante_num: 2,
+    expected_joker_hold_blinds: 4,
+    money: 40,
+    round: { reroll_cost: 5 },
+    jokers: { count: 0, limit: 5, cards: [] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { cards: [
+      offer(1, {}),
+      offer(2, { eternal: true }),
+      offer(3, { perishable: 2 }),
+      offer(4, { rental: true }),
+      offer(5, { eternal: true, rental: true }),
+    ] },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+  };
+  const buys = generateBalatrobotCandidates(shop, { limit: 30 })
+    .filter((candidate) => candidate.action.method === "buy" && candidate.action.card != null);
+  assert.equal(buys.length, 4, "Eternal+Rental is hard-rejected without measured immediate survival");
+  const byId = Object.fromEntries(buys.map((candidate) => [candidate.card.id, candidate]));
+  assert.equal(byId[3].card.perishable, 2);
+  assert.equal(byId[4].card.rentalRate, 3);
+  assert.equal(byId[4].stickerValuation.projectedRentalCost, 12);
+  assert.equal(byId[2].card.eternal, true);
+  assert.equal(new Set(buys.map((candidate) => candidate.expectedValue)).size, 4);
+  assert.ok(byId[1].expectedValue > byId[2].expectedValue);
+  assert.ok(byId[1].expectedValue > byId[3].expectedValue);
+  assert.ok(byId[1].expectedValue > byId[4].expectedValue);
+});
+
+test("canonical isPerishable marker aliases preserve marker-only and expired tally zero", () => {
+  const offer = (id, extra) => ({
+    id,
+    key: "j_jolly",
+    label: "Jolly Joker",
+    set: "JOKER",
+    value: { effect: "+8 Mult if hand contains a Pair" },
+    modifier: {},
+    state: {},
+    cost: { buy: 1 },
+    ...extra,
+  });
+  const exact = {
+    state: "SHOP",
+    ante_num: 2,
+    expected_joker_hold_blinds: 4,
+    money: 40,
+    round: { reroll_cost: 5 },
+    jokers: { count: 0, limit: 5, cards: [] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { cards: [
+      offer(11, { modifier: { isPerishable: true } }),
+      offer(12, { modifier: { is_perishable: true }, state: { perishable_tally: 0 } }),
+      offer(13, { state: { isPerishable: true } }),
+      offer(14, { is_perishable: true }),
+    ] },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+  };
+  const byId = Object.fromEntries(generateBalatrobotCandidates(exact, { limit: 30 })
+    .filter((candidate) => candidate.action.card != null)
+    .map((candidate) => [candidate.card.id, candidate]));
+  for (const id of [11, 13, 14]) {
+    assert.equal(byId[id].card.perishable, true);
+    assert.equal(byId[id].stickerValuation.perishable, true);
+    assert.equal(byId[id].stickerValuation.remainingPerishableBlinds, 5);
+  }
+  assert.equal(byId[12].card.perishable, 0);
+  assert.equal(byId[12].stickerValuation.remainingPerishableBlinds, 0);
+  assert.equal(byId[12].stickerValuation.lifespanDiscount, 0);
+});
+
+test("Eternal plus Rental is always rejected even when a local benchmark appears lifesaving", () => {
+  const benchmarkState = state([
+    card("A", "H"), card("A", "S"), card("2", "C"), card("3", "D"), card("4", "H"),
+  ], { handsLeft: 4, handsPlayed: 0, discardsUsed: 0 });
+  const play = generateBalatrobotCandidates(benchmarkState, { limit: 20 })
+    .find((candidate) => candidate.action.method === "play" && candidate.handType === "Pair");
+  assert.ok(play);
+  const shop = {
+    state: "SHOP",
+    ante_num: 2,
+    money: 10,
+    round: { hands_left: 4, reroll_cost: 5 },
+    blinds: { big: { type: "BIG", status: "UPCOMING", name: "Big Blind", score: 500 } },
+    jokers: { count: 0, limit: 5, cards: [] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { cards: [{
+      id: 10,
+      key: "j_cavendish",
+      label: "Cavendish",
+      set: "JOKER",
+      value: { effect: "X3 Mult" },
+      modifier: { eternal: true, rental: true },
+      state: {},
+      cost: { buy: 1 },
+    }] },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+  };
+  const withoutEvidence = generateBalatrobotCandidates(shop, { limit: 30 });
+  assert.equal(withoutEvidence.some((candidate) => candidate.id === "buy:card:0"), false);
+  const withEvidence = generateBalatrobotCandidates(shop, {
+    limit: 30,
+    benchmarks: [{ state: benchmarkState, candidate: play }],
+  });
+  assert.equal(
+    withEvidence.some((candidate) => candidate.id === "buy:card:0"),
+    false,
+    "local scoring evidence cannot prove every upcoming Blind rule",
+  );
+
+  const needle = {
+    ...shop,
+    blinds: { boss: { type: "BOSS", status: "UPCOMING", name: "The Needle", score: 500 } },
+  };
+  const needleCandidates = generateBalatrobotCandidates(needle, {
+    limit: 30,
+    benchmarks: [{ state: benchmarkState, candidate: play }],
+  });
+  assert.equal(
+    needleCandidates.some((candidate) => candidate.id === "buy:card:0"),
+    false,
+    "The Needle must use one hand, never the four-hand benchmark capacity",
+  );
+
+  const plant = {
+    ...shop,
+    blinds: { boss: { type: "BOSS", status: "UPCOMING", name: "The Plant", score: 400 } },
+  };
+  assert.equal(generateBalatrobotCandidates(plant, {
+    limit: 30,
+    benchmarks: [{ state: benchmarkState, candidate: play }],
+  }).some((candidate) => candidate.id === "buy:card:0"), false);
+});
+
+test("Rental and expiring Joker stop-loss works with open slots but never sells Eternal", () => {
+  const owned = (id, modifier, state = {}) => ({
+    id,
+    key: `j_owned_${id}`,
+    label: `Owned ${id}`,
+    set: "JOKER",
+    value: { effect: "utility effect" },
+    modifier,
+    state,
+    cost: { sell: 1 },
+  });
+  const shop = {
+    state: "SHOP",
+    ante_num: 3,
+    money: 4,
+    round: { reroll_cost: 5 },
+    jokers: { count: 4, limit: 5, cards: [
+      owned(1, { rental: true }),
+      owned(2, { perishable: 1, rental: true }),
+      owned(3, { perishable: 0, rental: true }, { debuff: true }),
+      owned(4, { eternal: true, rental: true }),
+    ] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { cards: [] },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+  };
+  const candidates = generateBalatrobotCandidates(shop, { limit: 30 });
+  const sales = candidates.filter((candidate) => candidate.action.method === "sell" && candidate.action.joker != null);
+  assert.deepEqual(sales.map((candidate) => candidate.action.joker).toSorted(), [0, 1, 2]);
+  assert.ok(sales.every((candidate) => candidate.requiresStrategic && candidate.fallbackSafe === false));
+  assert.equal(sales.find((candidate) => candidate.action.joker === 2).card.perishable, 0);
+  assert.equal(sales.find((candidate) => candidate.action.joker === 2).stopLoss.expired, true);
+  assert.equal(candidates.some((candidate) => candidate.action.joker === 3), false);
+});
+
+test("a Rental scoring core is never offered as stop-loss when removal loses the next Blind", () => {
+  const benchmarkState = state([
+    card("A", "H"), card("A", "S"), card("2", "C"), card("3", "D"), card("4", "H"),
+  ], { handsLeft: 4, handsPlayed: 0, discardsUsed: 0 });
+  const play = generateBalatrobotCandidates(benchmarkState, { limit: 20 })
+    .find((candidate) => candidate.action.method === "play" && candidate.handType === "Pair");
+  const cavendish = {
+    key: "j_cavendish",
+    label: "Cavendish",
+    set: "JOKER",
+    value: { effect: "X3 Mult" },
+    modifier: { rental: true },
+    state: {},
+    cost: { sell: 2 },
+  };
+  const shop = {
+    state: "SHOP",
+    ante_num: 2,
+    money: 20,
+    round: { reroll_cost: 5 },
+    blinds: { big: { type: "BIG", status: "UPCOMING", name: "Big Blind", score: 500 } },
+    jokers: { count: 1, limit: 5, cards: [cavendish] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { cards: [] },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+  };
+  const measured = generateBalatrobotCandidates(shop, {
+    limit: 30,
+    benchmarks: [{ state: benchmarkState, candidate: play }],
+  });
+  assert.equal(measured.some((candidate) => candidate.action.method === "sell"), false);
+  assert.equal(
+    generateBalatrobotCandidates(shop, { limit: 30 }).some((candidate) => candidate.action.method === "sell"),
+    false,
+    "without exact evidence, a scoring Rental fails closed instead of becoming a high-EV sale",
+  );
+
+  const comfortablyClearing = {
+    ...shop,
+    jokers: { count: 2, limit: 5, cards: [{
+      key: "j_large_mult",
+      label: "Large Mult",
+      set: "JOKER",
+      value: { effect: "+100 Mult" },
+      modifier: {},
+      state: {},
+    }, cavendish] },
+  };
+  assert.equal(generateBalatrobotCandidates(comfortablyClearing, {
+    limit: 30,
+    benchmarks: [{ state: benchmarkState, candidate: play }],
+  }).some((candidate) => candidate.action.method === "sell" && candidate.action.joker === 1), false,
+  "clearing the next Blind without Cavendish does not justify destroying a long-lived XMult layer");
+});
+
+test("unquantified recurring economy Rentals fail closed until they are actually expired", () => {
+  const rental = (key, effect) => ({
+    key,
+    label: key,
+    set: "JOKER",
+    value: { effect },
+    modifier: { rental: true },
+    state: {},
+    cost: { sell: 1 },
+  });
+  const economy = [
+    rental("j_cloud_9", "Earn $1 for each 9 in your full deck at end of round"),
+    rental("j_to_the_moon", "Earn an extra $1 of interest for every $5 you have at end of round"),
+    rental("j_delayed_gratification", "Earn $2 per discard if no discards are used by end of the round"),
+    rental("j_business", "Played face cards have a 1 in 2 chance to give $2 when scored"),
+  ];
+  const exact = {
+    state: "SHOP",
+    ante_num: 3,
+    money: 20,
+    round: { reroll_cost: 5 },
+    jokers: { count: economy.length, limit: 5, cards: economy },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { cards: [] },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+  };
+  assert.equal(generateBalatrobotCandidates(exact, { limit: 30 }).some(
+    (candidate) => candidate.action.method === "sell"), false);
+
+  const benchmarkState = state([
+    card("A", "H"), card("A", "S"), card("2", "C"), card("3", "D"), card("4", "H"),
+  ], { handsLeft: 4, handsPlayed: 0, discardsUsed: 0 });
+  const play = generateBalatrobotCandidates(benchmarkState, { limit: 20 })
+    .find((candidate) => candidate.action.method === "play" && candidate.handType === "Pair");
+  const profitableRental = {
+    ...exact,
+    blinds: { big: { type: "BIG", status: "UPCOMING", name: "Big Blind", score: 100 } },
+    jokers: { count: 1, limit: 5, cards: [
+      rental("j_golden", "Earn $4 at end of round"),
+    ] },
+  };
+  assert.equal(generateBalatrobotCandidates(profitableRental, {
+    limit: 30,
+    benchmarks: [{ state: benchmarkState, candidate: play }],
+  }).some((candidate) => candidate.action.method === "sell"), false,
+  "a low next-Blind target never justifies selling fixed income above its Rental upkeep");
+
+  const expired = {
+    ...exact,
+    jokers: { count: 1, limit: 5, cards: [{
+      ...economy[0],
+      modifier: { rental: true, perishable: 0 },
+      state: { debuff: true },
+    }] },
+  };
+  assert.ok(generateBalatrobotCandidates(expired, { limit: 30 }).some(
+    (candidate) => candidate.action.method === "sell" && candidate.action.joker === 0));
+});
+
+test("shop money reserves Rental upkeep across negative cash and stacked Credit Cards", () => {
+  const creditCard = () => ({ key: "j_credit_card", label: "Credit Card", set: "JOKER", modifier: {}, state: {}, cost: { sell: 1 } });
+  const rental = { key: "j_rental", label: "Rental", set: "JOKER", modifier: { rental: true }, state: {}, cost: { sell: 1 } };
+  const exact = {
+    state: "SHOP",
+    ante_num: 3,
+    money: -32,
+    round: { reroll_cost: 3 },
+    jokers: { count: 3, limit: 5, cards: [creditCard(), creditCard(), rental] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { cards: [
+      { id: 1, key: "j_joker", label: "Joker", set: "JOKER", modifier: {}, state: {}, cost: { buy: 2 } },
+      { id: 2, key: "j_jolly", label: "Jolly", set: "JOKER", modifier: { rental: true }, state: {}, cost: { buy: 1 } },
+    ] },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+  };
+  const stacked = generateBalatrobotCandidates(exact, { limit: 30 });
+  assert.ok(stacked.some((candidate) => candidate.id === "buy:card:0"));
+  assert.equal(stacked.some((candidate) => candidate.id === "buy:card:1"), false);
+  const budget = stacked.find((candidate) => candidate.id === "buy:card:0").shopBudget;
+  assert.equal(budget.cash, -32);
+  assert.equal(budget.credit, 40);
+  assert.equal(budget.rentalUpkeep, 3);
+  assert.equal(budget.twoBlindUpkeep, 6);
+  assert.equal(budget.projectedRentalUpkeep, 6);
+  assert.equal(budget.available, 2);
+  assert.equal(budget.purchaseCommitment, 2);
+  assert.equal(budget.availableAfterPurchase, 0);
+  exact.jokers.cards.splice(0, 1);
+  exact.jokers.count = 2;
+  const oneCredit = generateBalatrobotCandidates(exact, { limit: 30 });
+  assert.equal(oneCredit.some((candidate) => candidate.action.method === "buy"), false);
+  assert.equal(oneCredit.some((candidate) => candidate.action.method === "reroll"), false);
+});
+
+test("the second Rental payment cannot be spent, while genuinely free resources remain legal", () => {
+  const rental = { key: "j_utility", label: "Utility", set: "JOKER", modifier: { rental: true }, state: {}, cost: { sell: 1 } };
+  const base = {
+    state: "SHOP",
+    ante_num: 3,
+    money: 7,
+    round: { reroll_cost: 5 },
+    jokers: { count: 1, limit: 5, cards: [rental] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { cards: [
+      { key: "j_two", label: "Costs Two", set: "JOKER", modifier: {}, state: {}, cost: { buy: 2 } },
+      { key: "j_one", label: "Costs One", set: "JOKER", modifier: {}, state: {}, cost: { buy: 1 } },
+    ] },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+  };
+  const reserved = generateBalatrobotCandidates(base, { limit: 30 });
+  assert.equal(reserved.some((candidate) => candidate.id === "buy:card:0"), false);
+  assert.ok(reserved.some((candidate) => candidate.id === "buy:card:1"));
+  assert.equal(reserved.find((candidate) => candidate.id === "buy:card:1").shopBudget.twoBlindUpkeep, 6);
+
+  const free = {
+    ...base,
+    money: -1,
+    jokers: { count: 0, limit: 5, cards: [] },
+    shop: { cards: [
+      { key: "j_free", label: "Free Joker", set: "JOKER", modifier: {}, state: {}, cost: { buy: 0 } },
+      { key: "j_free_rental", label: "Free Rental", set: "JOKER", modifier: { rental: true }, state: {}, cost: { buy: 0 } },
+    ] },
+    vouchers: { cards: [{ key: "v_free", label: "Free Voucher", set: "VOUCHER", cost: { buy: 0 } }] },
+    packs: { cards: [{ key: "p_free", label: "Free Pack", set: "BOOSTER", cost: { buy: 0 } }] },
+  };
+  const freeCandidates = generateBalatrobotCandidates(free, { limit: 30 });
+  assert.ok(freeCandidates.some((candidate) => candidate.id === "buy:card:0"));
+  assert.equal(freeCandidates.some((candidate) => candidate.id === "buy:card:1"), false);
+  assert.ok(freeCandidates.some((candidate) => candidate.id === "buy:voucher:0"));
+  assert.ok(freeCandidates.some((candidate) => candidate.id === "buy:pack:0"));
+});
+
+test("buy_use and paid rerolls share the two-Blind reserve, but a needed free reroll bypasses cash", () => {
+  const rental = { key: "j_utility", label: "Utility", set: "JOKER", modifier: { rental: true }, state: {}, cost: { sell: 1 } };
+  const shop = {
+    state: "SHOP",
+    ante_num: 3,
+    money: 10,
+    round: { reroll_cost: 5 },
+    hands: { Flush: { chips: 35, mult: 4, played: 3 } },
+    blinds: { big: { type: "BIG", status: "UPCOMING", name: "Big Blind", score: 4_800 } },
+    jokers: { count: 1, limit: 5, cards: [rental] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { cards: [{ key: "c_hermit", label: "The Hermit", set: "TAROT", modifier: {}, cost: { buy: 4 } }] },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+  };
+  const blocked = generateBalatrobotCandidates(shop, { limit: 30 });
+  assert.equal(blocked.some((candidate) => candidate.action.method === "buy_use"), true, "cash 10 leaves $4 after two rents");
+  assert.equal(blocked.some((candidate) => candidate.action.method === "reroll"), false);
+  assert.equal(blocked.find((candidate) => candidate.action.method === "next_round").shopBudget.rerollBudget, 0);
+
+  const tighter = { ...shop, money: 4 };
+  const upkeepBlocked = generateBalatrobotCandidates(tighter, { limit: 30 });
+  assert.equal(upkeepBlocked.some((candidate) => candidate.action.method === "buy_use"), false);
+  tighter.shop.cards[0].cost.buy = 0;
+  const freeBuyUse = generateBalatrobotCandidates(tighter, { limit: 30 });
+  assert.ok(freeBuyUse.some((candidate) => candidate.action.method === "buy_use"));
+
+  const freeReroll = {
+    ...shop,
+    money: -1,
+    round: { reroll_cost: 0 },
+    shop: { cards: [] },
+  };
+  const freeRerollCandidates = generateBalatrobotCandidates(freeReroll, { limit: 30 });
+  assert.ok(freeRerollCandidates.some((candidate) => candidate.action.method === "reroll"));
+  assert.ok(freeRerollCandidates.find((candidate) => candidate.action.method === "reroll").shopBudget.available < 0);
+});
+
+test("an explicitly free reroll is never wasted, while a missing price is not fabricated as free", () => {
+  const emptyShop = {
+    state: "SHOP",
+    ante_num: 2,
+    money: -1,
+    round: { reroll_cost: 0 },
+    hands: { Pair: { chips: 10, mult: 2, played: 2 } },
+    blinds: { big: { type: "BIG", status: "UPCOMING", name: "Big Blind", score: 50 } },
+    jokers: { count: 0, limit: 5, cards: [] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { cards: [] },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+  };
+  const free = generateBalatrobotCandidates(emptyShop, { limit: 30 });
+  const reroll = free.find((candidate) => candidate.action.method === "reroll");
+  assert.ok(reroll);
+  assert.equal(reroll.rerollDecision.rerollCost, 0);
+  assert.equal(reroll.rerollDecision.rerollCostKnown, true);
+
+  const missing = generateBalatrobotCandidates({ ...emptyShop, round: {} }, { limit: 30 });
+  assert.equal(missing.some((candidate) => candidate.action.method === "reroll"), false);
+  assert.equal(missing.find((candidate) => candidate.action.method === "next_round")
+    .shopBudget.rerollDecision.rerollCostKnown, false);
+
+  const refreshed = generateBalatrobotCandidates({
+    ...emptyShop,
+    money: 4,
+    round: { reroll_cost: 5 },
+  }, { limit: 30 });
+  assert.equal(refreshed.some((candidate) => candidate.action.method === "reroll"), false);
+});
+
+test("future engine profile discounts a one-blind Perishable and exposes Rental upkeep", () => {
+  const base = {
+    state: "SHOP",
+    ante_num: 2,
+    expected_joker_hold_blinds: 5,
+    jokers: { count: 1, limit: 5, cards: [{
+      key: "j_cavendish",
+      label: "Cavendish",
+      set: "JOKER",
+      value: { effect: "X3 Mult" },
+      modifier: { rental: true },
+      state: {},
+    }] },
+    hands: {},
+  };
+  const clean = balatrobotHighScoreBuildProfile(base);
+  const expiring = balatrobotHighScoreBuildProfile({
+    ...base,
+    jokers: { ...base.jokers, cards: [{ ...base.jokers.cards[0], modifier: { perishable: 1, rental: true } }] },
+  });
+  const expired = balatrobotHighScoreBuildProfile({
+    ...base,
+    jokers: { ...base.jokers, cards: [{ ...base.jokers.cards[0], modifier: { perishable: 0, rental: true }, state: { debuff: true } }] },
+  });
+  assert.ok(clean.engineScore > expiring.engineScore);
+  assert.equal(expiring.futureXMultSources, 0.2);
+  assert.equal(expiring.layers.xMult, false);
+  assert.equal(clean.rentalUpkeepPerBlind, 3);
+  assert.equal(clean.projectedRentalUpkeep, 15);
+  assert.equal(expired.engineScore, 0);
+});
+
+test("an expired Perishable still occupies its Joker slot when deciding whether to reroll", () => {
+  const utility = (key, modifier = {}, state = {}) => ({
+    key,
+    label: key,
+    set: "JOKER",
+    value: { effect: "utility effect" },
+    modifier,
+    state,
+  });
+  const exact = {
+    state: "SHOP",
+    ante_num: 3,
+    money: 100,
+    round: { reroll_cost: 5 },
+    blinds: { big: { type: "BIG", status: "UPCOMING", name: "Big Blind", score: 140 } },
+    hands: {},
+    // The deliberately stale count proves visible cards are never ignored.
+    jokers: { count: 4, limit: 5, cards: [
+      utility("j_one"),
+      utility("j_two"),
+      utility("j_three"),
+      utility("j_four"),
+      utility("j_expired", { perishable: 0 }, { debuff: true }),
+    ] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { cards: [{ key: "j_offer", label: "Offer", set: "JOKER", modifier: {}, cost: { buy: 0 } }] },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+  };
+  const candidates = generateBalatrobotCandidates(exact, { limit: 30 });
+  assert.equal(candidates.some((candidate) => candidate.id === "buy:card:0"), false);
+  assert.equal(candidates.some((candidate) => candidate.id === "reroll:shop"), false);
+});
+
+test("full old consumable slots expose one strategic sale without ever selling rescue or premium cards", () => {
+  const shop = {
+    state: "SHOP",
+    seed: "AGED-SHOP",
+    ante_num: 4,
+    round_num: 10,
+    money: 20,
+    round: { reroll_cost: 1 },
+    jokers: { count: 0, limit: 5, cards: [] },
+    consumables: {
+      count: 2,
+      limit: 2,
+      cards: [
+        { id: 201, key: "c_tower", label: "The Tower", set: "TAROT", modifier: {}, cost: { sell: 1 } },
+        { id: 202, key: "c_sun", label: "The Sun", set: "TAROT", modifier: {}, cost: { sell: 1 } },
+      ],
+    },
+    shop: { cards: Array.from({ length: 12 }, (_, index) => ({
+      id: 300 + index,
+      key: `j_shop_${index}`,
+      label: `Shop Joker ${index}`,
+      set: "JOKER",
+      modifier: {},
+      cost: { buy: 1 },
+    })) },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+  };
+  const consumableAges = {
+    byId: {
+      201: { id: 201, key: "c_tower", tracked: true, blindAge: 3, firstSeenRound: 7 },
+      202: { id: 202, key: "c_sun", tracked: true, blindAge: 4, firstSeenRound: 6 },
+    },
+  };
+  const candidates = generateBalatrobotCandidates(shop, { limit: 4, consumableAges });
+  const sales = candidates.filter((candidate) => candidate.action.method === "sell" && candidate.action.consumable != null);
+  assert.equal(sales.length, 1);
+  assert.equal(sales[0].card.id, 201);
+  assert.equal(sales[0].requiresStrategic, true);
+  assert.equal(sales[0].fallbackSafe, false);
+  assert.equal(candidates.some((candidate) => candidate.action.consumable === 1), false);
+  assert.ok(candidates.some((candidate) => candidate.action.method === "next_round"));
+  const mode = balatrobotThinkingMode(shop, candidates, {
+    balatrobotRoutineReasoningEffort: "none",
+    balatrobotStrategicReasoningEffort: "high",
+  });
+  assert.equal(mode.ignorePersistedCheckpoint, true);
+  assert.doesNotThrow(() => assertBalatrobotCandidateAction(
+    { method: "sell", params: { consumable: 0 } },
+    candidates,
+    shop,
+  ));
+});
+
+test("many strategic consumables never crowd every ordinary hand action out", () => {
+  const exact = state([
+    card("A", "H"), card("K", "S"), card("Q", "D"), card("J", "C"), card("9", "H"), card("2", "C"),
+  ]);
+  exact.seed = "NEGATIVE-CONSUMABLES";
+  exact.round_num = 9;
+  exact.consumables = {
+    count: 4,
+    limit: 4,
+    cards: ["c_justice", "c_chariot", "c_devil", "c_tower"].map((key, index) => ({
+      id: 300 + index,
+      key,
+      label: key,
+      set: "TAROT",
+      modifier: { edition: "NEGATIVE" },
+    })),
+  };
+  const consumableAges = { byId: Object.fromEntries(exact.consumables.cards.map((item) => [
+    item.id,
+    { id: item.id, key: item.key, tracked: true, blindAge: 3 },
+  ])) };
+  const candidates = generateBalatrobotCandidates(exact, { limit: 6, consumableAges });
+  assert.ok(candidates.some((candidate) => candidate.action?.method === "play"));
+  assert.ok(candidates.some((candidate) => candidate.action?.method === "discard"));
+});
+
+test("limit two always retains the best legal play and spends no slot on a discard", () => {
+  const exact = state([
+    card("A", "H"), card("A", "S"), card("K", "D"), card("Q", "C"), card("2", "H"),
+  ]);
+  exact.seed = "LIMIT-TWO";
+  exact.round_num = 6;
+  exact.consumables = {
+    count: 1,
+    limit: 2,
+    cards: [{ id: 411, key: "c_tower", label: "The Tower", set: "TAROT" }],
+  };
+  const wide = generateBalatrobotCandidates(exact, { limit: 20 });
+  const expectedBestPlay = wide.find((candidate) => candidate.action?.method === "play");
+  assert.ok(expectedBestPlay);
+  const bounded = generateBalatrobotCandidates(exact, {
+    limit: 2,
+    consumableAges: { byId: { 411: { id: 411, key: "c_tower", tracked: true, blindAge: 3 } } },
+  });
+  assert.equal(bounded.length, 2);
+  assert.equal(bounded.find((candidate) => candidate.action?.method === "play")?.id, expectedBestPlay.id);
+  assert.equal(bounded.some((candidate) => candidate.action?.method === "discard"), false);
+  assert.ok(bounded.some((candidate) => candidate.consumableStrategicReview === true));
+});
+
+test("consumable sale fails closed without id age, sufficient age, or full slots", () => {
+  const base = {
+    state: "SHOP",
+    seed: "SAFE-SHOP",
+    money: 0,
+    round: {},
+    jokers: { count: 0, limit: 5, cards: [] },
+    consumables: {
+      count: 2,
+      limit: 2,
+      cards: [
+        { id: 9, key: "c_tower", label: "The Tower", set: "TAROT", cost: { sell: 1 } },
+        { key: "c_justice", label: "Justice", set: "TAROT", cost: { sell: 1 } },
+      ],
+    },
+    shop: { cards: [] },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+  };
+  const young = { byId: { 9: { id: 9, key: "c_tower", tracked: true, blindAge: 1 } } };
+  assert.equal(generateBalatrobotCandidates(base, { consumableAges: young }).some(
+    (candidate) => candidate.action.consumable != null && candidate.action.method === "sell"), false);
+  const old = { byId: { 9: { id: 9, key: "c_tower", tracked: true, blindAge: 3 } } };
+  assert.equal(generateBalatrobotCandidates({
+    ...base,
+    consumables: { ...base.consumables, count: 1, cards: [base.consumables.cards[0]] },
+  }, { consumableAges: old }).some(
+    (candidate) => candidate.action.consumable != null && candidate.action.method === "sell"), false);
+});
+
+test("an aged owned consumable forces one explicit strategic use-or-hold review", () => {
+  const exact = state([
+    card("A", "H"), card("K", "H"), card("Q", "H"), card("J", "H"), card("9", "H"), card("2", "C"),
+  ]);
+  exact.seed = "AGED-HAND";
+  exact.round_num = 7;
+  exact.consumables = {
+    count: 1,
+    limit: 2,
+    cards: [{ id: 77, key: "c_tower", label: "The Tower", set: "TAROT" }],
+  };
+  const candidates = generateBalatrobotCandidates(exact, {
+    limit: 20,
+    consumableAges: { byId: { 77: { id: 77, key: "c_tower", tracked: true, blindAge: 2 } } },
+  });
+  const ownedUse = candidates.find((candidate) => candidate.action.method === "use");
+  assert.ok(ownedUse?.consumableStrategicReview);
+  const mode = balatrobotThinkingMode(exact, candidates, {
+    balatrobotRoutineReasoningEffort: "none",
+    balatrobotStrategicReasoningEffort: "high",
+  });
+  assert.equal(mode.strategic, true);
+  assert.equal(mode.ignorePersistedCheckpoint, true);
+  assert.match(mode.reason, /aged or full-slot consumable/);
+});
+
+test("an aged consumable with no legal use target still forces a context-only hold review", () => {
+  const exact = state([card("A", "H"), card("K", "S"), card("2", "C")]);
+  exact.seed = "AGED-BLOCKED";
+  exact.round_num = 8;
+  exact.last_tarot_planet = null;
+  exact.consumables = {
+    count: 1,
+    limit: 2,
+    cards: [{ id: 88, key: "c_fool", label: "The Fool", set: "TAROT" }],
+  };
+  const candidates = generateBalatrobotCandidates(exact, {
+    limit: 20,
+    consumableAges: { byId: { 88: { id: 88, key: "c_fool", tracked: true, blindAge: 5 } } },
+  });
+  const play = candidates.find((candidate) => candidate.action?.method === "play");
+  assert.ok(play);
+  assert.equal(play.consumableStrategicReview, true);
+  assert.equal(play.consumableHoldReviews.length, 1);
+  assert.match(play.consumableHoldReviews[0].blockedReason, /last|known|valid|use/iu);
+  assert.ok(filterBalatrobotExecutableCandidates(exact, candidates).some(
+    (candidate) => candidate.id === play.id,
+  ));
+  const mode = balatrobotThinkingMode(exact, candidates, {
+    balatrobotRoutineReasoningEffort: "none",
+    balatrobotStrategicReasoningEffort: "high",
+  });
+  assert.equal(mode.strategic, true);
+  assert.equal(mode.ignorePersistedCheckpoint, true);
 });
 
 test("celestial pack fallback follows the committed hand route and skips unrelated planets", () => {
@@ -842,6 +1623,70 @@ test("celestial pack exposes a leading Black Hole as a strong no-target choice",
   assert.ok(blackHole.expectedValue > choices.find((candidate) => candidate.card?.key === "c_neptune").expectedValue);
 });
 
+test("Joker packs preserve stickers, discount liabilities, and never force an unsafe pick", () => {
+  const offer = (id, modifier) => ({
+    id,
+    key: "j_cavendish",
+    label: "Cavendish",
+    set: "JOKER",
+    value: { effect: "X3 Mult" },
+    modifier,
+    state: {},
+  });
+  const exact = {
+    state: "SMODS_BOOSTER_OPENED",
+    ante_num: 2,
+    expected_joker_hold_blinds: 4,
+    hand: { count: 0, cards: [] },
+    hands: {},
+    jokers: { count: 0, limit: 5, cards: [] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    pack: { cards: [
+      offer(1, {}),
+      offer(2, { eternal: true }),
+      offer(3, { perishable: 1 }),
+      offer(4, { rental: true }),
+      offer(5, { eternal: true, rental: true }),
+    ] },
+  };
+  const candidates = generateBalatrobotPackCandidates(exact, { limit: 20 });
+  const picks = candidates.filter((candidate) => candidate.action.card != null);
+  assert.deepEqual(picks.map((candidate) => candidate.card.id).toSorted(), [1, 2, 3, 4]);
+  assert.equal(new Set(picks.map((candidate) => candidate.expectedValue)).size, 4);
+  const byId = Object.fromEntries(picks.map((candidate) => [candidate.card.id, candidate]));
+  assert.equal(byId[1].safeChoice, true);
+  assert.equal(byId[1].fallbackSafe, true);
+  assert.equal(byId[2].card.eternal, true);
+  assert.equal(byId[3].card.perishable, 1);
+  assert.equal(byId[4].card.rental, true);
+  for (const id of [2, 3, 4]) {
+    assert.equal(byId[id].safeChoice, false);
+    assert.equal(byId[id].fallbackSafe, false);
+    assert.equal(byId[id].requiresStrategic, true);
+  }
+
+  const rentalOnly = { ...exact, pack: { cards: [offer(6, { rental: true })] } };
+  const rentalCandidates = generateBalatrobotPackCandidates(rentalOnly, { limit: 20 });
+  assert.ok(rentalCandidates.some((candidate) => candidate.card?.id === 6));
+  assert.doesNotThrow(() => assertBalatrobotCandidateAction(
+    { method: "pack", params: { skip: true } },
+    rentalCandidates,
+    rentalOnly,
+  ));
+
+  const eternalRentalOnly = {
+    ...exact,
+    pack: { cards: [offer(7, { eternal: true, rental: true })] },
+  };
+  const rejectedCandidates = generateBalatrobotPackCandidates(eternalRentalOnly, { limit: 20 });
+  assert.equal(rejectedCandidates.some((candidate) => candidate.action.card != null), false);
+  assert.doesNotThrow(() => assertBalatrobotCandidateAction(
+    { method: "pack", params: { skip: true } },
+    rejectedCandidates,
+    eternalRentalOnly,
+  ));
+});
+
 test("shop counterfactual values multiplicative engines and offers a verified full-slot replacement", () => {
   const shop = {
     state: "SHOP",
@@ -931,6 +1776,41 @@ test("full-slot replacement never sells Credit Card for an offer that becomes un
   };
   const candidates = generateBalatrobotCandidates(exact, { limit: 30 });
   assert.equal(candidates.some((candidate) => candidate.action.method === "sell" && candidate.action.joker === 0), false);
+});
+
+test("a debuffed Credit Card never makes unaffordable shop actions locally legal", () => {
+  const exact = {
+    state: "SHOP",
+    ante_num: 3,
+    money: -13,
+    round: { reroll_cost: 5 },
+    jokers: {
+      count: 1,
+      limit: 5,
+      cards: [{
+        key: "j_credit_card",
+        label: "Credit Card",
+        set: "JOKER",
+        state: { debuff: true },
+        modifier: {},
+        cost: { sell: 1 },
+      }],
+    },
+    shop: {
+      cards: [{ key: "j_splash", label: "Splash", set: "JOKER", modifier: {}, cost: { buy: 3 } }],
+    },
+    vouchers: { cards: [] },
+    packs: { cards: [] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    hands: {},
+  };
+  const blocked = generateBalatrobotCandidates(exact, { limit: 30 });
+  assert.equal(blocked.some((candidate) => ["buy", "reroll"].includes(candidate.action.method)), false);
+  assert.equal(blocked.find((candidate) => candidate.action.method === "next_round")?.requiresStrategic, false);
+
+  exact.jokers.cards[0].state.debuff = false;
+  const active = generateBalatrobotCandidates(exact, { limit: 30 });
+  assert.equal(active.some((candidate) => candidate.action.method === "buy"), true);
 });
 
 test("score telemetry includes known retriggers from Chad and Red Seal", () => {

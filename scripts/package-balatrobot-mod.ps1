@@ -16,7 +16,7 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
   $OutputDirectory = Join-Path $project "release"
 }
 $output = [System.IO.Path]::GetFullPath($OutputDirectory)
-$expectedFingerprint = "f5ffff76f5b0237e617a48e539ebb8cd4e007fa717cc0378987406559860964f"
+$expectedFingerprint = "b6da92128779742cd1a684c83b45027d603b3cf56be5d5a242c7269bb420c0d1"
 
 function Get-FileSha256 {
   param([Parameter(Mandatory = $true)][string]$LiteralPath)
@@ -72,7 +72,7 @@ BalatroBot v1.5.2
 Upstream: https://github.com/coder/balatrobot
 Commit: 9052d76f14723293f6c6b2cecaa791a5c4ae68f3
 Balatro Pilot runtime fingerprint: $expectedFingerprint
-Includes Balatro Pilot entropy, Endless, play settlement, cash-out safety, selected-card pack patches, Aura targeting, Boss reroll, and exact Buy & Use patches.
+Includes Balatro Pilot entropy, stable-menu start guard, button-independent hand actions, canonical cumulative-Stake and sticker state, Endless/play settlement, cash-out safety, selected-card pack patches, Aura targeting, Boss reroll, and exact Buy & Use patches.
 Lovely and Steamodded are prerequisites and are intentionally not bundled.
 "@
   [System.IO.File]::WriteAllText((Join-Path $target "BALATRO-PILOT-PROVENANCE.txt"), $provenance, [System.Text.UTF8Encoding]::new($false))

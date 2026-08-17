@@ -1,7 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 import { LearningDatabaseMetrics } from "./learning-metrics.mjs";
+
+const EVENT_READ_CHUNK_BYTES = 1024 * 1024;
 
 function number(value, fallback = 0) {
   const parsed = Number(value);
@@ -342,28 +345,40 @@ export class DashboardStats {
 
   readAppended(runId, file) {
     const stat = fs.statSync(file);
-    const cached = this.files.get(file) ?? { offset: 0, remainder: "" };
+    const cached = this.files.get(file) ?? {
+      offset: 0,
+      remainder: "",
+      decoder: new StringDecoder("utf8"),
+    };
     if (stat.size === cached.offset) return;
-    const length = stat.size - cached.offset;
+    const decoder = cached.decoder ?? new StringDecoder("utf8");
+    let offset = cached.offset;
+    let remainder = cached.remainder;
     const descriptor = fs.openSync(file, "r");
-    const buffer = Buffer.allocUnsafe(length);
+    const buffer = Buffer.allocUnsafe(Math.min(EVENT_READ_CHUNK_BYTES, stat.size - offset));
     try {
-      fs.readSync(descriptor, buffer, 0, length, cached.offset);
+      while (offset < stat.size) {
+        const requested = Math.min(buffer.length, stat.size - offset);
+        const bytesRead = fs.readSync(descriptor, buffer, 0, requested, offset);
+        if (bytesRead <= 0) break;
+        offset += bytesRead;
+
+        const source = remainder + decoder.write(buffer.subarray(0, bytesRead));
+        const lines = source.split(/\r?\n/);
+        remainder = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            this.ingest(runId, JSON.parse(line));
+          } catch {
+            this.malformedLines += 1;
+          }
+        }
+      }
     } finally {
       fs.closeSync(descriptor);
     }
-    const source = cached.remainder + buffer.toString("utf8");
-    const lines = source.split(/\r?\n/);
-    const remainder = lines.pop() ?? "";
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        this.ingest(runId, JSON.parse(line));
-      } catch {
-        this.malformedLines += 1;
-      }
-    }
-    this.files.set(file, { offset: stat.size, remainder });
+    this.files.set(file, { offset, remainder, decoder });
   }
 
   ingest(runId, event) {

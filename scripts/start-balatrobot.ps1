@@ -45,7 +45,12 @@ $BalatroBotUnsafeEndlessRuntimeFingerprint = "e2ab32128ec0fed5473e215df423265fac
 $BalatroBotPrePackRuntimeFingerprint = "a5b67a53b06fd4a949b3031d870bea87c6280b8bb7e13a1ad0b9d79e9145603d"
 $BalatroBotPreCapabilityRuntimeFingerprint = "d53fa2eb86813c48e33b9d2c9317f786ef24bef28c0c60e4b4a48bcfcb6441e2"
 $BalatroBotPreBuyUseRuntimeFingerprint = "7c780857ac7b7991479bc8942db17830a2b4c5ad4e9808718ac0f1dc17f00e7d"
-$BalatroBotRuntimeFingerprint = "f5ffff76f5b0237e617a48e539ebb8cd4e007fa717cc0378987406559860964f"
+$BalatroBotPreMenuGuardRuntimeFingerprint = "f5ffff76f5b0237e617a48e539ebb8cd4e007fa717cc0378987406559860964f"
+$BalatroBotOverstrictMenuGuardRuntimeFingerprint = "2ed8eb8bf7335f08579c11f56e35ca1cc51d2f2d548de60275386749f920b2d2"
+$BalatroBotPreHandActionsReadyRuntimeFingerprint = "8f84fc808d786c0be5e8be1c53b364fc569dbac18b57e6145f2f260abf08ca25"
+$BalatroBotOverstrictEventGuardRuntimeFingerprint = "16a24175f4e827e758875d94622a46a4a91074beacc37fff2f4463950b7b9943"
+$BalatroBotPreGoldRulesRuntimeFingerprint = "a8bc8486f0bd37ecddd6cb5cd42447a0d6bbb8d2ce7d75e95140fc38f0e0d48d"
+$BalatroBotRuntimeFingerprint = "b6da92128779742cd1a684c83b45027d603b3cf56be5d5a242c7269bb420c0d1"
 $MinimumUvVersion = [version]"0.9.21"
 $SmodsRuntimeVersion = "1.0.0~BETA-1814a-STEAMODDED"
 $PinnedUvExecutableSha256 = "68a22cbab1674647bcda32120b214e6480f875414e3333f49f87ae99b4b0e0fa"
@@ -385,9 +390,11 @@ function Add-BalatroBotEndlessPatch {
   $assetRoot = Join-Path $projectRoot "assets\balatrobot-v1.5.2"
   $endpointSource = Join-Path $assetRoot "endless.lua"
   $playSource = Join-Path $assetRoot "play.lua"
+  $discardSource = Join-Path $assetRoot "discard.lua"
   $cashOutSource = Join-Path $assetRoot "cash_out.lua"
   $packSource = Join-Path $assetRoot "pack.lua"
   $useSource = Join-Path $assetRoot "use.lua"
+  $startSource = Join-Path $assetRoot "start.lua"
   $bossRerollSource = Join-Path $assetRoot "reroll_boss.lua"
   $buyUseSource = Join-Path $assetRoot "buy_use.lua"
   $endlessMethodSource = Join-Path $assetRoot "openrpc-endless-method.json"
@@ -396,9 +403,11 @@ function Add-BalatroBotEndlessPatch {
   foreach ($asset in @(
     $endpointSource,
     $playSource,
+    $discardSource,
     $cashOutSource,
     $packSource,
     $useSource,
+    $startSource,
     $bossRerollSource,
     $buyUseSource,
     $endlessMethodSource,
@@ -420,9 +429,11 @@ function Add-BalatroBotEndlessPatch {
   }
 
   Copy-Item -LiteralPath $playSource -Destination (Join-Path $Root "src\lua\endpoints\play.lua") -Force -ErrorAction Stop
+  Copy-Item -LiteralPath $discardSource -Destination (Join-Path $Root "src\lua\endpoints\discard.lua") -Force -ErrorAction Stop
   Copy-Item -LiteralPath $cashOutSource -Destination (Join-Path $Root "src\lua\endpoints\cash_out.lua") -Force -ErrorAction Stop
   Copy-Item -LiteralPath $packSource -Destination (Join-Path $Root "src\lua\endpoints\pack.lua") -Force -ErrorAction Stop
   Copy-Item -LiteralPath $useSource -Destination (Join-Path $Root "src\lua\endpoints\use.lua") -Force -ErrorAction Stop
+  Copy-Item -LiteralPath $startSource -Destination (Join-Path $Root "src\lua\endpoints\start.lua") -Force -ErrorAction Stop
   Copy-Item -LiteralPath $bossRerollSource -Destination (Join-Path $Root "src\lua\endpoints\reroll_boss.lua") -Force -ErrorAction Stop
   Copy-Item -LiteralPath $buyUseSource -Destination (Join-Path $Root "src\lua\endpoints\buy_use.lua") -Force -ErrorAction Stop
 
@@ -560,7 +571,12 @@ if ($installedRuntimeFingerprint -eq $BalatroBotUpstreamRuntimeFingerprint -or
     $installedRuntimeFingerprint -eq $BalatroBotUnsafeEndlessRuntimeFingerprint -or
     $installedRuntimeFingerprint -eq $BalatroBotPrePackRuntimeFingerprint -or
     $installedRuntimeFingerprint -eq $BalatroBotPreCapabilityRuntimeFingerprint -or
-    $installedRuntimeFingerprint -eq $BalatroBotPreBuyUseRuntimeFingerprint) {
+    $installedRuntimeFingerprint -eq $BalatroBotPreBuyUseRuntimeFingerprint -or
+    $installedRuntimeFingerprint -eq $BalatroBotPreMenuGuardRuntimeFingerprint -or
+    $installedRuntimeFingerprint -eq $BalatroBotOverstrictMenuGuardRuntimeFingerprint -or
+    $installedRuntimeFingerprint -eq $BalatroBotPreHandActionsReadyRuntimeFingerprint -or
+    $installedRuntimeFingerprint -eq $BalatroBotOverstrictEventGuardRuntimeFingerprint -or
+    $installedRuntimeFingerprint -eq $BalatroBotPreGoldRulesRuntimeFingerprint) {
   if ($runningBalatroBeforePatch.Count -gt 0) {
     throw "Balatro is running with an older in-memory BalatroBot runtime. Close the game before applying the pinned Mod capability update, then launch it again with this script."
   }

@@ -9,6 +9,16 @@ This is trusted baseline game knowledge. Read all of it before choosing any acti
 - After winning, collect/cash out, use the shop, and advance. Remaining Hands normally pay money. Interest normally rewards retained money in $5 bands up to the current cap; visible deck, voucher, stake, challenge, or Blind effects may change this.
 - Hands, Discards, hand size, Joker slots, consumable slots, prices, rewards, and target scaling are resources, not constants. Read the visible counters and modifiers every round.
 
+## Stake rules in the installed 1.0.1o build
+
+- Stakes are cumulative. Gold applies every rule below it; it is not a single isolated modifier.
+- White is the baseline. Red removes the Small Blind's fixed $3 reward (remaining-Hand money, interest, and other income still work). Green raises the Blind scaling curve. Black allows Eternal Jokers. Blue removes one starting Discard. Purple raises the Blind scaling curve again. Orange allows Perishable Jokers. Gold allows Rental Jokers.
+- On Purple, Orange, and Gold, the Small Blind base targets by Ante 1 through 8 are 300, 1,000, 3,200, 9,000, 25,000, 60,000, 110,000, and 200,000. Big Blind is normally 1.5x; most Bosses are 2x, with visible exceptions. A deck such as Plasma can multiply this again. Prefer the exact runtime Blind target over memorized arithmetic.
+- Eternal means the Joker normally cannot be sold or destroyed and permanently consumes its slot. This makes a weak Eternal purchase much more expensive than its sticker price.
+- Perishable starts with 5 Blinds of life, loses one counter after each completed Blind, and becomes permanently debuffed when the counter reaches 0. It does not disappear and still occupies a slot; sell a non-Eternal expired or soon-expiring piece when its remaining contribution no longer justifies the slot.
+- Rental normally costs $1 to buy but charges exactly $3 after every completed Blind, even while debuffed. Multiple Rentals add. A Perishable+Rental continues charging after expiry until sold. Eternal+Rental is normally an irreversible $3-per-Blind liability and must be rejected unless it is the only clearly proven immediate survival line.
+- Price recurring Sticker liabilities over the expected holding horizon, not at the displayed purchase price. Before any buy, pack, or reroll, reserve the next two Rental payments and show the resulting cash/debt explicitly. Do not describe a Rental as cheap merely because it costs $1.
+
 ## Selecting, playing, and discarding cards
 
 - A normal Play Hand or Discard selection contains **1 through 5 cards**. Five is the maximum, not a requirement. The Psychic Boss Blind is a notable rule that requires exactly 5 played cards; obey the visible Boss text.
@@ -51,13 +61,14 @@ This is trusted baseline game knowledge. Read all of it before choosing any acti
 ## Jokers, consumables, packs, and order
 
 - Joker text is authoritative and conditional. Evaluate the whole owned lineup as a build: flat Chips, +Mult, scaling, XMult, economy, hand-shaping, retriggers, and destructive or probabilistic effects. A Joker slot has opportunity cost.
-- Joker editions and stickers matter. Eternal cannot be sold or destroyed; Perishable becomes debuffed after its counter; Rental charges its visible recurring cost. Other visible modifiers must be honored literally.
+- Joker editions and stickers matter. Apply the exact Stake rules above rather than treating stickers as generic prose; other visible modifiers must be honored literally.
 - Tarot cards modify cards or economy; Planet cards level poker hands; Spectral cards give strong deck/Joker changes with stated costs; playing cards add to the deck. Use consumables only when their target requirements and resulting slots are clear.
 - In a pack, inspect all visible choices, the number of picks, and Skip. Choose the option with the best build/economy value, then stop for a fresh screenshot after the layout changes.
 
 ## Shop and economy
 
 - In shops, compare purchase benefit, sale value, reroll cost, current cash, interest threshold, future Blind survival, and free slots. Do not buy an item merely because it is affordable.
+- Treat the runtime `stickerEconomy` and `stakeRules` values as binding. Include Rental upkeep, remaining Perishable life, Eternal locked-slot cost, and negative cash in every shop comparison. A clean Joker, Rental copy, Perishable copy, and Eternal copy are different offers with different expected values.
 - Buy & Use is legal only when that exact control is visibly present. A full consumable area does not create the control. In particular, a targeted Tarot such as The Hierophant cannot be bought into full slots when the shop shows only Buy; do not click an imagined Buy & Use location. Skip it, legally use/sell an owned consumable through a visible control, or advance the round.
 - Treat idle cash as an opportunity cost, not an objective. When scoring is weak or the next Blind is not reliably covered, prioritize affordable Jokers and other durable upgrades over preserving an interest band. An empty Joker slot alone is not a reason to buy: if survival is already reliable, skip a weak non-scaling placeholder and preserve cash, interest, and slot flexibility for a stronger offer. Buy useful early bridges only when their survival/economy value exceeds that opportunity cost, then replace weak pieces as the build becomes clearer.
 - Inspect every visible offer before leaving. If one or more purchases materially improve scoring, scaling, economy, deck quality, or survival, spend proactively in best-value order; leave money unspent only when the available upgrades are genuinely weak, harmful, unaffordable, or saving it has greater expected run value.

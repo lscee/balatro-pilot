@@ -532,7 +532,13 @@ function kimiBalatrobotJsonInstruction() {
   ].join(" ");
 }
 
-function compactPlanningCards(area) {
+function nullableFinite(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function compactPlanningCards(area, { rentalRate = null, perishableRounds = null } = {}) {
   return (Array.isArray(area?.cards) ? area.cards : []).map((card) => ({
     key: String(card?.key ?? ""),
     set: String(card?.set ?? ""),
@@ -542,8 +548,15 @@ function compactPlanningCards(area) {
     sell: Number.isFinite(Number(card?.sell)) ? Number(card.sell) : null,
     edition: card?.edition ?? null,
     eternal: Boolean(card?.eternal),
+    isPerishable: Boolean(card?.isPerishable) || card?.perishable !== null && card?.perishable !== undefined,
     perishable: card?.perishable ?? null,
+    perishableTally: nullableFinite(card?.perishableTally ?? card?.perishable),
+    perishableRounds: nullableFinite(card?.perishableRounds) ??
+      (Boolean(card?.isPerishable) || card?.perishable !== null && card?.perishable !== undefined
+        ? nullableFinite(perishableRounds)
+        : null),
     rental: Boolean(card?.rental),
+    rentalRate: nullableFinite(card?.rentalRate) ?? (card?.rental ? nullableFinite(rentalRate) : null),
   }));
 }
 
@@ -553,8 +566,8 @@ export function balatrobotBuildPlanningContext(gameState) {
   const jokerCount = Number(gameState?.jokers?.count);
   const jokerLimit = Number(gameState?.jokers?.limit);
   const phase = Number.isFinite(ante) ? (ante <= 2 ? "early" : ante <= 5 ? "mid" : "late") : "unknown";
-  const finiteMoney = Number.isFinite(money) ? Math.max(0, money) : null;
-  const defaultInterestBands = finiteMoney == null ? null : Math.min(5, Math.floor(finiteMoney / 5));
+  const finiteMoney = Number.isFinite(money) ? money : null;
+  const defaultInterestBands = finiteMoney == null ? null : Math.max(0, Math.min(5, Math.floor(finiteMoney / 5)));
   const freeJokerSlots = Number.isFinite(jokerCount) && Number.isFinite(jokerLimit)
     ? Math.max(0, jokerLimit - jokerCount)
     : null;
@@ -571,6 +584,13 @@ export function balatrobotBuildPlanningContext(gameState) {
   const shopReroll = gameState?.shopReroll && typeof gameState.shopReroll === "object"
     ? gameState.shopReroll
     : null;
+  const rawStakeRules = gameState?.stakeRules ?? gameState?.stake_rules;
+  const stakeRules = rawStakeRules && typeof rawStakeRules === "object"
+    ? rawStakeRules
+    : null;
+  const stickerEconomy = gameState?.stickerEconomy && typeof gameState.stickerEconomy === "object"
+    ? gameState.stickerEconomy
+    : null;
   return {
     installedVersion: "1.0.1o",
     phase,
@@ -578,10 +598,12 @@ export function balatrobotBuildPlanningContext(gameState) {
     defaultInterestBands,
     defaultInterestReserve: shopReroll?.reserve ?? 25,
     shopReroll,
+    stakeRules,
+    stickerEconomy,
     highScoreTraining: gameState?.highScoreTraining ?? null,
     freeJokerSlots,
-    ownedJokers: compactPlanningCards(gameState?.jokers),
-    offeredJokers: compactPlanningCards(gameState?.shop).filter((card) => /^JOKER$/i.test(card.set)),
+    ownedJokers: compactPlanningCards(gameState?.jokers, stakeRules ?? {}),
+    offeredJokers: compactPlanningCards(gameState?.shop, stakeRules ?? {}).filter((card) => /^JOKER$/i.test(card.set)),
     activeDeck: activeDeck
       ? { code: activeDeck.code, label: activeDeck.label, effect: activeDeck.effect }
       : { code: activeDeckCode, label: activeDeckCode, effect: "" },
@@ -622,7 +644,7 @@ export function balatrobotBuildPlanningContext(gameState) {
       vouchers: (appeared.vouchers ?? []).map((card) => ({ key: card.key, label: card.label, sources: card.sources })),
     },
     decisionRequired:
-      "use active deck, activeUnlockTarget, and exact score-pressure budget; win the selected deck/stake run; locked-Joker conditions are optional only when already reachable without reducing survival; keep build composition flexible; buildGoal/synergies use only owned or appeared cards; unlocked unseen cards are optional shop/pivot targets; compare keep_current_build vs temporary_bridge vs pivot",
+      "use active deck, activeUnlockTarget, exact cumulative Stake rules, recurring Sticker liabilities, and score-pressure budget; on Gold, price Rental at its full per-Blind upkeep, discount Perishable by remaining Blinds, treat Eternal as locked slot capacity, and normally reject Eternal+Rental; win the selected deck/stake run; locked-Joker conditions are optional only when already reachable without reducing survival; keep build composition flexible; buildGoal/synergies use only owned or appeared cards; unlocked unseen cards are optional shop/pivot targets; compare keep_current_build vs temporary_bridge vs pivot",
   };
 }
 

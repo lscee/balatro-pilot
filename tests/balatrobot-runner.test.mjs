@@ -2,7 +2,37 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { BalatrobotRpcError, BalatrobotTimeoutError } from "../src/balatrobot-client.mjs";
-import { latchBalatrobotMouthLock, runBalatrobot, strategicCheckpointScope } from "../src/balatrobot-runner.mjs";
+import { balatrobotStateFingerprint } from "../src/balatrobot-policy.mjs";
+import {
+  applyStrategicCheckpoint,
+  confirmBalatrobotMenuStartReady,
+  latchBalatrobotMouthLock,
+  runBalatrobot,
+  strategicCheckpointScope,
+} from "../src/balatrobot-runner.mjs";
+
+test("a persisted same-seed checkpoint cannot suppress a fresh held-consumable review", () => {
+  const state = { state: "SELECTING_HAND", seed: "REPEATED-SEED", ante_num: 3, round_num: 7 };
+  const thinking = {
+    strategic: true,
+    effort: "high",
+    reason: "aged consumable review",
+    ignorePersistedCheckpoint: true,
+  };
+  const scope = strategicCheckpointScope(state, thinking);
+  const persisted = { has() { return true; } };
+  const first = applyStrategicCheckpoint(state, thinking, new Set(), {
+    balatrobotRoutineReasoningEffort: "none",
+  }, persisted);
+  assert.equal(first.strategic, true);
+  assert.equal(first.checkpointScope, scope);
+
+  const alreadyReviewedHere = applyStrategicCheckpoint(state, thinking, new Set([scope]), {
+    balatrobotRoutineReasoningEffort: "none",
+  }, persisted);
+  assert.equal(alreadyReviewedHere.strategic, false);
+  assert.equal(alreadyReviewedHere.reusedCheckpoint, true);
+});
 
 test("runner latches The Mouth's first unique hand even after another counter grows larger", () => {
   const cache = { blindKey: null, handType: null };
@@ -116,12 +146,13 @@ function blindSelectState() {
 }
 
 test("runner starts only an unlocked deck chosen from adaptive performance", async () => {
-  const initial = { state: "MENU" };
+  const initial = { state: "MENU", menu_ready: true };
   const after = { ...blindSelectState(), deck: "BLUE", stake: "WHITE", seed: "deck-test" };
   const calls = [];
+  let gamestateReads = 0;
   const client = {
     baseUrl: config.balatrobotUrl,
-    async gamestate() { return initial; },
+    async gamestate() { gamestateReads += 1; return initial; },
     async call(method, params) { calls.push({ method, params }); return after; },
   };
   const planner = { async planState() { throw new Error("menu must not call a model"); } };
@@ -161,11 +192,61 @@ test("runner starts only an unlocked deck chosen from adaptive performance", asy
     log,
   });
   assert.deepEqual(calls, [{ method: "start", params: { deck: "BLUE", stake: "WHITE" } }]);
+  assert.equal(gamestateReads, 3, "initial menu read plus two fresh pre-start confirmations");
+  assert.ok(log.events.some((event) => event.type === "bot_menu_start_guard" && event.ready === true));
   assert.ok(log.events.some((event) => event.type === "bot_deck_selected" && event.selection.deck === "BLUE"));
 });
 
+test("menu start confirmation rejects a readiness loss without sending an action", async () => {
+  const states = [
+    { state: "MENU", menu_ready: true },
+    { state: "MENU", menu_ready: false },
+  ];
+  let reads = 0;
+  const result = await confirmBalatrobotMenuStartReady({
+    client: { async gamestate() { return states[reads++]; } },
+    expectedState: states[0],
+    delayMs: 0,
+  });
+  assert.equal(reads, 2);
+  assert.equal(result.ready, false);
+  assert.equal(result.reason, "menu-not-ready");
+  assert.equal(result.state.menu_ready, false);
+});
+
+test("runner polls an unready menu and sends start only after two fresh ready states", async () => {
+  const menuStates = [
+    { state: "MENU", menu_ready: false },
+    { state: "MENU", menu_ready: true },
+    { state: "MENU", menu_ready: true },
+    { state: "MENU", menu_ready: true },
+  ];
+  let reads = 0;
+  const calls = [];
+  const log = fakeLog();
+  await runBalatrobot({
+    projectRoot: ".",
+    config: { ...config, balatrobotTransitionTimeoutMs: 1_000 },
+    client: {
+      baseUrl: config.balatrobotUrl,
+      async gamestate() { return menuStates[Math.min(reads++, menuStates.length - 1)]; },
+      async call(method, params) {
+        calls.push({ method, params });
+        return { ...blindSelectState(), deck: "RED", stake: "WHITE", seed: "ready-menu" };
+      },
+    },
+    planner: { async planState() { throw new Error("menu must not call a model"); } },
+    experienceStore: { enabled: false, deckPerformance() { return []; } },
+    maxSteps: 1,
+    log,
+  });
+  assert.equal(reads, 4);
+  assert.deepEqual(calls, [{ method: "start", params: { deck: "RED", stake: "WHITE" } }]);
+  assert.ok(log.events.some((event) => event.type === "bot_transition_wait" && event.state === "MENU"));
+});
+
 test("runner sends the unlock selector's legal Stake and preserves its target after profile refresh", async () => {
-  const initial = { state: "MENU" };
+  const initial = { state: "MENU", menu_ready: true };
   const after = { ...blindSelectState(), deck: "YELLOW", stake: "RED", seed: "unlock-stake-test" };
   const afterSelect = { ...handState(), deck: "YELLOW", stake: "RED", seed: "unlock-stake-test" };
   const calls = [];
@@ -230,7 +311,7 @@ test("runner sends the unlock selector's legal Stake and preserves its target af
 });
 
 test("runner stops when start returns a different deck or Stake", async () => {
-  const initial = { state: "MENU" };
+  const initial = { state: "MENU", menu_ready: true };
   const client = {
     baseUrl: config.balatrobotUrl,
     async gamestate() { return initial; },
@@ -356,6 +437,208 @@ test("runner executes one validated exact-state model action", async () => {
   assert.ok(log.events.some((event) => event.type === "rpc_result"));
 });
 
+test("runner polls an unready hand without planning or sending an RPC", async () => {
+  const unready = { ...handState(), hand_actions_ready: false };
+  const ready = { ...structuredClone(unready), hand_actions_ready: true };
+  const after = { ...ready, state: "ROUND_EVAL", round: { ...ready.round, chips: 120 } };
+  let reads = 0;
+  let plannerCalls = 0;
+  const calls = [];
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() {
+      reads += 1;
+      return reads === 1 ? unready : ready;
+    },
+    async call(method, params) {
+      calls.push({ method, params });
+      return after;
+    },
+  };
+  const planner = {
+    async planState() {
+      plannerCalls += 1;
+      return modelPlan(semanticAction("play", { cards: [0, 1] }));
+    },
+  };
+  const log = fakeLog();
+
+  const result = await runBalatrobot({ projectRoot: ".", config, client, planner, maxSteps: 1, log });
+
+  assert.equal(result.state.state, "ROUND_EVAL");
+  assert.equal(plannerCalls, 1);
+  assert.deepEqual(calls, [{ method: "play", params: { cards: [0, 1] } }]);
+  assert.ok(log.events.some((event) => event.type === "bot_hand_actions_wait"));
+  assert.ok(log.events.some((event) => event.type === "bot_hand_actions_ready" && event.readiness === true));
+});
+
+test("runner waits for the next hand readiness after a successful play", async () => {
+  const initial = { ...handState(), hand_actions_ready: true };
+  const nextUnready = {
+    ...structuredClone(initial),
+    hand_actions_ready: false,
+    round: { ...initial.round, chips: 80, hands_left: 3, hands_played: 1 },
+  };
+  const nextReady = { ...structuredClone(nextUnready), hand_actions_ready: true };
+  const after = { ...nextReady, state: "ROUND_EVAL", round: { ...nextReady.round, chips: 160, hands_left: 2, hands_played: 2 } };
+  let current = initial;
+  let plannerCalls = 0;
+  const calls = [];
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() {
+      if (current === nextUnready) current = nextReady;
+      return current;
+    },
+    async call(method, params) {
+      calls.push({ method, params });
+      current = calls.length === 1 ? nextUnready : after;
+      return current;
+    },
+  };
+  const planner = {
+    async planState() {
+      plannerCalls += 1;
+      return modelPlan(semanticAction("play", { cards: [0, 1] }));
+    },
+  };
+  const log = fakeLog();
+
+  const result = await runBalatrobot({ projectRoot: ".", config, client, planner, maxSteps: 2, log });
+
+  assert.equal(result.state.state, "ROUND_EVAL");
+  assert.equal(plannerCalls, 2, "the transitional frame must not invoke the planner");
+  assert.deepEqual(calls, [
+    { method: "play", params: { cards: [0, 1] } },
+    { method: "play", params: { cards: [0, 1] } },
+  ]);
+  assert.equal(log.events.filter((event) => event.type === "bot_hand_actions_wait").length, 1);
+});
+
+test("runner quarantines a buttons-nil play rejection until a fresh ready hand", async () => {
+  const initial = { ...handState(), hand_actions_ready: true };
+  const blocked = { ...structuredClone(initial), hand_actions_ready: false };
+  for (const index of [0, 1]) blocked.hand.cards[index].state.highlight = true;
+  const ready = { ...structuredClone(blocked), hand_actions_ready: true };
+  const after = { ...ready, state: "ROUND_EVAL", round: { ...ready.round, chips: 120 } };
+  let current = initial;
+  let blockedReads = 0;
+  let plannerCalls = 0;
+  const calls = [];
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() {
+      if (current === blocked) {
+        blockedReads += 1;
+        if (blockedReads >= 2) current = ready;
+      }
+      return current;
+    },
+    async call(method, params) {
+      calls.push({ method, params });
+      if (calls.length === 1) {
+        current = blocked;
+        throw new BalatrobotRpcError(
+          "BalatroBot RPC play failed: play.lua:68: attempt to index field 'buttons' (a nil value)",
+          { code: -32000, method: "play", requestId: 1 },
+        );
+      }
+      current = after;
+      return current;
+    },
+  };
+  const planner = {
+    async planState() {
+      plannerCalls += 1;
+      return modelPlan(semanticAction("play", { cards: [0, 1] }));
+    },
+  };
+  const log = fakeLog();
+
+  const result = await runBalatrobot({ projectRoot: ".", config, client, planner, maxSteps: 1, log });
+
+  assert.equal(result.state.state, "ROUND_EVAL");
+  assert.equal(plannerCalls, 2);
+  assert.equal(calls.length, 2, "only one fresh-ready reconsideration may follow the rejected pre-submit call");
+  assert.equal(log.events.filter((event) => event.type === "rpc_hand_actions_not_ready").length, 1);
+  assert.equal(log.events.filter((event) => event.type === "rpc_rejected").length, 0);
+  assert.ok(log.events.some((event) => event.type === "bot_hand_actions_wait"));
+});
+
+test("runner does not misclassify unrelated play or discard RPC errors as readiness", async () => {
+  const cases = [
+    {
+      method: "play",
+      params: { cards: [0, 1] },
+      message: "BalatroBot RPC play failed: native submission outcome is uncertain",
+      code: -32000,
+    },
+    {
+      method: "discard",
+      params: { cards: [2] },
+      message: "BalatroBot RPC discard failed: exact-selection failure",
+      code: -32003,
+    },
+  ];
+
+  for (const item of cases) {
+    const initial = { ...handState(), hand_actions_ready: true };
+    const calls = [];
+    const log = fakeLog();
+    const client = {
+      baseUrl: config.balatrobotUrl,
+      async gamestate() { return initial; },
+      async call(method, params) {
+        calls.push({ method, params });
+        throw new BalatrobotRpcError(item.message, {
+          code: item.code,
+          method: item.method,
+          requestId: calls.length,
+        });
+      },
+    };
+    const planner = {
+      async planState() { return modelPlan(semanticAction(item.method, item.params)); },
+    };
+
+    await runBalatrobot({ projectRoot: ".", config, client, planner, maxSteps: 1, log });
+
+    assert.deepEqual(calls, [{ method: item.method, params: item.params }]);
+    assert.equal(log.events.filter((event) => event.type === "rpc_rejected").length, 1);
+    assert.equal(log.events.filter((event) => event.type === "rpc_hand_actions_not_ready").length, 0);
+  }
+});
+
+test("runner still safe-stops after three ordinary unchanged play rejections", async () => {
+  const initial = { ...handState(), hand_actions_ready: true };
+  let playCalls = 0;
+  const log = fakeLog();
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() { return initial; },
+    async call(method) {
+      if (method === "screenshot") return { path: "failure.png" };
+      playCalls += 1;
+      throw new BalatrobotRpcError(
+        "BalatroBot RPC play failed: native submission outcome is uncertain",
+        { code: -32000, method: "play", requestId: playCalls },
+      );
+    },
+  };
+  const planner = {
+    async planState() { return modelPlan(semanticAction("play", { cards: [0, 1] })); },
+  };
+
+  await assert.rejects(
+    runBalatrobot({ projectRoot: ".", config, client, planner, maxSteps: 10, log }),
+    /stopping instead of replaying the same RPC indefinitely/,
+  );
+
+  assert.equal(playCalls, 3);
+  assert.equal(log.events.filter((event) => event.type === "rpc_rejected").length, 3);
+  assert.equal(log.events.filter((event) => event.type === "rpc_hand_actions_not_ready").length, 0);
+});
+
 test("runner handles round navigation locally without spending model tokens", async () => {
   const initial = { ...handState(), state: "ROUND_EVAL" };
   const after = { ...initial, state: "SHOP" };
@@ -371,6 +654,71 @@ test("runner handles round navigation locally without spending model tokens", as
   assert.deepEqual(calls, [{ method: "cash_out", params: {} }]);
   assert.equal(planned, false);
   assert.equal(result.usage.apiCalls, 0);
+});
+
+test("runner waits with backoff for a ROUND_EVAL modal to close before retrying cash-out", async () => {
+  const initial = { ...handState(), state: "ROUND_EVAL" };
+  const shop = { ...initial, state: "SHOP" };
+  let cashOutCalls = 0;
+  let gamestateReads = 0;
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() { gamestateReads += 1; return initial; },
+    async call(method) {
+      assert.equal(method, "cash_out");
+      cashOutCalls += 1;
+      if (cashOutCalls <= 2) {
+        throw new BalatrobotRpcError(
+          "BalatroBot RPC cash_out failed: cash_out() cannot run while a modal overlay is open or the game is paused",
+          { code: -32003, method, requestId: cashOutCalls },
+        );
+      }
+      return shop;
+    },
+  };
+  const planner = { async planState() { throw new Error("round navigation must stay local"); } };
+  const log = fakeLog();
+
+  const result = await runBalatrobot({ projectRoot: ".", config, client, planner, maxSteps: 1, log });
+
+  assert.equal(result.state.state, "SHOP");
+  assert.equal(cashOutCalls, 3);
+  assert.equal(gamestateReads, 3, "initial read plus one fresh read after each modal rejection");
+  assert.deepEqual(
+    log.events.filter((event) => event.type === "bot_cash_out_modal_wait").map((event) => [event.attempt, event.delayMs]),
+    [[1, 100], [2, 200]],
+  );
+  assert.equal(log.events.filter((event) => event.type === "rpc_rejected").length, 0);
+  assert.equal(log.events.filter((event) => event.type === "bot_failure_screenshot").length, 0);
+});
+
+test("runner replans instead of retrying cash-out when the state changes behind a modal", async () => {
+  const initial = { ...handState(), state: "ROUND_EVAL" };
+  const changed = { ...initial, state: "SHOP", money: initial.money + 3 };
+  let current = initial;
+  let cashOutCalls = 0;
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() { return current; },
+    async call(method) {
+      assert.equal(method, "cash_out");
+      cashOutCalls += 1;
+      current = changed;
+      throw new BalatrobotRpcError(
+        "BalatroBot RPC cash_out failed: cash_out() cannot run while a modal overlay is open or the game is paused",
+        { code: -32003, method, requestId: cashOutCalls },
+      );
+    },
+  };
+  const planner = { async planState() { throw new Error("round navigation must stay local"); } };
+  const log = fakeLog();
+
+  const result = await runBalatrobot({ projectRoot: ".", config, client, planner, maxSteps: 1, log });
+
+  assert.equal(cashOutCalls, 1);
+  assert.deepEqual(result.state, changed);
+  assert.ok(log.events.some((event) => event.type === "bot_cash_out_modal_poll" && event.changed === true));
+  assert.equal(log.events.filter((event) => event.type === "rpc_rejected").length, 0);
 });
 
 test("runner records the winning play, finalizes it, and only then returns the win overlay to the menu", async () => {
@@ -904,6 +1252,340 @@ test("runner escalates a routine shop purchase to the strategic planner", async 
   assert.ok(log.events.some((event) => event.type === "bot_planner_route" && event.route === "strategic-approval"));
 });
 
+test("runner compiles a ranked Joker sale with the exact owned identity before strategic approval", async () => {
+  const owned = [
+    ["j_joker", "Joker", "+4 Mult"],
+    ["j_jolly", "Jolly Joker", "+8 Mult"],
+    ["j_zany", "Zany Joker", "+12 Mult"],
+    ["j_mad", "Mad Joker", "+10 Mult"],
+    ["j_burglar", "Burglar", "+3 Hands, lose all discards"],
+  ].map(([key, label, effect], index) => ({
+    id: `owned-${index}`,
+    key,
+    set: "JOKER",
+    label,
+    value: { effect },
+    modifier: index < 4 ? { eternal: true } : {},
+    state: {},
+    cost: { buy: 0, sell: 1 },
+  }));
+  const replacement = {
+    id: "offer-cavendish-ranked",
+    key: "j_cavendish",
+    set: "JOKER",
+    label: "Cavendish",
+    value: { effect: "X3 Mult" },
+    modifier: {},
+    state: {},
+    cost: { buy: 4, sell: 2 },
+  };
+  const initial = {
+    state: "SHOP",
+    seed: "SHOP-RANKED-BURGLAR",
+    ante_num: 5,
+    round_num: 13,
+    money: 4,
+    round: { chips: 0, hands_left: 4, discards_left: 3, reroll_cost: 5 },
+    blinds: { big: { type: "BIG", status: "UPCOMING", name: "Big Blind", score: 40_000 } },
+    hand: { count: 0, limit: 8, cards: [] },
+    cards: { count: 52, limit: 52, cards: [] },
+    jokers: { count: 5, limit: 5, cards: owned },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { count: 1, limit: 2, cards: [replacement] },
+    vouchers: { count: 0, limit: 1, cards: [] },
+    packs: { count: 0, limit: 2, cards: [] },
+  };
+  const after = {
+    ...initial,
+    money: 5,
+    jokers: { count: 4, limit: 5, cards: owned.slice(0, 4) },
+  };
+  let strategicPlans = 0;
+  const calls = [];
+  const log = fakeLog();
+  await runBalatrobot({
+    projectRoot: ".",
+    config: { ...config, balatrobotStrategicThinkingEnabled: true, balatrobotStrategicReasoningEffort: "high" },
+    client: {
+      baseUrl: config.balatrobotUrl,
+      async gamestate() { return initial; },
+      async call(method, params) { calls.push({ method, params }); return after; },
+    },
+    planner: {
+      config: { provider: "deepseek-chat", model: "deepseek-v4-flash" },
+      async rankCandidate() {
+        return { candidateId: "sell:joker:4", reason: "replace Burglar", usage: { apiCalls: 1, totalTokens: 5 } };
+      },
+      async planState() { throw new Error("routine full action planning must not run"); },
+    },
+    strategicPlanner: {
+      config: { provider: "kimi-chat", model: "k3-256k" },
+      async planState() {
+        strategicPlans += 1;
+        return modelPlan({
+          ...semanticAction("sell", { joker: 4 }),
+          reason: "Sell exact owned Burglar for the verified Cavendish replacement",
+        });
+      },
+    },
+    strategicCheckpointStore: { has() { return true; }, runPlan() { return null; }, mark() {} },
+    maxSteps: 1,
+    log,
+  });
+
+  assert.equal(strategicPlans, 1);
+  assert.deepEqual(calls, [{ method: "sell", params: { joker: 4 } }]);
+  assert.ok(log.events.some((event) => event.type === "bot_candidate_ranked" && event.candidateId === "sell:joker:4"));
+  assert.ok(log.events.some((event) => event.type === "bot_candidate_escalated" && event.candidateId === "sell:joker:4"));
+});
+
+test("runner circuit-breaks the second same-shop candidate-ranker contract failure with one exact safe exit", async () => {
+  const initial = {
+    state: "SHOP",
+    seed: "SHOP-RANK-CONTRACT",
+    ante_num: 3,
+    round_num: 7,
+    money: 1,
+    round: { chips: 0, hands_left: 4, discards_left: 3, reroll_cost: 5 },
+    blinds: { big: { type: "BIG", status: "UPCOMING", name: "Big Blind", score: 4_500 } },
+    hand: { count: 0, limit: 8, cards: [] },
+    cards: { count: 52, limit: 52, cards: [] },
+    jokers: { count: 0, limit: 5, cards: [] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { count: 0, limit: 2, cards: [] },
+    vouchers: { count: 1, limit: 1, cards: [{ key: "v_overstock_norm", set: "VOUCHER", label: "Overstock", value: { effect: "+1 shop slot" }, modifier: {}, state: {}, cost: { buy: 1 } }] },
+    packs: { count: 0, limit: 2, cards: [] },
+  };
+  const after = { ...initial, state: "BLIND_SELECT" };
+  let rankCalls = 0;
+  const gameplayCallRankCounts = [];
+  const calls = [];
+  const log = fakeLog();
+  await runBalatrobot({
+    projectRoot: ".",
+    config: { ...config, balatrobotStrategicThinkingEnabled: true },
+    client: {
+      baseUrl: config.balatrobotUrl,
+      async gamestate() { return initial; },
+      async call(method, params) {
+        gameplayCallRankCounts.push(rankCalls);
+        calls.push({ method, params });
+        return after;
+      },
+    },
+    planner: {
+      config: { provider: "deepseek-chat", model: "deepseek-v4-flash" },
+      async rankCandidate() {
+        rankCalls += 1;
+        const error = new Error("candidate ranker returned an unlisted id");
+        error.code = "CANDIDATE_RANK_INVALID";
+        throw error;
+      },
+      async planState() { throw new Error("candidate-rank path must remain compact"); },
+    },
+    strategicCheckpointStore: { has() { return true; }, runPlan() { return null; }, mark() {} },
+    maxSteps: 2,
+    log,
+  });
+
+  assert.equal(rankCalls, 2);
+  assert.deepEqual(gameplayCallRankCounts, [2], "the first contract failure must send no gameplay RPC");
+  assert.deepEqual(calls, [{ method: "next_round", params: {} }]);
+  assert.deepEqual(
+    log.events.filter((event) => event.type === "bot_shop_validation_failure").map((event) => event.failures),
+    [1, 2],
+  );
+  assert.ok(log.events.some((event) =>
+    event.type === "bot_shop_validation_circuit_breaker" && event.candidateId === "next_round:shop"));
+  assert.equal(log.events.find((event) => event.type === "plan").source, "balatrobot_shop_validation_circuit_breaker");
+});
+
+test("runner aggregates alternating same-shop RPC rejections and exits once without returning to the rejected action", async () => {
+  const joker = (key, label, effect) => ({
+    key,
+    set: "JOKER",
+    label,
+    value: {},
+    effect,
+    modifier: {},
+    state: {},
+    cost: { buy: 0, sell: 1 },
+  });
+  const shopState = (effects) => ({
+    state: "SHOP",
+    seed: "SHOP-RPC-ALTERNATING",
+    ante_num: 3,
+    round_num: 7,
+    money: 0,
+    round: { chips: 0, hands_left: 4, discards_left: 3, reroll_cost: 5 },
+    blinds: { big: { type: "BIG", status: "UPCOMING", name: "Big Blind", score: 4_500 } },
+    hand: { count: 0, limit: 8, cards: [] },
+    cards: { count: 52, limit: 52, cards: [] },
+    jokers: {
+      count: 3,
+      limit: 5,
+      cards: [
+        joker("j_mod_alpha", "Alpha", effects[0]),
+        joker("j_mod_beta", "Beta", effects[1]),
+        joker("j_mod_gamma", "Gamma", effects[2]),
+      ],
+    },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: { count: 0, limit: 2, cards: [] },
+    vouchers: { count: 0, limit: 1, cards: [] },
+    packs: { count: 0, limit: 2, cards: [] },
+  });
+  // These snapshots preserve the exact compact fingerprint (one +Mult, one
+  // neutral, and one XMult Joker) while exposing A, B, then no deterministic
+  // rearrangement. This reproduces an unchanged SHOP rejecting A, A, B.
+  const actionAState = shopState(["X2 Mult", "+4 Mult", "utility"]);
+  const actionBState = shopState(["utility", "X2 Mult", "+4 Mult"]);
+  const neutralState = shopState(["+4 Mult", "utility", "X2 Mult"]);
+  assert.equal(balatrobotStateFingerprint(actionAState), balatrobotStateFingerprint(actionBState));
+  assert.equal(balatrobotStateFingerprint(actionAState), balatrobotStateFingerprint(neutralState));
+
+  const after = { ...neutralState, state: "BLIND_SELECT" };
+  let rpcRejections = 0;
+  let exited = false;
+  const calls = [];
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() {
+      if (exited) return after;
+      if (rpcRejections < 2) return actionAState;
+      if (rpcRejections < 3) return actionBState;
+      return neutralState;
+    },
+    async call(method, params) {
+      calls.push({ method, params });
+      if (method === "next_round") {
+        exited = true;
+        return after;
+      }
+      rpcRejections += 1;
+      throw new BalatrobotRpcError(
+        `BalatroBot RPC ${method} failed: simulated unchanged-shop rejection`,
+        { code: -32003, method, requestId: rpcRejections },
+      );
+    },
+  };
+  const log = fakeLog();
+  const result = await runBalatrobot({
+    projectRoot: ".",
+    config: { ...config, balatrobotStrategicThinkingEnabled: true },
+    client,
+    planner: { async planState() { throw new Error("the rejection breaker must remain local"); } },
+    strategicPlanner: { async planState() { throw new Error("the rejection breaker must remain local"); } },
+    maxSteps: 4,
+    log,
+  });
+
+  assert.equal(result.state.state, "BLIND_SELECT");
+  assert.deepEqual(calls, [
+    { method: "rearrange", params: { jokers: [1, 2, 0] } },
+    { method: "rearrange", params: { jokers: [1, 2, 0] } },
+    { method: "rearrange", params: { jokers: [2, 0, 1] } },
+    { method: "next_round", params: {} },
+  ]);
+  assert.deepEqual(
+    log.events.filter((event) => event.type === "rpc_rejected").map((event) => event.stateRepeated),
+    [1, 2, 3],
+  );
+  assert.equal(log.events.filter((event) => event.type === "bot_shop_rpc_rejection_circuit_breaker").length, 1);
+  assert.equal(log.events.filter((event) => event.type === "plan").at(-1).source, "balatrobot_shop_rpc_rejection_circuit_breaker");
+});
+
+test("runner routes three identical same-shop RPC rejections through one exact safe exit without a restart", async () => {
+  const initial = {
+    state: "SHOP",
+    seed: "SHOP-RPC-IDENTICAL",
+    ante_num: 7,
+    round_num: 20,
+    money: 10,
+    round: { chips: 0, hands_left: 4, discards_left: 3, reroll_cost: 5 },
+    blinds: { big: { type: "BIG", status: "UPCOMING", name: "Big Blind", score: 1_000_000 } },
+    hands: { "High Card": { chips: 5, mult: 1, played: 1 } },
+    hand: { count: 0, limit: 8, cards: [] },
+    cards: { count: 52, limit: 52, cards: [] },
+    jokers: { count: 0, limit: 5, cards: [] },
+    consumables: { count: 0, limit: 2, cards: [] },
+    shop: {
+      count: 1,
+      limit: 2,
+      cards: [{
+        key: "j_splash",
+        set: "JOKER",
+        label: "Splash",
+        value: { effect: "Every played card counts in scoring" },
+        modifier: {},
+        state: {},
+        cost: { buy: 3, sell: 1 },
+      }],
+    },
+    vouchers: { count: 0, limit: 1, cards: [] },
+    packs: { count: 0, limit: 2, cards: [] },
+  };
+  const after = { ...initial, state: "BLIND_SELECT" };
+  let exited = false;
+  let plannerCalls = 0;
+  const calls = [];
+  const planner = {
+    config: { provider: "kimi-chat", model: "k3-256k" },
+    async planState() {
+      plannerCalls += 1;
+      return modelPlan({
+        ...semanticAction("buy", { card: 0 }),
+        reason: "Buy exact Splash under extreme score pressure",
+      });
+    },
+  };
+  const client = {
+    baseUrl: config.balatrobotUrl,
+    async gamestate() { return exited ? after : initial; },
+    async call(method, params) {
+      if (method === "screenshot") return { path: params.path };
+      calls.push({ method, params });
+      if (method === "next_round") {
+        exited = true;
+        return after;
+      }
+      throw new BalatrobotRpcError(
+        `BalatroBot RPC ${method} failed: simulated identical shop rejection`,
+        { code: -32003, method, requestId: calls.length },
+      );
+    },
+  };
+  const log = fakeLog();
+  const result = await runBalatrobot({
+    projectRoot: ".",
+    config: {
+      ...config,
+      balatrobotStrategicThinkingEnabled: true,
+      balatrobotStrategicReasoningEffort: "high",
+    },
+    client,
+    planner,
+    strategicPlanner: planner,
+    maxSteps: 4,
+    log,
+  });
+
+  assert.equal(result.state.state, "BLIND_SELECT");
+  assert.equal(plannerCalls, 2, "the third identical attempt is the local RPC fallback, not another model call");
+  assert.deepEqual(calls, [
+    { method: "buy", params: { card: 0 } },
+    { method: "buy", params: { card: 0 } },
+    { method: "buy", params: { card: 0 } },
+    { method: "next_round", params: {} },
+  ]);
+  assert.deepEqual(
+    log.events.filter((event) => event.type === "rpc_rejected").map((event) => [event.repeated, event.stateRepeated]),
+    [[1, 1], [2, 2], [3, 3]],
+  );
+  assert.equal(log.events.filter((event) => event.type === "bot_shop_rpc_rejection_circuit_breaker").length, 1);
+  assert.equal(log.events.filter((event) => event.type === "plan").at(-1).source, "balatrobot_shop_rpc_rejection_circuit_breaker");
+});
+
 test("one strategic sell approval completes its exact replacement buy without a second model call", async () => {
   const weakJoker = (key, label) => ({
     id: key,
@@ -1082,7 +1764,8 @@ test("runner leaves the shop without destructive fallback when strategic approva
     log: invalidLog,
   });
   assert.deepEqual(invalidCalls, [{ method: "next_round", params: {} }]);
-  assert.ok(invalidLog.events.some((event) => event.type === "bot_unapproved_shop_action_blocked"));
+  assert.ok(invalidLog.events.some((event) =>
+    event.type === "bot_shop_validation_circuit_breaker" && event.failures === 2));
 });
 
 test("runner injects save-backed unlocks and cards seen this run into build planning", async () => {

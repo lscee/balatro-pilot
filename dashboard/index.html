@@ -36,6 +36,27 @@
         </div>
       </section>
 
+      <section id="pilot-control" class="pilot-control" aria-label="AI 自动控制" aria-busy="true">
+        <div class="pilot-control-copy">
+          <span class="section-kicker">PILOT CONTROL</span>
+          <div class="pilot-control-heading">
+            <strong>AI 自动控制</strong>
+            <span id="pilot-control-status" class="pilot-control-status checking" role="status" aria-live="polite">正在读取…</span>
+          </div>
+          <p id="pilot-control-detail">这里只暂停或启动 AI 决策与自动输入；Balatro 游戏、BalatroBot RPC 和直播页面都会继续运行。</p>
+        </div>
+        <div class="pilot-control-actions" role="group" aria-label="暂停或启动 AI 自动控制">
+          <button id="pilot-pause" class="pilot-control-button pause" type="button" disabled>
+            <span>一键暂停</span>
+            <small>停止 AI 决策，不关闭游戏</small>
+          </button>
+          <button id="pilot-start" class="pilot-control-button start" type="button" disabled>
+            <span>一键启动</span>
+            <small>从当前游戏状态继续控制</small>
+          </button>
+        </div>
+      </section>
+
       <section class="panel health-panel" aria-label="项目组件健康检查">
         <div class="health-heading">
           <div>

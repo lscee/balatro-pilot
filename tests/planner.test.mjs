@@ -94,7 +94,11 @@ test("BalatroBot build context exposes phase, economy, slots, and exact Joker of
     ante: 4,
     money: 31,
     deck: "BLACK",
-    jokers: { count: 4, limit: 5, cards: [{ key: "j_green_joker", set: "JOKER", effect: "scales" }] },
+    jokers: {
+      count: 4,
+      limit: 5,
+      cards: [{ key: "j_green_joker", set: "JOKER", effect: "scales", rental: true, rentalRate: null }],
+    },
     shop: {
       cards: [
         { key: "j_blueprint", set: "JOKER", label: "Blueprint", effect: "copies", buy: 10 },
@@ -108,6 +112,23 @@ test("BalatroBot build context exposes phase, economy, slots, and exact Joker of
       budget: 10,
       remainingDesiredRerolls: 2,
       shouldReroll: true,
+    },
+    stakeRules: {
+      stake: "GOLD",
+      appliedStakes: ["WHITE", "RED", "GREEN", "BLACK", "BLUE", "PURPLE", "ORANGE", "GOLD"],
+      smallBlindReward: 0,
+      scalingTier: 3,
+      discardModifier: -1,
+      perishableRounds: 5,
+      rentalRate: 3,
+      signature: "gold-rules-v1",
+    },
+    stickerEconomy: {
+      rentalCount: 1,
+      rentalRate: 3,
+      rentalUpkeep: 3,
+      cashAfterNextUpkeep: 28,
+      eternalLockedSlots: 0,
     },
     collectionKnowledge: {
       available: true,
@@ -137,6 +158,13 @@ test("BalatroBot build context exposes phase, economy, slots, and exact Joker of
   assert.equal(context.defaultInterestBands, 5);
   assert.equal(context.defaultInterestReserve, 12);
   assert.equal(context.shopReroll.budget, 10);
+  assert.equal(context.stakeRules.smallBlindReward, 0);
+  assert.equal(context.stickerEconomy.rentalUpkeep, 3);
+  assert.equal(context.ownedJokers[0].rentalRate, 3);
+  assert.equal(context.ownedJokers[0].perishableTally, null);
+  assert.equal(context.ownedJokers[0].perishableRounds, null);
+  assert.equal(context.offeredJokers[0].rentalRate, null);
+  assert.equal(context.offeredJokers[0].perishableTally, null);
   assert.equal(context.freeJokerSlots, 1);
   assert.deepEqual(context.offeredJokers.map((card) => card.key), ["j_blueprint"]);
   assert.deepEqual(context.collectionKnowledge.lockedJokers, [{
@@ -152,6 +180,21 @@ test("BalatroBot build context exposes phase, economy, slots, and exact Joker of
   assert.equal(context.collectionKnowledge.unlockedDecks.length, 2);
   assert.deepEqual(context.appearedThisRun.jokers.map((card) => card.key), ["j_blueprint"]);
   assert.match(context.decisionRequired, /temporary_bridge vs pivot/);
+  assert.match(context.decisionRequired, /Eternal\+Rental/);
+});
+
+test("Gold planning context preserves debt instead of reporting it as zero cash", () => {
+  const context = balatrobotBuildPlanningContext({
+    ante: 3,
+    money: -8,
+    deck: "CHECKERED",
+    jokers: { count: 1, limit: 5, cards: [{ key: "j_half", set: "JOKER", rental: true }] },
+    shop: { cards: [] },
+    stickerEconomy: { rentalCount: 1, rentalRate: 3, rentalUpkeep: 3, cashAfterNextUpkeep: -11 },
+  });
+  assert.equal(context.money, -8);
+  assert.equal(context.defaultInterestBands, 0);
+  assert.equal(context.stickerEconomy.cashAfterNextUpkeep, -11);
 });
 
 test("extractOutputText reads the Responses API message shape", () => {

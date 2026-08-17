@@ -6,6 +6,8 @@ import {
   BalatrobotTransportError,
 } from "./balatrobot-client.mjs";
 import {
+  balatrobotMenuReady,
+  balatrobotHandActionsReady,
   balatrobotStateFingerprint,
   compactBalatrobotState,
   deterministicBalatrobotAction,
@@ -21,6 +23,7 @@ import {
   generateBalatrobotCandidates,
 } from "./balatrobot-solver.mjs";
 import { BalatroRunCardTracker, contextualBalatrobotState } from "./balatro-profile.mjs";
+import { BalatroOwnedConsumableAgeTracker } from "./balatro-consumable-memory.mjs";
 import { selectBalatroDeck } from "./balatro-deck-selector.mjs";
 import { mergeUsage } from "./planner.mjs";
 import { RunLog } from "./run-log.mjs";
@@ -48,6 +51,9 @@ const LEARNABLE_METHODS = new Set([
 ]);
 const MODEL_STATES = new Set(["BLIND_SELECT", "SELECTING_HAND", "SHOP", "SMODS_BOOSTER_OPENED"]);
 const STRATEGIC_SHOP_METHODS = new Set(["buy", "buy_use", "sell", "reroll"]);
+const SHOP_VALIDATION_SAFE_EXIT_THRESHOLD = 2;
+const SHOP_RPC_REJECTION_SAFE_EXIT_THRESHOLD = 3;
+const CANDIDATE_RANK_CONTRACT_ERROR_CODES = new Set(["PLAN_JSON_INVALID", "CANDIDATE_RANK_INVALID"]);
 
 function checkpointSegment(value, fallback = "unknown") {
   const normalized = String(value ?? "").trim().replaceAll(":", "_").replaceAll("|", "_");
@@ -139,6 +145,39 @@ function assertGameState(value, method) {
   return value;
 }
 
+export async function confirmBalatrobotMenuStartReady({
+  client,
+  expectedState,
+  signal,
+  delayMs = 100,
+} = {}) {
+  if (!client || typeof client.gamestate !== "function") {
+    throw new TypeError("menu start confirmation requires a BalatroBot client with gamestate()");
+  }
+  const expectedFingerprint = expectedState ? balatrobotStateFingerprint(expectedState) : null;
+  let firstFingerprint = null;
+  let current = expectedState ?? null;
+  const observations = [];
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    current = assertGameState(await client.gamestate({ signal }), "menu start confirmation");
+    const fingerprint = balatrobotStateFingerprint(current);
+    const menuReady = balatrobotMenuReady(current);
+    observations.push({ attempt, state: current.state, menuReady, fingerprint });
+    if (!menuReady) {
+      return { ready: false, reason: "menu-not-ready", state: current, observations };
+    }
+    if (expectedFingerprint && fingerprint !== expectedFingerprint) {
+      return { ready: false, reason: "menu-state-changed", state: current, observations };
+    }
+    if (firstFingerprint && fingerprint !== firstFingerprint) {
+      return { ready: false, reason: "menu-state-unstable", state: current, observations };
+    }
+    firstFingerprint = fingerprint;
+    if (attempt === 1) await sleep(Math.max(0, Number(delayMs) || 0), signal);
+  }
+  return { ready: true, reason: "stable-menu-ready", state: current, observations };
+}
+
 function assertStartedRunMatches(action, state) {
   if (action?.method !== "start") return;
   const requestedDeck = String(action?.params?.deck ?? "").trim().toUpperCase();
@@ -179,6 +218,7 @@ function candidateAction(candidate) {
 }
 
 function candidateForAction(action, candidates) {
+  if (!action?.method) return null;
   const signature = actionSignature(action);
   return (Array.isArray(candidates) ? candidates : []).find((candidate) => {
     const compiled = candidateAction(candidate);
@@ -253,10 +293,17 @@ export function strategicCheckpointScope(state, thinkingMode) {
   return `${run}:${state?.state ?? "unknown"}:${ante}:${round}`;
 }
 
-function applyStrategicCheckpoint(state, thinkingMode, completedScopes, config, checkpointStore = null) {
+export function applyStrategicCheckpoint(state, thinkingMode, completedScopes, config, checkpointStore = null) {
   const scope = strategicCheckpointScope(state, thinkingMode);
   if (!scope) return thinkingMode;
-  const persisted = checkpointStore?.has?.(state?.seed, scope) ?? false;
+  // A persisted scope is keyed by seed for controller-restart continuity. A
+  // repeated fixed-seed attempt can therefore inherit an older run's scope.
+  // Held-consumable age is intentionally process-local, so its first explicit
+  // review in this process must not be suppressed by that older persisted
+  // record. The in-memory completed set still limits it to one review here.
+  const persisted = thinkingMode?.ignorePersistedCheckpoint === true
+    ? false
+    : checkpointStore?.has?.(state?.seed, scope) ?? false;
   if (!completedScopes.has(scope) && !persisted) {
     return { ...thinkingMode, checkpointScope: scope };
   }
@@ -271,6 +318,12 @@ function applyStrategicCheckpoint(state, thinkingMode, completedScopes, config, 
 
 function isUncertainActionError(error) {
   return error instanceof BalatrobotTransportError || error instanceof BalatrobotProtocolError;
+}
+
+function isHandActionReadinessRejection(error, action) {
+  if (action?.method !== "play" && action?.method !== "discard") return false;
+  const message = String(error?.message ?? "");
+  return /(?:hand actions are not ready:|g\.buttons[^\n]*nil|field\s+['"]buttons['"]\s*\([^)]*nil|(?:play|discard)\(\)[^\n]*(?:play|discard)(?:_|\s+)button[^\n]*not found)/iu.test(message);
 }
 
 function validatedStuckPackSkip(state) {
@@ -437,6 +490,7 @@ async function planSemanticAction({
         planningMs: performance.now() - startedAt,
         corrected: false,
         fallback: true,
+        validationFailures: 2,
       };
     }
   }
@@ -452,6 +506,14 @@ function compiledCandidateReason(candidate) {
       return "选择本地已验证的换牌候选";
     case "buy":
       return `购买${label}`;
+    case "sell": {
+      // The sell narrative guard intentionally requires the exact owned card
+      // to be named. A ranker returns only a candidate id, so compile both the
+      // visible label and stable key before asking the strategic route to
+      // approve (or reject) the irreversible sale.
+      const key = String(candidate?.card?.key ?? "").trim();
+      return `Sell exact owned card ${label}${key && key !== label ? ` (${key})` : ""}`.slice(0, 160);
+    }
     case "pack":
       return action.skip ? "没有安全选项，跳过卡包" : `选择${label}`;
     case "reroll":
@@ -465,14 +527,41 @@ function compiledCandidateReason(candidate) {
   }
 }
 
-function strategicUnavailableShopExit({ memory, runPlan, usage, attempts = [], planningMs = 0, reason = "" } = {}) {
+function markCandidateValidationFailure(error, { usage = null, attempts = null, candidateId = null } = {}) {
+  error.balatrobotCandidateValidationFailure = true;
+  if (usage && !error.usage) error.usage = usage;
+  if (attempts && !error.recoveryAttempts) error.recoveryAttempts = attempts;
+  if (candidateId != null) error.candidateId = candidateId;
+  return error;
+}
+
+function strategicUnavailableShopExit({
+  state,
+  candidates,
+  memory,
+  runPlan,
+  usage,
+  attempts = [],
+  planningMs = 0,
+  reason = "",
+} = {}) {
+  const exitCandidates = (Array.isArray(candidates) ? candidates : []).filter(
+    (candidate) => candidate.action?.method === "next_round",
+  );
+  if (exitCandidates.length !== 1) {
+    throw new Error(`safe shop exit requires exactly one local next_round candidate; found ${exitCandidates.length}`);
+  }
+  const [selectedCandidate] = exitCandidates;
   const action = {
-    method: "next_round",
-    params: {},
+    ...candidateAction(selectedCandidate),
     reason: "Strategic approval unavailable; preserve money and leave the shop",
   };
-  return {
-    plan: {
+  // Establish exact local authority before enabling the one scoped policy
+  // exception below. The selected action is still checked again after plan
+  // normalization so the exception cannot authorize an invented action.
+  assertBalatrobotCandidateAction(action, candidates, state);
+  const plan = validateBalatrobotPlan(
+    {
       observation: "A build-changing shop action cannot execute without the strategic planner.",
       strategy: action.reason,
       memory,
@@ -480,10 +569,22 @@ function strategicUnavailableShopExit({ memory, runPlan, usage, attempts = [], p
       confidence: 1,
       actions: [action],
     },
+    state,
+    {
+      // This option is intentionally private to the exact-candidate safe-exit
+      // helper. It bypasses only the reroll-budget preference for next_round;
+      // schema, state, RPC params, and candidate membership remain validated.
+      allowTrustedShopExit: true,
+    },
+  );
+  assertBalatrobotCandidateAction(plan.actions[0], candidates, state);
+  return {
+    plan,
     usage: mergeUsage(usage),
     attempts,
     planningMs,
     safeStrategicExit: true,
+    selectedCandidate,
     blockedReason: String(reason || "strategic approval unavailable").slice(0, 300),
   };
 }
@@ -518,35 +619,52 @@ async function planRankedCandidate({
     });
   } catch (error) {
     log.event("bot_candidate_rank_error", { step, ...planningErrorEvent(error) });
+    if (CANDIDATE_RANK_CONTRACT_ERROR_CODES.has(error?.code)) {
+      markCandidateValidationFailure(error);
+    }
     throw error;
   }
-  const selectedCandidate = candidates.find((candidate) => candidate.id === ranked.candidateId);
+  const selectedCandidate = candidates.find((candidate) => candidate.id === ranked?.candidateId);
   if (!selectedCandidate) {
-    const error = new Error(`Candidate ranker returned an unknown id: ${ranked.candidateId || "none"}`);
-    error.usage = ranked.usage;
-    throw error;
+    throw markCandidateValidationFailure(
+      new Error(`Candidate ranker returned an unknown id: ${ranked?.candidateId || "none"}`),
+      {
+        usage: ranked?.usage,
+        attempts: ranked?.attempts,
+        candidateId: ranked?.candidateId || null,
+      },
+    );
   }
   const { method, ...params } = selectedCandidate.action ?? {};
   const reason = compiledCandidateReason(selectedCandidate);
   const rawAction = { method, ...params, reason };
-  const plan = validateBalatrobotPlan(
-    {
-      observation: `高频模型只排序本地合法候选，选择 ${selectedCandidate.id}。`,
-      strategy: reason,
-      memory,
-      runPlan,
-      confidence: 1,
-      actions: [rawAction],
-    },
-    state,
-    {
-      minimumConfidence: config.balatrobotMinimumConfidence ?? config.minimumConfidence,
-      allowBlindSkip: false,
-      collectionKnowledge,
-      appearedThisRun,
-    },
-  );
-  assertBalatrobotCandidateAction(plan.actions[0], candidates, state);
+  let plan;
+  try {
+    plan = validateBalatrobotPlan(
+      {
+        observation: `高频模型只排序本地合法候选，选择 ${selectedCandidate.id}。`,
+        strategy: reason,
+        memory,
+        runPlan,
+        confidence: 1,
+        actions: [rawAction],
+      },
+      state,
+      {
+        minimumConfidence: config.balatrobotMinimumConfidence ?? config.minimumConfidence,
+        allowBlindSkip: false,
+        collectionKnowledge,
+        appearedThisRun,
+      },
+    );
+    assertBalatrobotCandidateAction(plan.actions[0], candidates, state);
+  } catch (error) {
+    throw markCandidateValidationFailure(error, {
+      usage: ranked?.usage,
+      attempts: ranked?.attempts,
+      candidateId: selectedCandidate.id,
+    });
+  }
   log.event("bot_candidate_ranked", {
     step,
     candidateId: selectedCandidate.id,
@@ -585,6 +703,18 @@ function isUnlockOverlayMismatch(state, action, error) {
   );
 }
 
+function isCashOutModalPause(state, action, error) {
+  return (
+    state?.state === "ROUND_EVAL" &&
+    action?.method === "cash_out" &&
+    error instanceof BalatrobotRpcError &&
+    error.code === -32003 &&
+    /cash_out\(\) cannot run while a modal overlay is open or (?:the )?game is paused/iu.test(
+      String(error.message ?? ""),
+    )
+  );
+}
+
 export async function runBalatrobot({
   projectRoot,
   config,
@@ -595,6 +725,7 @@ export async function runBalatrobot({
   experienceStore = null,
   profileReader = null,
   runCardTracker = new BalatroRunCardTracker(),
+  consumableAgeTracker = new BalatroOwnedConsumableAgeTracker(),
   overlayController = null,
   dryRun = false,
   maxSteps = Number.POSITIVE_INFINITY,
@@ -627,11 +758,18 @@ export async function runBalatrobot({
   let previousError = "";
   let repeatedRpcFailureKey = "";
   let repeatedRpcFailures = 0;
+  let rpcFailureStateKey = "";
+  let rpcFailuresAtState = 0;
+  let shopValidationFailureKey = "";
+  let shopValidationFailures = 0;
+  let cashOutModalWait = null;
   let plannerFailures = 0;
   let uncertainAction = null;
   let transitionState = "";
   let transitionStartedAt = 0;
   let transitionPolls = 0;
+  let handReadinessWait = null;
+  let handReadinessRejections = 0;
   let state = null;
   const mouthLockCache = { blindKey: null, handType: null };
   let collectionKnowledge = null;
@@ -683,6 +821,7 @@ export async function runBalatrobot({
       ? Object.freeze({ ...snapshot, activeUnlockTarget })
       : snapshot;
     appearedThisRun = runCardTracker.observe(currentState);
+    consumableAgeTracker.observe(currentState);
     return contextualBalatrobotState(currentState, collectionKnowledge, appearedThisRun);
   };
 
@@ -873,6 +1012,7 @@ export async function runBalatrobot({
     }
     if (afterState?.state !== "SHOP") approvedShopContinuation = null;
     if (action.method === "menu" || action.method === "start") {
+      consumableAgeTracker.reset();
       memory = "";
       runPlan = null;
       scoreBenchmarks = [];
@@ -884,6 +1024,12 @@ export async function runBalatrobot({
     previousError = "";
     repeatedRpcFailureKey = "";
     repeatedRpcFailures = 0;
+    rpcFailureStateKey = "";
+    rpcFailuresAtState = 0;
+    shopValidationFailureKey = "";
+    shopValidationFailures = 0;
+    handReadinessWait = null;
+    handReadinessRejections = 0;
   };
   const stepLimitLabel = Number.isFinite(maxSteps) ? maxSteps : "∞";
 
@@ -964,6 +1110,7 @@ export async function runBalatrobot({
       if (signal.aborted) throw abortError(signal);
       latchBalatrobotMouthLock(state, mouthLockCache);
       const semanticState = refreshRunKnowledge(state);
+      const consumableAges = consumableAgeTracker.snapshot();
       if (!runPlan && state?.seed) {
         runPlan = strategicCheckpointStore?.runPlan?.(state.seed) ?? null;
       }
@@ -998,6 +1145,51 @@ export async function runBalatrobot({
       log.event("bot_state", { step, fingerprint: exactFingerprint, state: compactState });
       console.log(`\n[${step}/${stepLimitLabel}] ${stateLabel(state)}`);
       finalizeEpisode(semanticState);
+
+      const handActionsReady = balatrobotHandActionsReady(state);
+      if (state.state === "SELECTING_HAND" && handActionsReady === false) {
+        const waitKey = [state.seed ?? "unseeded", state.ante_num ?? "?", state.round_num ?? "?"].join(":");
+        const sameWait = handReadinessWait?.key === waitKey;
+        const polls = sameWait ? handReadinessWait.polls + 1 : 1;
+        const startedAt = sameWait ? handReadinessWait.startedAt : Date.now();
+        const baseDelayMs = Math.max(100, Number(config.balatrobotPollMs) || 0);
+        const delayMs = Math.min(2_000, baseDelayMs * 2 ** Math.min(polls - 1, 5));
+        handReadinessWait = { key: waitKey, polls, startedAt };
+        repeatedRpcFailureKey = "";
+        repeatedRpcFailures = 0;
+        rpcFailureStateKey = "";
+        rpcFailuresAtState = 0;
+        previousError = "Native hand actions are still rebuilding; wait for a fresh ready state.";
+        if (polls === 1 || polls % 10 === 0) {
+          log.event("bot_hand_actions_wait", {
+            step,
+            polls,
+            delayMs,
+            waitingMs: Date.now() - startedAt,
+            fingerprint: exactFingerprint,
+          });
+          console.log(
+            `  Hand actions are not ready; polling fresh state in ${delayMs}ms ` +
+              "without planning or sending an RPC.",
+          );
+        }
+        await sleep(delayMs, signal);
+        state = assertGameState(await client.gamestate({ signal }), "gamestate while hand actions are not ready");
+        step -= 1;
+        continue;
+      }
+      if (handReadinessWait) {
+        log.event("bot_hand_actions_ready", {
+          step,
+          polls: handReadinessWait.polls,
+          waitingMs: Date.now() - handReadinessWait.startedAt,
+          readiness: handActionsReady,
+          state: state.state,
+          fingerprint: exactFingerprint,
+        });
+        handReadinessWait = null;
+        previousError = "";
+      }
 
       let circuitRecovery = null;
       if (uncertainAction) {
@@ -1160,7 +1352,20 @@ export async function runBalatrobot({
       let semanticPriorDecision = null;
 
       const failureKeyPrefix = `${exactFingerprint}:`;
-      if (!action && repeatedRpcFailures >= 2 && repeatedRpcFailureKey.startsWith(failureKeyPrefix)) {
+      if (rpcFailureStateKey && rpcFailureStateKey !== exactFingerprint) {
+        rpcFailureStateKey = "";
+        rpcFailuresAtState = 0;
+      }
+      const aggregateShopRecoveryPending =
+        state.state === "SHOP" &&
+        rpcFailureStateKey === exactFingerprint &&
+        rpcFailuresAtState >= SHOP_RPC_REJECTION_SAFE_EXIT_THRESHOLD;
+      if (
+        !action &&
+        !aggregateShopRecoveryPending &&
+        repeatedRpcFailures >= 2 &&
+        repeatedRpcFailureKey.startsWith(failureKeyPrefix)
+      ) {
         action = fallbackBalatrobotAction(state);
         if (action) {
           source = "balatrobot_rpc_recovery";
@@ -1204,6 +1409,7 @@ export async function runBalatrobot({
           limit: config.balatrobotHandCandidateLimit,
           benchmarks: scoreBenchmarks,
           runPlan,
+          consumableAges,
         });
         if (state.state === "SELECTING_HAND") {
           for (const candidate of generatedCandidates.filter((item) => item.action?.method === "play").slice(0, 5)) {
@@ -1279,6 +1485,63 @@ export async function runBalatrobot({
           }
         }
         actionCandidates = candidates;
+        if (
+          !action &&
+          state.state === "SHOP" &&
+          rpcFailureStateKey === exactFingerprint &&
+          rpcFailuresAtState >= SHOP_RPC_REJECTION_SAFE_EXIT_THRESHOLD
+        ) {
+          planned = strategicUnavailableShopExit({
+            state,
+            candidates,
+            memory,
+            runPlan,
+            usage: mergeUsage(),
+            reason: `${rpcFailuresAtState} total RPC rejections in the same exact shop`,
+          });
+          action = planned.plan.actions[0];
+          planDetails = planned.plan;
+          selectedActionCandidate = planned.selectedCandidate;
+          source = "balatrobot_shop_rpc_rejection_circuit_breaker";
+          approvedShopContinuation = null;
+          log.event("bot_shop_rpc_rejection_circuit_breaker", {
+            step,
+            fingerprint: exactFingerprint,
+            failures: rpcFailuresAtState,
+            candidateId: selectedActionCandidate.id,
+            action,
+          });
+        }
+        if (shopValidationFailureKey && shopValidationFailureKey !== exactFingerprint) {
+          shopValidationFailureKey = "";
+          shopValidationFailures = 0;
+        }
+        if (
+          !action &&
+          state.state === "SHOP" &&
+          shopValidationFailureKey === exactFingerprint &&
+          shopValidationFailures >= SHOP_VALIDATION_SAFE_EXIT_THRESHOLD
+        ) {
+          planned = strategicUnavailableShopExit({
+            state,
+            candidates,
+            memory,
+            runPlan,
+            usage: mergeUsage(),
+            reason: `${shopValidationFailures} repeated local plan validation failures in the same exact shop`,
+          });
+          action = planned.plan.actions[0];
+          planDetails = planned.plan;
+          selectedActionCandidate = planned.selectedCandidate;
+          source = "balatrobot_shop_validation_circuit_breaker";
+          log.event("bot_shop_validation_circuit_breaker", {
+            step,
+            fingerprint: exactFingerprint,
+            failures: shopValidationFailures,
+            candidateId: selectedActionCandidate.id,
+            action,
+          });
+        }
         let thinkingMode = applyStrategicCheckpoint(
           state,
           balatrobotThinkingMode(state, candidates, config),
@@ -1438,13 +1701,52 @@ export async function runBalatrobot({
               planned.strategicRoute = true;
             }
             plannerFailures = 0;
-            action = planned.plan.actions[0];
-            planDetails = planned.plan;
-            source = planned.fallback
-              ? "balatrobot_validation_fallback"
-              : planned.strategicRoute
-                ? "balatrobot_model_strategic"
-                : "balatrobot_model";
+            if (state?.state === "SHOP" && Number(planned.validationFailures) > 0) {
+              const validationKey = exactFingerprint;
+              shopValidationFailures = shopValidationFailureKey === validationKey
+                ? shopValidationFailures + Number(planned.validationFailures)
+                : Number(planned.validationFailures);
+              shopValidationFailureKey = validationKey;
+              log.event("bot_shop_validation_failure", {
+                step,
+                fingerprint: exactFingerprint,
+                failures: shopValidationFailures,
+                threshold: SHOP_VALIDATION_SAFE_EXIT_THRESHOLD,
+              });
+              if (shopValidationFailures >= SHOP_VALIDATION_SAFE_EXIT_THRESHOLD) {
+                const rejectedPlan = planned;
+                planned = strategicUnavailableShopExit({
+                  state,
+                  candidates,
+                  memory,
+                  runPlan,
+                  usage: rejectedPlan.usage,
+                  attempts: rejectedPlan.attempts,
+                  planningMs: rejectedPlan.planningMs,
+                  reason: `${shopValidationFailures} local plan validation failures in the same exact shop`,
+                });
+                action = planned.plan.actions[0];
+                planDetails = planned.plan;
+                selectedActionCandidate = planned.selectedCandidate;
+                source = "balatrobot_shop_validation_circuit_breaker";
+                log.event("bot_shop_validation_circuit_breaker", {
+                  step,
+                  fingerprint: exactFingerprint,
+                  failures: shopValidationFailures,
+                  candidateId: selectedActionCandidate.id,
+                  action,
+                });
+              }
+            }
+            if (!action) {
+              action = planned.plan.actions[0];
+              planDetails = planned.plan;
+              source = planned.fallback
+                ? "balatrobot_validation_fallback"
+                : planned.strategicRoute
+                  ? "balatrobot_model_strategic"
+                  : "balatrobot_model";
+            }
           }
         } catch (error) {
           if (isAbort(error, signal)) throw error;
@@ -1464,6 +1766,8 @@ export async function runBalatrobot({
             );
             if (state?.state === "SHOP") {
               planned = strategicUnavailableShopExit({
+                state,
+                candidates,
                 memory,
                 runPlan,
                 usage: strategicError.usage,
@@ -1549,7 +1853,66 @@ export async function runBalatrobot({
               error = routineError;
             }
           }
-          if (!action) {
+          let shopCandidateValidationHandled = false;
+          if (
+            !action &&
+            state?.state === "SHOP" &&
+            error?.balatrobotCandidateValidationFailure === true
+          ) {
+            shopValidationFailures = shopValidationFailureKey === exactFingerprint
+              ? shopValidationFailures + 1
+              : 1;
+            shopValidationFailureKey = exactFingerprint;
+            plannerFailures += 1;
+            previousError = `Candidate ranking failed local validation: ${error.message}`.slice(0, 300);
+            log.event("bot_shop_validation_failure", {
+              step,
+              fingerprint: exactFingerprint,
+              failures: shopValidationFailures,
+              threshold: SHOP_VALIDATION_SAFE_EXIT_THRESHOLD,
+              code: error.code ?? null,
+              candidateId: error.candidateId ?? null,
+              error: error.message,
+            });
+            if (shopValidationFailures >= SHOP_VALIDATION_SAFE_EXIT_THRESHOLD) {
+              planned = strategicUnavailableShopExit({
+                state,
+                candidates,
+                memory,
+                runPlan,
+                usage: error.usage,
+                attempts: error.recoveryAttempts ?? [],
+                planningMs: performance.now() - planningStartedAt,
+                reason: `${shopValidationFailures} candidate-contract failures in the same exact shop: ${error.message}`,
+              });
+              plannerFailures = 0;
+              action = planned.plan.actions[0];
+              planDetails = planned.plan;
+              selectedActionCandidate = planned.selectedCandidate;
+              source = "balatrobot_shop_validation_circuit_breaker";
+              log.event("bot_shop_validation_circuit_breaker", {
+                step,
+                fingerprint: exactFingerprint,
+                failures: shopValidationFailures,
+                candidateId: selectedActionCandidate.id,
+                action,
+              });
+            } else {
+              planned = {
+                usage: mergeUsage(error.usage),
+                attempts: error.recoveryAttempts ?? [],
+                planningMs: performance.now() - planningStartedAt,
+                fallback: false,
+              };
+              source = "balatrobot_shop_validation_wait";
+              shopCandidateValidationHandled = true;
+              console.warn(
+                `  [warn] Shop candidate contract failed local validation (${shopValidationFailures}/` +
+                  `${SHOP_VALIDATION_SAFE_EXIT_THRESHOLD}); polling the same exact shop once with no RPC.`,
+              );
+            }
+          }
+          if (!action && !shopCandidateValidationHandled) {
             plannerFailures += 1;
             const usage = mergeUsage(error.usage);
             const delayMs = plannerBackoffMs(plannerFailures, config);
@@ -1595,6 +1958,8 @@ export async function runBalatrobot({
           const proposedAction = action;
           const proposedSource = source;
           planned = strategicUnavailableShopExit({
+            state,
+            candidates: actionCandidates,
             memory,
             runPlan,
             usage: planned.usage,
@@ -1620,7 +1985,9 @@ export async function runBalatrobot({
           selectedActionCandidate?.requiresStrategic === true &&
           source !== "balatrobot_model_strategic" &&
           source !== "balatrobot_checkpoint_sequence" &&
-          source !== "balatrobot_strategic_unavailable_safe_exit"
+          source !== "balatrobot_strategic_unavailable_safe_exit" &&
+          source !== "balatrobot_shop_validation_circuit_breaker" &&
+          source !== "balatrobot_shop_rpc_rejection_circuit_breaker"
         ) {
           const proposedAction = action;
           const proposedSource = source;
@@ -1707,6 +2074,30 @@ export async function runBalatrobot({
         };
       }
 
+      if (action.method === "start") {
+        const menuGuard = await confirmBalatrobotMenuStartReady({
+          client,
+          expectedState: state,
+          signal,
+          delayMs: Math.min(250, Math.max(0, Number(config.balatrobotPollMs) || 0)),
+        });
+        log.event("bot_menu_start_guard", {
+          step,
+          ready: menuGuard.ready,
+          reason: menuGuard.reason,
+          observations: menuGuard.observations,
+        });
+        if (!menuGuard.ready) {
+          console.log(`  Menu start withheld (${menuGuard.reason}); polling fresh state without sending input.`);
+          state = menuGuard.state;
+          previousError = "Menu was not stably ready immediately before start; wait for a fresh stable menu state.";
+          await sleep(config.balatrobotPollMs, signal);
+          step -= 1;
+          continue;
+        }
+        state = menuGuard.state;
+      }
+
       const legacyPlan = legacyPlanForBalatrobot(state, action, planDetails);
       log.event("plan", {
         step,
@@ -1759,6 +2150,7 @@ export async function runBalatrobot({
       }
       try {
         state = assertGameState(await client.call(action.method, action.params, { signal }), action.method);
+        cashOutModalWait = null;
         assertStartedRunMatches(action, state);
         const resultFingerprint = balatrobotStateFingerprint(state);
         log.event("rpc_result", {
@@ -1824,6 +2216,58 @@ export async function runBalatrobot({
       } catch (error) {
         if (isAbort(error, signal)) throw error;
         if (error instanceof BalatrobotRpcError) {
+          if (isCashOutModalPause(beforeState, action, error)) {
+            const waitKey = `${exactFingerprint}:cash_out`;
+            const waitAttempt = cashOutModalWait?.key === waitKey
+              ? cashOutModalWait.attempt + 1
+              : 1;
+            const baseDelayMs = Math.max(100, Number(config.balatrobotPollMs) || 0);
+            const delayMs = Math.min(2_000, baseDelayMs * 2 ** Math.min(waitAttempt - 1, 5));
+            cashOutModalWait = {
+              key: waitKey,
+              attempt: waitAttempt,
+              startedAt: cashOutModalWait?.key === waitKey ? cashOutModalWait.startedAt : Date.now(),
+            };
+            repeatedRpcFailureKey = "";
+            repeatedRpcFailures = 0;
+            previousError = "Cash-out is waiting for the open modal or pause menu to close.";
+            log.event("bot_cash_out_modal_wait", {
+              step,
+              attempt: waitAttempt,
+              delayMs,
+              waitingMs: Date.now() - cashOutModalWait.startedAt,
+              stateFingerprint: exactFingerprint,
+              code: error.code,
+              error: error.message,
+            });
+            console.warn(
+              `  [wait] Cash-out is blocked by an open modal or pause menu; ` +
+                `polling fresh state again in ${delayMs}ms without counting this as an RPC failure.`,
+            );
+            await sleep(delayMs, signal);
+            const refreshed = assertGameState(await client.gamestate({ signal }), "gamestate while cash-out modal is open");
+            const refreshedFingerprint = balatrobotStateFingerprint(refreshed);
+            const changed = refreshedFingerprint !== exactFingerprint;
+            log.event("bot_cash_out_modal_poll", {
+              step,
+              attempt: waitAttempt,
+              previousFingerprint: exactFingerprint,
+              currentFingerprint: refreshedFingerprint,
+              state: refreshed.state,
+              changed,
+            });
+            state = refreshed;
+            if (changed) {
+              cashOutModalWait = null;
+              previousError = "Game state changed while cash-out was waiting; re-evaluate the fresh state.";
+              continue;
+            }
+            // A stock gamestate response has no overlay/paused flag. The
+            // guarded endpoint remains the authority, so retry only after the
+            // abortable exponential backoff and a fresh unchanged-state read.
+            step -= 1;
+            continue;
+          }
           if (
             action.method === "endless" &&
             beforeState?.state === "ROUND_EVAL" &&
@@ -1853,9 +2297,60 @@ export async function runBalatrobot({
               reason: `The one-shot stuck-pack recovery was rejected: ${error.message}`,
             });
           }
+          if (source === "balatrobot_shop_rpc_rejection_circuit_breaker") {
+            state = assertGameState(await client.gamestate({ signal }), "gamestate after rejected shop safe exit");
+            const reason = `The exact next_round recovery was rejected after ${rpcFailuresAtState} failures in one shop: ${error.message}`;
+            log.event("bot_shop_rpc_rejection_safe_stop", {
+              step,
+              method: action.method,
+              params: action.params,
+              fingerprint: exactFingerprint,
+              failures: rpcFailuresAtState,
+              reason,
+            });
+            console.warn(`  [warn] ${reason} Controller stopped safely without replaying the shop exit.`);
+            return { state, usage: cumulativeUsage, logDir: log.dir, stoppedReason: reason };
+          }
+          if (isHandActionReadinessRejection(error, action)) {
+            handReadinessRejections += 1;
+            const baseDelayMs = Math.max(100, Number(config.balatrobotPollMs) || 0);
+            const delayMs = Math.min(2_000, baseDelayMs * 2 ** Math.min(handReadinessRejections - 1, 5));
+            repeatedRpcFailureKey = "";
+            repeatedRpcFailures = 0;
+            rpcFailureStateKey = "";
+            rpcFailuresAtState = 0;
+            previousError = "Native hand-action UI was not ready; wait for a fresh gamestate before reconsidering the hand.";
+            const waitKey = [beforeState.seed ?? "unseeded", beforeState.ante_num ?? "?", beforeState.round_num ?? "?"].join(":");
+            handReadinessWait = {
+              key: waitKey,
+              polls: handReadinessWait?.key === waitKey ? handReadinessWait.polls : 0,
+              startedAt: handReadinessWait?.key === waitKey ? handReadinessWait.startedAt : Date.now(),
+            };
+            log.event("rpc_hand_actions_not_ready", {
+              step,
+              method: action.method,
+              params: action.params,
+              code: error.code,
+              data: error.data ?? null,
+              error: error.message,
+              rejection: handReadinessRejections,
+              delayMs,
+              fingerprint: exactFingerprint,
+            });
+            console.warn(
+              `  [wait] ${action.method} reached an unready native hand UI; ` +
+                `polling a fresh state in ${delayMs}ms without counting or blindly replaying it.`,
+            );
+            await sleep(delayMs, signal);
+            state = assertGameState(await client.gamestate({ signal }), "gamestate after hand-action readiness rejection");
+            step -= 1;
+            continue;
+          }
           const key = `${exactFingerprint}:${action.method}:${JSON.stringify(action.params)}`;
           repeatedRpcFailures = key === repeatedRpcFailureKey ? repeatedRpcFailures + 1 : 1;
           repeatedRpcFailureKey = key;
+          rpcFailuresAtState = rpcFailureStateKey === exactFingerprint ? rpcFailuresAtState + 1 : 1;
+          rpcFailureStateKey = exactFingerprint;
           previousError = `${action.method} was rejected by BalatroBot: ${error.message}`.slice(0, 300);
           log.event("rpc_rejected", {
             step,
@@ -1865,6 +2360,7 @@ export async function runBalatrobot({
             data: error.data ?? null,
             error: error.message,
             repeated: repeatedRpcFailures,
+            stateRepeated: rpcFailuresAtState,
           });
           console.warn(`  [warn] ${previousError}`);
           if (overlayController && isUnlockOverlayMismatch(state, action, error)) {
@@ -1875,6 +2371,8 @@ export async function runBalatrobot({
                 console.log("  Unlock overlay detected; clicked its Continue button once.");
                 repeatedRpcFailureKey = "";
                 repeatedRpcFailures = 0;
+                rpcFailureStateKey = "";
+                rpcFailuresAtState = 0;
                 previousError = "Unlock overlay was dismissed; re-read exact state before selecting the blind.";
                 await sleep(Math.max(250, Number(config.balatrobotPollMs) || 0), signal);
                 state = assertGameState(await client.gamestate({ signal }), "gamestate after unlock overlay");
@@ -1889,6 +2387,18 @@ export async function runBalatrobot({
           if (repeatedRpcFailures >= 3) await captureFailureScreenshot(client, log, step, signal);
           state = assertGameState(await client.gamestate({ signal }), "gamestate");
           if (repeatedRpcFailures >= 3) {
+            const rejectedStateFingerprint = balatrobotStateFingerprint(state);
+            if (
+              state.state === "SHOP" &&
+              rejectedStateFingerprint === exactFingerprint &&
+              rpcFailureStateKey === exactFingerprint &&
+              rpcFailuresAtState >= SHOP_RPC_REJECTION_SAFE_EXIT_THRESHOLD
+            ) {
+              previousError =
+                `${rpcFailuresAtState} RPC actions were rejected in the same exact shop; ` +
+                "the next turn is reserved for one validated local next_round recovery.";
+              continue;
+            }
             throw new Error(
               `BalatroBot repeatedly rejected unchanged ${action.method} state (${repeatedRpcFailures} times); ` +
                 "stopping instead of replaying the same RPC indefinitely",

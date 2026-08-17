@@ -187,6 +187,31 @@ test("DashboardStats reads only appended event bytes without duplicating old met
   }
 });
 
+test("DashboardStats streams an event file larger than one read chunk", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "balatro-dashboard-chunked-"));
+  try {
+    const directory = path.join(root, "runs", "2026-08-02T00-00-00-000Z-bot-run");
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, "events.ndjson"), [
+      event("2026-08-02T00:00:00.000Z", "diagnostic_payload", {
+        payload: "x".repeat(1024 * 1024 + 257),
+      }),
+      event("2026-08-02T00:00:01.000Z", "bot_state", {
+        state: compactState("CHUNKED", { ante: 3, round: 8 }),
+      }),
+    ].join("\n") + "\n");
+
+    const stats = new DashboardStats(root).refresh();
+    assert.equal(stats.coverage.totalEvents, 2);
+    assert.equal(stats.coverage.malformedLines, 0);
+    assert.equal(stats.live.gameId, "CHUNKED");
+    assert.equal(stats.live.ante, 3);
+    assert.equal(stats.live.round, 8);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("DashboardStats records a repeated seed as a new attempt after the previous game ended", () => {
   const fixture = createFixture();
   try {
@@ -313,6 +338,49 @@ test("dashboard server exposes loopback-ready health, stats, and static page end
     assert.equal(page.status, 200);
     assert.match(page.body, /<title>test<\/title>/);
     assert.match(page.headers["content-security-policy"], /default-src 'self'/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("dashboard exposes revision-aware pilot status and operations", async () => {
+  const fixture = createFixture();
+  const calls = [];
+  const running = {
+    desiredState: "running",
+    effectiveState: "running",
+    revision: 4,
+    controllerPid: 102,
+  };
+  const pilotControl = {
+    async status() { calls.push(["status"]); return running; },
+    async operate(action, options) {
+      calls.push([action, options]);
+      return { ...running, desiredState: "paused", effectiveState: "paused", revision: 5, controllerPid: null };
+    },
+  };
+  let invalidations = 0;
+  const componentHealth = {
+    invalidate() { invalidations += 1; },
+    async refresh() { return { ok: true, components: [] }; },
+  };
+  const server = createDashboardServer({ projectRoot: fixture.root, pilotControl, componentHealth });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  try {
+    const getResponse = await fetch(`http://127.0.0.1:${address.port}/api/pilot-control`);
+    assert.equal(getResponse.status, 200);
+    assert.equal((await getResponse.json()).controllerPid, 102);
+    const postResponse = await fetch(`http://127.0.0.1:${address.port}/api/pilot-control`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "pause", expectedRevision: 4 }),
+    });
+    assert.equal(postResponse.status, 200);
+    assert.equal((await postResponse.json()).effectiveState, "paused");
+    assert.deepEqual(calls, [["status"], ["pause", { expectedRevision: 4 }]]);
+    assert.equal(invalidations, 1);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(fixture.root, { recursive: true, force: true });

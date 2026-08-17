@@ -19,6 +19,7 @@ import {
   semanticStateBucket,
   semanticStateFeatures,
   semanticStateSimilarity,
+  semanticStakeRuleCompatibility,
   semanticStateText,
   semanticTransitionReward,
   semanticTransitionRewardFromFeatures,
@@ -459,7 +460,9 @@ export class SemanticRagStore {
     const existingLabels = Number(this.db.prepare(`
       SELECT COUNT(*) AS count FROM semantic_reward_labels WHERE reward_version = ?
     `).get(SEMANTIC_REWARD_VERSION).count) || 0;
-    const rewardSignature = `v${SEMANTIC_REWARD_VERSION}:outcome-anchor-2:segment-link-3:gamma=${this.discount}`;
+    const rewardSignature = `v${SEMANTIC_REWARD_VERSION}:outcome-anchor-2:segment-link-3:` +
+      `cash-delta=0.035[-0.7,0.7]:rental-liability=-0.1[-0.6,0.6]:` +
+      `perishable-expiry=-0.65x3:legacy-boundary-only:no-buy-bonus:gamma=${this.discount}`;
     const previous = this.db.prepare(`
       SELECT * FROM semantic_reward_migrations WHERE reward_version = ?
     `).get(SEMANTIC_REWARD_VERSION);
@@ -557,6 +560,27 @@ export class SemanticRagStore {
         return leftAt.localeCompare(rightAt) || left.episode_id.localeCompare(right.episode_id);
       });
     }
+    const incrementalRelabel = !fullRelabel && Boolean(previous) &&
+      previous.reward_signature === rewardSignature && existingLabels < eligibleTransitions;
+    let groupsToRelabel = [...groups.values()];
+    if (incrementalRelabel) {
+      const eligibleIds = [...eligibleEpisodeIds];
+      const missingEpisodeIds = eligibleIds.length
+        ? this.db.prepare(`
+            SELECT DISTINCT e.episode_id
+            FROM semantic_experiences e
+            LEFT JOIN semantic_reward_labels labels
+              ON labels.experience_id = e.id AND labels.reward_version = ?
+            WHERE e.episode_id IN (${eligibleIds.map(() => "?").join(",")})
+              AND labels.experience_id IS NULL
+          `).all(SEMANTIC_REWARD_VERSION, ...eligibleIds)
+          .map((row) => row.episode_id)
+        : [];
+      const affectedCredits = new Set(missingEpisodeIds.map((episodeId) =>
+        completedEpisodeIds.has(episodeId) ? episodeId : creditByEpisode.get(episodeId)
+      ).filter(Boolean));
+      groupsToRelabel = groupsToRelabel.filter((group) => affectedCredits.has(group.creditEpisodeId));
+    }
     const transitionQuery = this.db.prepare(`
       SELECT id, action_json, features_json, next_features_json
       FROM semantic_experiences WHERE episode_id = ? ORDER BY id
@@ -581,11 +605,14 @@ export class SemanticRagStore {
     let incompatibleTransitions = 0;
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      // Any changed migration is recomputed as whole canonical trajectories.
-      // This keeps a linked prefix and terminal tail in one backward return
-      // pass instead of granting the prefix a second, standalone terminal.
-      this.db.prepare("DELETE FROM semantic_reward_labels WHERE reward_version = ?").run(SEMANTIC_REWARD_VERSION);
-      for (const group of groups.values()) {
+      // A signature or credit change invalidates the whole reward version. A
+      // newly completed episode only relabels its complete canonical group,
+      // so a linked prefix and terminal tail still share one backward-return
+      // pass without rewriting every prior episode at each game over.
+      if (!incrementalRelabel) {
+        this.db.prepare("DELETE FROM semantic_reward_labels WHERE reward_version = ?").run(SEMANTIC_REWARD_VERSION);
+      }
+      for (const group of groupsToRelabel) {
         const terminalEpisode = group.trajectories.find((episode) => episode.episode_id === group.creditEpisodeId);
         if (!terminalEpisode) continue;
         const rewardable = [];
@@ -1046,13 +1073,15 @@ export class SemanticRagStore {
 
     const candidates = [];
     let searched = 0;
+    let scanned = 0;
     let truncated = false;
     for (const entry of this.hot) {
-      if (entry.screen !== state.state) continue;
-      if ((searched & 63) === 0 && performance.now() - startedAt >= budgetMs) {
+      if ((scanned++ & 63) === 0 && performance.now() - startedAt >= budgetMs) {
         truncated = true;
         break;
       }
+      if (entry.screen !== state.state) continue;
+      if (semanticStakeRuleCompatibility(features, entry.features) === "incompatible") continue;
       searched += 1;
       const similarity = semanticStateSimilarity(features, entry.features);
       if (similarity < this.minimumSimilarity) continue;

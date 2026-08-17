@@ -1,4 +1,8 @@
-import { semanticActionTemplate, semanticStateFeatures } from "./semantic-experience.mjs";
+import {
+  semanticActionTemplate,
+  semanticNormalizeFeatures,
+  semanticStateFeatures,
+} from "./semantic-experience.mjs";
 
 const DEFAULT_MINIMUM_EPISODES = 3;
 const DEFAULT_CONFIDENCE_Z = 1.28;
@@ -22,6 +26,28 @@ function baseCardIdentity(value) {
     .split("@")[0]
     .split("+")[0]
     .trim() || "unknown";
+}
+
+function exactCardIdentity(value) {
+  return String(value ?? "unknown").trim() || "unknown";
+}
+
+function decisionStakeRuleSignature(value) {
+  const rules = value && typeof value === "object" ? value : {};
+  const appliedStakes = Array.isArray(rules.appliedStakes)
+    ? rules.appliedStakes.map((stake) => String(stake ?? "").trim().toUpperCase()).filter(Boolean)
+    : [];
+  return [
+    "decision-stake-rules-v1",
+    `code=${String(rules.code ?? "unknown").trim().toUpperCase() || "UNKNOWN"}`,
+    `applied=${appliedStakes.join(">") || "unknown"}`,
+    `small=${finite(rules.smallBlindReward, 0)}`,
+    `scale=${finite(rules.scalingTier, 0)}`,
+    `discard=${finite(rules.discardModifier, 0)}`,
+    `eternal=${Number(Boolean(rules.eternalStickers))}`,
+    `perishable=${Number(Boolean(rules.perishableStickers))}:${finite(rules.perishableRounds, 5)}`,
+    `rental=${Number(Boolean(rules.rentalStickers))}:${finite(rules.rentalRate, 3)}`,
+  ].join("|");
 }
 
 function cardRank(identity) {
@@ -129,7 +155,9 @@ function buildRoles(jokerKeys) {
 }
 
 function normalizeFeatures(stateOrFeatures) {
-  if (stateOrFeatures?.screen && !stateOrFeatures?.state) return stateOrFeatures;
+  if (stateOrFeatures?.screen && !stateOrFeatures?.state) {
+    return semanticNormalizeFeatures(stateOrFeatures, { canonicalVersion: true }) ?? stateOrFeatures;
+  }
   return semanticStateFeatures(stateOrFeatures);
 }
 
@@ -153,7 +181,20 @@ export function semanticDecisionState(stateOrFeatures) {
     screen,
     phase: String(features?.strategy?.phase ?? phase(finite(features?.ante, 0))),
     deck: String(features?.deck ?? "unknown").toUpperCase() || "UNKNOWN",
-    stake: String(features?.stake ?? "unknown").toUpperCase() || "UNKNOWN",
+    stake: String(features?.stakeRules?.code ?? features?.stake ?? "unknown").toUpperCase() || "UNKNOWN",
+    // Prior buckets use only the cumulative, decision-relevant Stake rules.
+    // Older trajectories can derive this core from their Stake code, while
+    // runtime provenance and deck-specific ante scaling must not fragment the
+    // same Stake. A changed reward, scaling, discard, sticker, lifetime, or
+    // rental-rate rule still produces a different bucket.
+    stakeRuleSignature: decisionStakeRuleSignature(features?.stakeRules),
+    rentalCount: finite(features?.stickerEconomy?.rentalCount, 0),
+    rentalUpkeep: finite(features?.stickerEconomy?.rentalUpkeep, 0),
+    perishableTtls: Array.isArray(features?.stickerEconomy?.perishableTtls)
+      ? [...features.stickerEconomy.perishableTtls]
+      : [],
+    perishableExpired: finite(features?.stickerEconomy?.perishableExpired, 0),
+    eternalLockedSlots: finite(features?.stickerEconomy?.eternalLockedSlots, 0),
     blind: blindType === "BOSS" ? `BOSS:${String(features?.blind?.name ?? "unknown")}` : blindType,
     economy: String(features?.strategy?.economy ?? economy(finite(features?.money, 0))),
     pressure: pressureBand(
@@ -227,14 +268,14 @@ function abstractTemplate(features, template, candidate = null) {
     const shape = groupShape(kept);
     return { method, keptRanks: shape.ranks, keptSuit: Math.min(5, shape.maxSuit), keptCount: shape.count };
   }
-  if (method === "buy") return { method, choice: template?.choice ?? "unknown", item: baseCardIdentity(template?.item) };
-  if (method === "sell") return { method, choice: template?.choice ?? "unknown", item: baseCardIdentity(template?.item) };
+  if (method === "buy") return { method, choice: template?.choice ?? "unknown", item: exactCardIdentity(template?.item) };
+  if (method === "sell") return { method, choice: template?.choice ?? "unknown", item: exactCardIdentity(template?.item) };
   if (method === "pack") return template?.skip
     ? { method, skip: true }
-    : { method, item: baseCardIdentity(template?.item), targets: finite(template?.targets?.length, 0) };
+    : { method, item: exactCardIdentity(template?.item), targets: finite(template?.targets?.length, 0) };
   if (method === "use") return {
     method,
-    item: baseCardIdentity(template?.item),
+    item: exactCardIdentity(template?.item),
     targets: finite(template?.cards?.length, 0),
   };
   if (method === "rearrange") return { method, area: String(template?.area ?? "unknown") };

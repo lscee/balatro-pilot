@@ -10,6 +10,7 @@ import {
 import {
   BALATRO_HAND_STRENGTH,
   balatroCardRank,
+  balatroJokerDebuffed,
   balatroRankNumber,
   classifyBalatroHand,
   validateBalatroConsumableTargets,
@@ -24,6 +25,21 @@ export const BALATROBOT_STATES = Object.freeze({
   PACK: "SMODS_BOOSTER_OPENED",
   GAME_OVER: "GAME_OVER",
 });
+
+export function balatrobotMenuReady(state) {
+  if (state?.state !== BALATROBOT_STATES.MENU) return false;
+  if (typeof state.menuReady === "boolean") return state.menuReady;
+  return state.menu_ready === true;
+}
+
+export function balatrobotHandActionsReady(state) {
+  if (state?.state !== BALATROBOT_STATES.SELECTING_HAND) return null;
+  if (typeof state.handActionsReady === "boolean") return state.handActionsReady;
+  if (typeof state.hand_actions_ready === "boolean") return state.hand_actions_ready;
+  // Older BalatroBot builds do not expose readiness. Keep those builds
+  // compatible instead of treating an absent capability as a permanent lock.
+  return null;
+}
 
 const ACTION_FIELDS = new Set([
   "method",
@@ -50,6 +66,16 @@ const METHODS_BY_STATE = Object.freeze({
 });
 const CONSUMABLE_SETS = new Set(["TAROT", "PLANET", "SPECTRAL"]);
 const GENERIC_CARD_TOKENS = new Set(["the", "and", "joker", "card", "tarot", "planet", "spectral"]);
+const VANILLA_STAKE_ORDER = Object.freeze([
+  "WHITE",
+  "RED",
+  "GREEN",
+  "BLACK",
+  "BLUE",
+  "PURPLE",
+  "ORANGE",
+  "GOLD",
+]);
 
 const EMPTY_ACTION = Object.freeze({
   cards: [],
@@ -67,6 +93,123 @@ const EMPTY_ACTION = Object.freeze({
 
 function areaCards(area) {
   return Array.isArray(area?.cards) ? area.cards : [];
+}
+
+function areaOccupancy(area) {
+  const visible = areaCards(area).length;
+  const reported = Number(area?.count);
+  return Math.max(visible, Number.isFinite(reported) && reported >= 0 ? reported : 0);
+}
+
+function firstFinite(...values) {
+  for (const value of values) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) return numeric;
+  }
+  return null;
+}
+
+function canonicalStakeName(value) {
+  const name = String(value?.key ?? value?.name ?? value ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/^STAKE_/, "")
+    .replace(/(?:_|\s+)STAKE$/, "");
+  return VANILLA_STAKE_ORDER.includes(name) ? name : "";
+}
+
+/**
+ * Normalize the exact Mod-provided run rules while keeping old BalatroBot
+ * builds useful. The fallback is deliberately limited to the installed
+ * vanilla 1.0.1o Stake chain; explicit runtime values always win.
+ */
+export function balatrobotStakeRules(state) {
+  const raw = state?.stakeRules ?? state?.stake_rules ?? state?.runModifiers ?? state?.run_modifiers ?? {};
+  const stake = canonicalStakeName(raw.stake ?? state?.stake);
+  const stakeIndex = VANILLA_STAKE_ORDER.indexOf(stake);
+  const inferredApplied = stakeIndex >= 0 ? VANILLA_STAKE_ORDER.slice(0, stakeIndex + 1) : [];
+  const suppliedApplied = raw.appliedStakes ?? raw.applied_stakes;
+  const appliedStakes = Array.isArray(suppliedApplied)
+    ? suppliedApplied.map(canonicalStakeName).filter(Boolean)
+    : inferredApplied;
+  const applied = new Set(appliedStakes);
+  const smallBlindReward = firstFinite(raw.smallBlindReward, raw.small_blind_reward);
+  const smallBlindBaseReward = firstFinite(raw.smallBlindBaseReward, raw.small_blind_base_reward);
+  const scalingTier = firstFinite(raw.scalingTier, raw.scaling_tier, raw.scaling);
+  const discardModifier = firstFinite(raw.discardModifier, raw.discard_modifier, raw.discardsDelta, raw.discards_delta);
+  const rentalRate = firstFinite(raw.rentalRate, raw.rental_rate);
+  const perishableRounds = firstFinite(raw.perishableRounds, raw.perishable_rounds);
+  const anteScaling = firstFinite(raw.anteScaling, raw.ante_scaling);
+  const normalized = {
+    stake: stake || String(state?.stake ?? raw.stake ?? ""),
+    stakeLevel: firstFinite(raw.stakeLevel, raw.stake_level) ?? (stakeIndex >= 0 ? stakeIndex + 1 : null),
+    appliedStakes,
+    smallBlindBaseReward: smallBlindBaseReward ?? 3,
+    smallBlindReward: smallBlindReward ?? (applied.has("RED") ? 0 : 3),
+    noSmallBlindReward: raw.noSmallBlindReward === true || raw.no_small_blind_reward === true || applied.has("RED"),
+    scalingTier: scalingTier ?? (applied.has("PURPLE") ? 3 : applied.has("GREEN") ? 2 : 1),
+    anteScaling,
+    baseDiscards: firstFinite(raw.baseDiscards, raw.base_discards, raw.vanillaBaseDiscards, raw.vanilla_base_discards),
+    preStakeDiscards: firstFinite(raw.preStakeDiscards, raw.pre_stake_discards),
+    actualDiscards: firstFinite(
+      raw.actualDiscards,
+      raw.actual_discards,
+      raw.startingDiscards,
+      raw.starting_discards,
+    ),
+    discardModifier: discardModifier ?? (applied.has("BLUE") ? -1 : 0),
+    stakeDiscardPenalty: firstFinite(raw.stakeDiscardPenalty, raw.stake_discard_penalty) ?? (applied.has("BLUE") ? 1 : 0),
+    eternalStickers: raw.eternalStickers === true || raw.eternal_stickers === true || applied.has("BLACK"),
+    perishableStickers: raw.perishableStickers === true || raw.perishable_stickers === true || applied.has("ORANGE"),
+    rentalStickers: raw.rentalStickers === true || raw.rental_stickers === true || applied.has("GOLD"),
+    perishableRounds: perishableRounds ?? 5,
+    rentalRate: rentalRate ?? 3,
+  };
+  normalized.signature = [
+    normalized.appliedStakes.join(">"),
+    `small=${normalized.smallBlindReward}`,
+    `scale=${normalized.scalingTier}`,
+    `discard=${normalized.discardModifier}`,
+    `eternal=${Number(normalized.eternalStickers)}`,
+    `perishable=${Number(normalized.perishableStickers)}:${normalized.perishableRounds}`,
+    `rental=${Number(normalized.rentalStickers)}:${normalized.rentalRate}`,
+  ].join("|");
+  return normalized;
+}
+
+export function balatrobotStickerEconomy(state) {
+  const rules = balatrobotStakeRules(state);
+  const jokers = areaCards(state?.jokers);
+  const rentals = jokers.filter((joker) => Boolean(joker?.modifier?.rental ?? joker?.rental));
+  const perishable = jokers.filter((joker) => {
+    const modifier = joker?.modifier ?? joker ?? {};
+    return modifier.isPerishable === true || modifier.is_perishable === true ||
+      (modifier.perishable !== undefined && modifier.perishable !== null && modifier.perishable !== false);
+  });
+  const expiredPerishables = perishable.filter((joker) => {
+    const modifier = joker?.modifier ?? joker ?? {};
+    const tally = firstFinite(modifier.perishableTally, modifier.perishable_tally, modifier.perishable);
+    return tally !== null && tally <= 0 || Boolean(joker?.state?.debuff ?? joker?.debuff);
+  });
+  const eternalLockedSlots = jokers.filter((joker) => Boolean(joker?.modifier?.eternal ?? joker?.eternal)).length;
+  const rentalRate = Math.max(0, rules.rentalRate ?? 3);
+  const rentalUpkeep = rentals.length * rentalRate;
+  const money = firstFinite(state?.money) ?? 0;
+  const activeCredit = jokers.reduce((total, joker) =>
+    total + (joker?.key === "j_credit_card" && !balatroJokerDebuffed(joker) ? 20 : 0), 0);
+  return {
+    rentalCount: rentals.length,
+    rentalRate,
+    rentalUpkeep,
+    twoBlindUpkeep: rentalUpkeep * 2,
+    perishableCount: perishable.length,
+    expiredPerishableCount: expiredPerishables.length,
+    eternalLockedSlots,
+    money,
+    activeCredit,
+    legalLiquidity: money + activeCredit,
+    cashAfterNextUpkeep: money - rentalUpkeep,
+  };
 }
 
 function compactCard(card, index) {
@@ -88,8 +231,19 @@ function compactCard(card, index) {
     edition: modifier.edition ?? null,
     seal: modifier.seal ?? null,
     eternal: Boolean(modifier.eternal),
+    isPerishable: modifier.isPerishable === true || modifier.is_perishable === true ||
+      (modifier.perishable !== undefined && modifier.perishable !== null && modifier.perishable !== false),
     perishable: modifier.perishable ?? null,
+    perishableTally: Number.isFinite(Number(modifier.perishableTally ?? modifier.perishable_tally ?? modifier.perishable))
+      ? Number(modifier.perishableTally ?? modifier.perishable_tally ?? modifier.perishable)
+      : null,
+    perishableRounds: Number.isFinite(Number(modifier.perishable_rounds ?? modifier.perishableRounds))
+      ? Number(modifier.perishable_rounds ?? modifier.perishableRounds)
+      : null,
     rental: Boolean(modifier.rental),
+    rentalRate: Number.isFinite(Number(modifier.rental_rate ?? modifier.rentalRate))
+      ? Number(modifier.rental_rate ?? modifier.rentalRate)
+      : null,
     debuff: Boolean(cardState.debuff),
     hidden: Boolean(cardState.hidden),
     highlight: Boolean(cardState.highlight),
@@ -133,6 +287,8 @@ function compactBlind(blind) {
     name: blind.name ?? "",
     effect: blind.effect ?? "",
     score: blind.score ?? null,
+    reward: firstFinite(blind.reward, blind.dollars, blind.money),
+    noReward: blind.noReward === true || blind.no_reward === true,
     tagName: blind.tag_name ?? null,
     tagEffect: blind.tag_effect ?? null,
   };
@@ -167,12 +323,24 @@ export function compactBalatrobotState(state) {
   const highScoreTraining = balatrobotHighScoreBuildProfile(state);
   return {
     state: state.state,
+    ...(state.state === BALATROBOT_STATES.MENU
+      ? {
+          menuReady: typeof state.menuReady === "boolean"
+            ? state.menuReady
+            : (typeof state.menu_ready === "boolean" ? state.menu_ready : null),
+        }
+      : {}),
+    ...(state.state === BALATROBOT_STATES.SELECTING_HAND
+      ? { handActionsReady: balatrobotHandActionsReady(state) }
+      : {}),
     ante: state.ante_num ?? null,
     roundNumber: state.round_num ?? null,
     money: state.money ?? null,
     won: state.won ?? null,
     deck: state.deck ?? null,
     stake: state.stake ?? null,
+    stakeRules: balatrobotStakeRules(state),
+    stickerEconomy: balatrobotStickerEconomy(state),
     seed: state.seed ?? null,
     bossRerolled: Boolean(state.boss_rerolled),
     lastTarotPlanet: typeof state.last_tarot_planet === "string" ? state.last_tarot_planet : null,
@@ -236,8 +404,7 @@ function assertIndicesInArea(state, areaName, indices, label) {
 }
 
 function availableMoney(state) {
-  const creditCard = areaCards(state?.jokers).some((joker) => joker?.key === "j_credit_card");
-  return Number(state?.money) + (creditCard ? 20 : 0);
+  return balatrobotStickerEconomy(state).legalLiquidity;
 }
 
 function actionNamesCard(card, text) {
@@ -305,13 +472,19 @@ function rpcParams(method, params, state) {
     case "reroll": {
       assertNoParams(params, method);
       const cost = Number(state.round?.reroll_cost);
-      const money = availableMoney(state);
-      if (Number.isFinite(cost) && cost > 0 && Number.isFinite(money) && cost > money) {
-        throw new Error(`reroll costs $${cost}, but only $${money} is available`);
+      // Credit Card liquidity is reserved for an exact lifesaving purchase or
+      // Boss reroll. A speculative paid shop reroll must be funded by cash;
+      // native $0 rerolls remain legal even while the balance is negative.
+      const cash = Math.max(0, Number.isFinite(Number(state?.money)) ? Number(state.money) : 0);
+      if (Number.isFinite(cost) && cost > 0 && cost > cash) {
+        throw new Error(`reroll costs $${cost}, but only $${cash} cash is available`);
       }
       return {};
     }
     case "play": {
+      if (balatrobotHandActionsReady(state) === false) {
+        throw new Error("play is temporarily unavailable because native hand actions are not ready");
+      }
       const configuredLimit = Number(state.hand?.highlighted_limit);
       const limit = Number.isInteger(configuredLimit) && configuredLimit > 0 ? configuredLimit : 5;
       const cards = uniqueIndices(params.cards, "play.cards", { min: 1, max: limit });
@@ -322,6 +495,9 @@ function rpcParams(method, params, state) {
       return { cards };
     }
     case "discard": {
+      if (balatrobotHandActionsReady(state) === false) {
+        throw new Error("discard is temporarily unavailable because native hand actions are not ready");
+      }
       const limit = Math.min(5, Number(state.hand?.highlighted_limit) || 5);
       const cards = uniqueIndices(params.cards, "discard.cards", { min: 1, max: limit });
       assertIndicesInArea(state, "hand", cards, "discard.cards");
@@ -339,17 +515,17 @@ function rpcParams(method, params, state) {
       const card = assertAreaIndex(state, areaName, index, `buy.${choice}`);
       const price = card?.cost?.buy;
       const money = availableMoney(state);
-      if (Number.isFinite(price) && Number.isFinite(money) && price > money) {
+      if (Number.isFinite(price) && price > 0 && Number.isFinite(money) && price > money) {
         throw new Error(`buy.${choice} costs $${price}, but only $${money} is available`);
       }
       if (choice === "card") {
         const set = String(card?.set ?? "").toUpperCase();
         // BalatroBot v1.5.2 rejects full-slot purchases even for Negative cards (upstream #208).
         // Match the stable server contract here so the planner does not enter an RPC retry loop.
-        if (set === "JOKER" && state.jokers?.count >= state.jokers?.limit) {
+        if (set === "JOKER" && areaOccupancy(state.jokers) >= state.jokers?.limit) {
           throw new Error("cannot buy this Joker while Joker slots are full; sell first or choose another action");
         }
-        if (CONSUMABLE_SETS.has(set) && state.consumables?.count >= state.consumables?.limit) {
+        if (CONSUMABLE_SETS.has(set) && areaOccupancy(state.consumables) >= state.consumables?.limit) {
           throw new Error("cannot buy this consumable while consumable slots are full; use/sell first or choose another action");
         }
       }
@@ -364,7 +540,7 @@ function rpcParams(method, params, state) {
       }
       const price = offeredCard?.cost?.buy;
       const money = availableMoney(state);
-      if (Number.isFinite(price) && Number.isFinite(money) && price > money) {
+      if (Number.isFinite(price) && price > 0 && Number.isFinite(money) && price > money) {
         throw new Error(`buy_use.card costs $${price}, but only $${money} is available`);
       }
       const targets = uniqueIndices(params.targets, "buy_use.targets", { min: 0, max: 5 });
@@ -394,7 +570,7 @@ function rpcParams(method, params, state) {
       const offeredCard = assertAreaIndex(state, "pack", card, "pack.card");
       if (
         String(offeredCard?.set ?? "").toUpperCase() === "JOKER" &&
-        state.jokers?.count >= state.jokers?.limit
+        areaOccupancy(state.jokers) >= state.jokers?.limit
       ) {
         throw new Error("cannot select this Joker from the pack while Joker slots are full");
       }
@@ -496,12 +672,22 @@ function assertHandNarrativeMatchesAction(state, method, cards, rationale) {
 }
 
 function immediateScoringShopOffers(state) {
-  const openSlots = Math.max(0, Number(state?.jokers?.limit) - Number(state?.jokers?.count));
+  const openSlots = Math.max(0, Number(state?.jokers?.limit) - areaOccupancy(state?.jokers));
   if (openSlots <= 0) return [];
-  const money = availableMoney(state);
+  const stickerEconomy = balatrobotStickerEconomy(state);
+  const money = Math.max(0, stickerEconomy.legalLiquidity - stickerEconomy.twoBlindUpkeep);
   return areaCards(state?.shop)
     .map((card, index) => ({ card, index }))
     .filter(({ card }) => String(card?.set ?? "").toUpperCase() === "JOKER")
+    // Fallback is deliberately unable to accept Sticker liabilities. Those
+    // offers require the full strategic NPV path even when their printed
+    // purchase price is low and their immediate scoring text looks useful.
+    .filter(({ card }) => {
+      const modifier = card?.modifier ?? card ?? {};
+      const hasPerishable = modifier.isPerishable === true || modifier.is_perishable === true ||
+        (modifier.perishable !== undefined && modifier.perishable !== null && modifier.perishable !== false);
+      return !modifier.eternal && !modifier.rental && !hasPerishable;
+    })
     .filter(({ card }) => Number(card?.cost?.buy) <= money)
     .filter(({ card }) => balatrobotIsScoringJoker(card));
 }
@@ -600,7 +786,7 @@ export function balatrobotShopRerollBudget(state, { benchmarks = null } = {}) {
     (left, right) => right.played - left.played || repeatabilityOf(right) - repeatabilityOf(left),
   )[0] ?? { name: "High Card", chips: 5, mult: 1, played: 0 };
   const scoringJokers = balatrobotScoringJokerCount(state);
-  const activeJokers = areaCards(state?.jokers).filter((joker) => !joker?.state?.debuff).length;
+  const activeJokers = areaCards(state?.jokers).filter((joker) => !balatroJokerDebuffed(joker)).length;
   const blindName = String(blind?.name ?? "").trim().toLowerCase();
   // SHOP.hands_left belongs to the blind that just ended. Forecast the next
   // blind from the run's actual hand allowance instead of that stale value.
@@ -618,8 +804,18 @@ export function balatrobotShopRerollBudget(state, { benchmarks = null } = {}) {
   const estimatedPerHand = Math.max(proxyPerHand, Math.round(evidence.perHand));
   const estimatedRoundCapacity = Math.max(1, estimatedPerHand * handCapacity);
   const pressure = target > 0 ? target / estimatedRoundCapacity : 0;
-  const openSlots = Math.max(0, (finiteNumber(state?.jokers?.limit) ?? activeJokers) - activeJokers);
-  const rerollCost = Math.max(0, finiteNumber(state?.round?.reroll_cost, state?.round?.rerollCost) ?? 0);
+  // Debuffed and expired Perishable Jokers still occupy physical slots. Use
+  // the area's actual occupancy for shop capacity; activeJokers is only a
+  // scoring-strength signal.
+  const occupiedJokerSlots = areaCards(state?.jokers).length;
+  const openSlots = Math.max(
+    0,
+    (finiteNumber(state?.jokers?.limit) ?? occupiedJokerSlots) - occupiedJokerSlots,
+  );
+  const rawRerollCost = finiteNumber(state?.round?.reroll_cost, state?.round?.rerollCost);
+  const rerollCost = Math.max(0, rawRerollCost ?? 0);
+  const explicitFreeReroll = rawRerollCost === 0;
+  const stickerEconomy = balatrobotStickerEconomy(state);
   const cash = Math.max(0, finiteNumber(state?.money) ?? 0);
 
   let desiredRerolls = target > 0
@@ -647,13 +843,20 @@ export function balatrobotShopRerollBudget(state, { benchmarks = null } = {}) {
   const remainingDesiredRerolls = Math.max(0, desiredRerolls - rerollsUsed);
 
   const survivalUrgency = Math.max(0, Math.min(1, (pressure - 0.75) / 3));
-  const reserve = Math.round(15 - survivalUrgency * 10);
+  const interestAndSafetyReserve = Math.round(15 - survivalUrgency * 10);
+  // Rental is charged after every completed Blind, including while debuffed.
+  // Protect two payments so a superficially cheap $1 Sticker cannot silently
+  // consume the search budget and force the run further into debt.
+  const operatingReserve = stickerEconomy.twoBlindUpkeep;
+  const reserve = interestAndSafetyReserve + operatingReserve;
   const spendable = Math.max(0, cash - reserve);
   const requestedBudget = rerollCost > 0 ? remainingDesiredRerolls * rerollCost : 0;
   const budget = rerollCost > 0
     ? Math.floor(Math.min(spendable, requestedBudget) / rerollCost) * rerollCost
     : 0;
-  const maxRerolls = rerollCost > 0 ? Math.floor(budget / rerollCost) : (remainingDesiredRerolls > 0 ? 1 : 0);
+  const maxRerolls = rerollCost > 0
+    ? Math.floor(budget / rerollCost)
+    : (explicitFreeReroll ? 1 : 0);
   return {
     blind: blind?.name ?? null,
     target,
@@ -666,7 +869,19 @@ export function balatrobotShopRerollBudget(state, { benchmarks = null } = {}) {
     estimatedRoundCapacity,
     pressure: Math.round(pressure * 100) / 100,
     reserve,
+    interestAndSafetyReserve,
+    operatingReserve,
+    rentalCount: stickerEconomy.rentalCount,
+    rentalRate: stickerEconomy.rentalRate,
+    rentalUpkeep: stickerEconomy.rentalUpkeep,
+    cashAfterNextUpkeep: stickerEconomy.cashAfterNextUpkeep,
+    cash,
+    legalLiquidity: stickerEconomy.legalLiquidity,
+    emergencyCredit: stickerEconomy.activeCredit,
+    creditReservedForSurvival: stickerEconomy.activeCredit > 0,
+    spendableCash: spendable,
     rerollCost,
+    explicitFreeReroll,
     budget,
     maxRerolls,
     desiredRerolls,
@@ -674,7 +889,7 @@ export function balatrobotShopRerollBudget(state, { benchmarks = null } = {}) {
     remainingDesiredRerolls,
     openSlots,
     scoringJokers,
-    shouldReroll: rerollCost === 0 ? remainingDesiredRerolls > 0 : maxRerolls > 0,
+    shouldReroll: explicitFreeReroll || (rerollCost > 0 && maxRerolls > 0),
   };
 }
 
@@ -718,9 +933,10 @@ function assertBuyNarrativeMatchesAction(state, params, actionReason, strategy) 
   }
 }
 
-function assertShopResourcesConverted(state, method, params) {
+function assertShopResourcesConverted(state, method, params, { allowTrustedShopExit = false } = {}) {
   if (state?.state !== "SHOP") return;
   if (method === "next_round") {
+    if (allowTrustedShopExit) return;
     const decision = balatrobotShopRerollBudget(state);
     if (decision.shouldReroll) {
       throw new Error(
@@ -811,7 +1027,13 @@ export function sanitizeCollectionAwareRunPlan(runPlan, collectionKnowledge, app
 export function validateBalatrobotPlan(
   candidate,
   state,
-  { minimumConfidence = 0, allowBlindSkip = false, collectionKnowledge = null, appearedThisRun = null } = {},
+  {
+    minimumConfidence = 0,
+    allowBlindSkip = false,
+    allowTrustedShopExit = false,
+    collectionKnowledge = null,
+    appearedThisRun = null,
+  } = {},
 ) {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
     throw new Error("BalatroBot planner result must be an object");
@@ -845,7 +1067,7 @@ export function validateBalatrobotPlan(
   if (method === "buy" || method === "buy_use") {
     assertBuyNarrativeMatchesAction(state, normalizedParams, rawAction.reason, candidate.strategy);
   }
-  assertShopResourcesConverted(state, method, normalizedParams);
+  assertShopResourcesConverted(state, method, normalizedParams, { allowTrustedShopExit });
   if (method === "sell") {
     const choice = Number.isInteger(normalizedParams.joker) ? "joker" : "consumable";
     const areaName = choice === "joker" ? "jokers" : "consumables";
@@ -863,7 +1085,7 @@ export function validateBalatrobotPlan(
     const explicitlySkips = /(?:跳过|skip)/iu.test(rationale);
     const contradictsSkip = /(?:不跳过|正常挑战|挑战当前|打当前|进入当前|play\s+(?:the\s+)?current\s+blind)/iu.test(rationale);
     const highValueTag = /(?:Investment|Economy|Negative|Polychrome|Rare|Uncommon|Voucher|Coupon|投资|经济|负片|多彩|稀有|罕见|优惠券)/iu.test(tag);
-    const matureBuild = areaCards(state?.jokers).filter((joker) => !joker?.state?.debuff).length >= 3 &&
+    const matureBuild = areaCards(state?.jokers).filter((joker) => !balatroJokerDebuffed(joker)).length >= 3 &&
       balatrobotScoringJokerCount(state) >= 2;
     if (!allowBlindSkip) throw new Error("blind skip is disabled outside a fresh strategic tag evaluation");
     if (confidence < 0.9) throw new Error("blind skip requires confidence of at least 0.90");
@@ -910,6 +1132,7 @@ export function deterministicBalatrobotAction(state, config = {}) {
   if (jokerOrderAction) return jokerOrderAction;
   switch (state?.state) {
     case BALATROBOT_STATES.MENU:
+      if (!balatrobotMenuReady(state)) return null;
       return {
         method: "start",
         params: { deck: config.balatrobotDeck ?? "RED", stake: config.balatrobotStake ?? "WHITE" },
@@ -958,6 +1181,7 @@ export function fallbackBalatrobotAction(state) {
     case BALATROBOT_STATES.BLIND_SELECT:
       return { method: "select", params: {}, reason: "Fallback: play the current blind" };
     case BALATROBOT_STATES.SELECTING_HAND: {
+      if (balatrobotHandActionsReady(state) === false) return null;
       const candidates = generateBalatrobotCandidates(state);
       const assessment = balatrobotSurvivalAssessment(state, candidates);
       if (assessment.shouldResolveBoss && assessment.requiredBossAction) {

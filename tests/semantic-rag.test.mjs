@@ -6,7 +6,12 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { SemanticRagStore } from "../src/semantic-rag.mjs";
-import { semanticDiscountedReturns, semanticStateFeatures } from "../src/semantic-experience.mjs";
+import {
+  SEMANTIC_POLICY_VERSION,
+  SEMANTIC_REWARD_VERSION,
+  semanticDiscountedReturns,
+  semanticStateFeatures,
+} from "../src/semantic-experience.mjs";
 
 function card(key) {
   const [suit, rank] = key.split("_");
@@ -118,7 +123,8 @@ test("semantic RAG learns only after terminal outcomes and fast replay requires 
     retrieval = store.retrieve(before);
     assert.deepEqual(store.chooseFastAction(retrieval).action.params.cards, [0, 1]);
     assert.equal(store.stats().learnedTransitions, 2);
-    assert.equal(store.stats().policyVersion, 5);
+    assert.equal(store.stats().policyVersion, 6);
+    assert.equal(store.stats().rewardVersion, 7);
     assert.equal(store.stats().positiveLossTransitions, 0);
     assert.equal(store.stats().tenThousandEpisodes, 0);
     assert.equal(store.topActions(1)[0].method, "play");
@@ -130,6 +136,35 @@ test("semantic RAG learns only after terminal outcomes and fast replay requires 
       averageRound: 4,
     }]);
     assert.deepEqual(store.deckPerformance("GOLD"), []);
+  } finally {
+    store?.close();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+  }
+});
+
+test("semantic RAG never injects experience across stake or known rule signatures", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "balatro-semantic-rag-stake-"));
+  let store;
+  try {
+    store = new SemanticRagStore(root, config("data/semantic.sqlite"));
+    const gold = state({ stake: "GOLD" });
+    const after = state({
+      stake: "GOLD",
+      round: { chips: 400, hands_left: 2, discards_left: 1, reroll_cost: 5 },
+    });
+    store.beginEpisode({ episodeId: "gold-win", runId: "gold-run", state: gold });
+    store.recordTransition({
+      runId: "gold-run", episodeId: "gold-win", step: 1, state: gold,
+      action: { method: "play", params: { cards: [0, 1] } }, nextState: after,
+      source: "balatrobot_model", plan: {}, usage: {},
+    });
+    store.finalizeEpisode("gold-win", "won", { ...after, won: true, ante_num: 9 });
+    assert.equal(store.retrieve(gold).evidence.length, 1);
+    assert.equal(store.retrieve(state({ stake: "WHITE" })).evidence.length, 0);
+    assert.equal(store.retrieve(state({
+      stake: "GOLD",
+      run_modifiers: { rental_rate: 4 },
+    })).evidence.length, 0);
   } finally {
     store?.close();
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
@@ -267,6 +302,9 @@ test("reward migration relabels legacy trajectories idempotently without overwri
 
     store = new SemanticRagStore(root, config("data/semantic.sqlite"));
     const migration = store.rewardMigrationStatus();
+    assert.equal(SEMANTIC_POLICY_VERSION, 6);
+    assert.equal(SEMANTIC_REWARD_VERSION, 7);
+    assert.equal(migration.rewardVersion, 7);
     assert.equal(migration.transitions, 1);
     assert.equal(migration.semanticTransitions, 1);
     assert.equal(migration.rawTrajectoriesImmutable, true);
@@ -298,6 +336,53 @@ test("reward migration relabels legacy trajectories idempotently without overwri
     try {
       fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     } catch (error) {
+      if (error?.code !== "EPERM") throw error;
+    }
+  }
+});
+
+test("reward migration appends a newly completed canonical group without relabeling old history", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "balatro-semantic-rag-incremental-"));
+  let store;
+  try {
+    store = new SemanticRagStore(root, config("data/semantic.sqlite"));
+    const before = state();
+    const after = state({ round: { ...before.round, chips: 500 } });
+    const recordAndFinish = (episodeId) => {
+      store.beginEpisode({ episodeId, runId: `${episodeId}-run`, state: before });
+      store.recordTransition({
+        runId: `${episodeId}-run`, episodeId, step: 1, state: before,
+        action: { method: "play", params: { cards: [0, 1] } }, nextState: after,
+        source: "balatrobot_model", plan: {}, usage: {},
+      });
+      store.finalizeEpisode(episodeId, "lost", { ...after, state: "GAME_OVER", ante_num: 2 });
+    };
+
+    recordAndFinish("old-group");
+    const oldExperienceId = store.db.prepare(
+      "SELECT id FROM semantic_experiences WHERE episode_id='old-group'",
+    ).get().id;
+    store.db.prepare(`
+      UPDATE semantic_reward_labels SET relabeled_at='preserve-me'
+      WHERE experience_id=? AND reward_version=?
+    `).run(oldExperienceId, SEMANTIC_REWARD_VERSION);
+
+    recordAndFinish("new-group");
+    const migration = store.rewardMigrationStatus();
+    assert.equal(migration.transitions, 2);
+    assert.equal(migration.relabeledTransitions, 1);
+    assert.equal(
+      store.db.prepare(`
+        SELECT relabeled_at FROM semantic_reward_labels
+        WHERE experience_id=? AND reward_version=?
+      `).get(oldExperienceId, SEMANTIC_REWARD_VERSION).relabeled_at,
+      "preserve-me",
+    );
+    assert.equal(store.allRewardEvidence().length, 2);
+    assert.equal(store.migrateRewards().changed, false);
+  } finally {
+    store?.close();
+    try { fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch (error) {
       if (error?.code !== "EPERM") throw error;
     }
   }
@@ -491,9 +576,9 @@ test("reward migration links a conservative interrupted segment to one completed
       SELECT e.episode_id, labels.immediate_reward
       FROM semantic_reward_labels labels
       JOIN semantic_experiences e ON e.id = labels.experience_id
-      WHERE labels.reward_version = 6 AND labels.credit_episode_id = 'terminal'
+      WHERE labels.reward_version = ? AND labels.credit_episode_id = 'terminal'
       ORDER BY CASE e.episode_id WHEN 'front' THEN 0 ELSE 1 END, e.id
-    `).all();
+    `).all(SEMANTIC_REWARD_VERSION);
     rewardDb.close();
     const expectedCombinedReturns = semanticDiscountedReturns(rawImmediate.map((row, index) => ({
       id: index + 1,

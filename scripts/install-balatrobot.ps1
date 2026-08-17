@@ -36,7 +36,12 @@ $BalatroBotUnsafeEndlessRuntimeFingerprint = "e2ab32128ec0fed5473e215df423265fac
 $BalatroBotPrePackRuntimeFingerprint = "a5b67a53b06fd4a949b3031d870bea87c6280b8bb7e13a1ad0b9d79e9145603d"
 $BalatroBotPreCapabilityRuntimeFingerprint = "d53fa2eb86813c48e33b9d2c9317f786ef24bef28c0c60e4b4a48bcfcb6441e2"
 $BalatroBotPreBuyUseRuntimeFingerprint = "7c780857ac7b7991479bc8942db17830a2b4c5ad4e9808718ac0f1dc17f00e7d"
-$BalatroBotRuntimeFingerprint = "f5ffff76f5b0237e617a48e539ebb8cd4e007fa717cc0378987406559860964f"
+$BalatroBotPreMenuGuardRuntimeFingerprint = "f5ffff76f5b0237e617a48e539ebb8cd4e007fa717cc0378987406559860964f"
+$BalatroBotOverstrictMenuGuardRuntimeFingerprint = "2ed8eb8bf7335f08579c11f56e35ca1cc51d2f2d548de60275386749f920b2d2"
+$BalatroBotPreHandActionsReadyRuntimeFingerprint = "8f84fc808d786c0be5e8be1c53b364fc569dbac18b57e6145f2f260abf08ca25"
+$BalatroBotOverstrictEventGuardRuntimeFingerprint = "16a24175f4e827e758875d94622a46a4a91074beacc37fff2f4463950b7b9943"
+$BalatroBotPreGoldRulesRuntimeFingerprint = "a8bc8486f0bd37ecddd6cb5cd42447a0d6bbb8d2ce7d75e95140fc38f0e0d48d"
+$BalatroBotRuntimeFingerprint = "b6da92128779742cd1a684c83b45027d603b3cf56be5d5a242c7269bb420c0d1"
 
 $UvVersion = "0.12.3"
 $UvArchiveUri = "https://github.com/astral-sh/uv/releases/download/0.12.3/uv-x86_64-pc-windows-msvc.zip"
@@ -300,9 +305,11 @@ function Add-BalatroBotEndlessPatch {
   $assetRoot = Join-Path $projectRoot "assets\balatrobot-v1.5.2"
   $endpointSource = Join-Path $assetRoot "endless.lua"
   $playSource = Join-Path $assetRoot "play.lua"
+  $discardSource = Join-Path $assetRoot "discard.lua"
   $cashOutSource = Join-Path $assetRoot "cash_out.lua"
   $packSource = Join-Path $assetRoot "pack.lua"
   $useSource = Join-Path $assetRoot "use.lua"
+  $startSource = Join-Path $assetRoot "start.lua"
   $bossRerollSource = Join-Path $assetRoot "reroll_boss.lua"
   $buyUseSource = Join-Path $assetRoot "buy_use.lua"
   $endlessMethodSource = Join-Path $assetRoot "openrpc-endless-method.json"
@@ -311,9 +318,11 @@ function Add-BalatroBotEndlessPatch {
   foreach ($asset in @(
     $endpointSource,
     $playSource,
+    $discardSource,
     $cashOutSource,
     $packSource,
     $useSource,
+    $startSource,
     $bossRerollSource,
     $buyUseSource,
     $endlessMethodSource,
@@ -334,11 +343,12 @@ function Add-BalatroBotEndlessPatch {
     Copy-Item -LiteralPath $endpointSource -Destination $endpointTarget -ErrorAction Stop
   }
 
-  # Replace the two pinned v1.5.2 endpoints as one atomic compatibility patch.
-  # play.lua must distinguish the native victory overlay from the persistent
+  # Keep hand actions independent of the optional deck-preview button UI.
+  # play.lua also distinguishes the native victory overlay from the persistent
   # G.GAME.won flag in Endless, while cash_out.lua independently waits until
   # every payout-row event and the native cash-out button are ready.
   Copy-Item -LiteralPath $playSource -Destination (Join-Path $Root "src\lua\endpoints\play.lua") -Force -ErrorAction Stop
+  Copy-Item -LiteralPath $discardSource -Destination (Join-Path $Root "src\lua\endpoints\discard.lua") -Force -ErrorAction Stop
   Copy-Item -LiteralPath $cashOutSource -Destination (Join-Path $Root "src\lua\endpoints\cash_out.lua") -Force -ErrorAction Stop
   # Mixed packs can contain Black Hole before an ordinary Planet. The pinned
   # endpoint derives hand readiness from the selected card and actual targets,
@@ -347,6 +357,7 @@ function Add-BalatroBotEndlessPatch {
   # Aura is a vanilla special case whose center does not declare its one-card
   # target contract. Keep the endpoint and game-level validation pinned.
   Copy-Item -LiteralPath $useSource -Destination (Join-Path $Root "src\lua\endpoints\use.lua") -Force -ErrorAction Stop
+  Copy-Item -LiteralPath $startSource -Destination (Join-Path $Root "src\lua\endpoints\start.lua") -Force -ErrorAction Stop
   Copy-Item -LiteralPath $bossRerollSource -Destination (Join-Path $Root "src\lua\endpoints\reroll_boss.lua") -Force -ErrorAction Stop
   Copy-Item -LiteralPath $buyUseSource -Destination (Join-Path $Root "src\lua\endpoints\buy_use.lua") -Force -ErrorAction Stop
 
@@ -468,7 +479,12 @@ function Get-TargetState {
     $fingerprint -eq $BalatroBotUnsafeEndlessRuntimeFingerprint -or
     $fingerprint -eq $BalatroBotPrePackRuntimeFingerprint -or
     $fingerprint -eq $BalatroBotPreCapabilityRuntimeFingerprint -or
-    $fingerprint -eq $BalatroBotPreBuyUseRuntimeFingerprint
+    $fingerprint -eq $BalatroBotPreBuyUseRuntimeFingerprint -or
+    $fingerprint -eq $BalatroBotPreMenuGuardRuntimeFingerprint -or
+    $fingerprint -eq $BalatroBotOverstrictMenuGuardRuntimeFingerprint -or
+    $fingerprint -eq $BalatroBotPreHandActionsReadyRuntimeFingerprint -or
+    $fingerprint -eq $BalatroBotOverstrictEventGuardRuntimeFingerprint -or
+    $fingerprint -eq $BalatroBotPreGoldRulesRuntimeFingerprint
   ) {
     return [pscustomobject]@{ State = "patch"; Detail = "BalatroBot v$BalatroBotVersion legacy runtime detected; installer will apply the pinned entropy, safe settlement, and selected-card pack patches" }
   }

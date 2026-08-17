@@ -2,8 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  balatrobotHandActionsReady,
   balatrobotShopRerollBudget,
+  balatrobotStakeRules,
   balatrobotStateFingerprint,
+  balatrobotStickerEconomy,
   compactBalatrobotState,
   deterministicBalatrobotAction,
   fallbackBalatrobotAction,
@@ -12,14 +15,37 @@ import {
   validateBalatrobotPlan,
 } from "../src/balatrobot-policy.mjs";
 
-function card({ key, set = "DEFAULT", rank, suit, buy = 0, edition = null, eternal = false } = {}) {
+function card({
+  key,
+  set = "DEFAULT",
+  rank,
+  suit,
+  buy = 0,
+  edition = null,
+  eternal = false,
+  perishable = null,
+  isPerishable = false,
+  is_perishable = false,
+  perishableTally = null,
+  perishable_tally = null,
+  rental = false,
+} = {}) {
   return {
     id: 1,
     key,
     set,
     label: key,
     value: { rank, suit, effect: `${key} effect` },
-    modifier: { edition, eternal },
+    modifier: {
+      edition,
+      eternal,
+      perishable,
+      isPerishable,
+      is_perishable,
+      perishableTally,
+      perishable_tally,
+      rental,
+    },
     state: { debuff: false, hidden: false, highlight: false },
     cost: { buy, sell: 1 },
   };
@@ -88,6 +114,113 @@ test("compact exact state preserves indexed cards and produces a semantic finger
   const changed = structuredClone(state);
   changed.money = 10;
   assert.notEqual(balatrobotStateFingerprint(state), balatrobotStateFingerprint(changed));
+});
+
+test("Gold Stake rules and recurring Sticker liabilities stay explicit in compact state", () => {
+  const state = {
+    ...handState(),
+    state: "SHOP",
+    stake: "GOLD",
+    money: 4,
+    stake_rules: {
+      applied_stakes: ["WHITE", "RED", "GREEN", "BLACK", "BLUE", "PURPLE", "ORANGE", "GOLD"],
+      stake_level: 8,
+      small_blind_base_reward: 3,
+      small_blind_reward: 0,
+      scaling_tier: 3,
+      ante_scaling: 1,
+      base_discards: 3,
+      pre_stake_discards: 3,
+      actual_discards: 2,
+      discard_modifier: -1,
+      perishable_rounds: 5,
+      rental_rate: 3,
+    },
+    jokers: area([
+      card({ key: "j_credit_card", set: "JOKER" }),
+      card({ key: "j_half", set: "JOKER", eternal: true, rental: true }),
+      card({ key: "j_raised_fist", set: "JOKER", perishable: 0 }),
+    ], 5),
+  };
+  const rules = balatrobotStakeRules(state);
+  assert.deepEqual(rules.appliedStakes, ["WHITE", "RED", "GREEN", "BLACK", "BLUE", "PURPLE", "ORANGE", "GOLD"]);
+  assert.equal(rules.smallBlindReward, 0);
+  assert.equal(rules.smallBlindBaseReward, 3);
+  assert.equal(rules.scalingTier, 3);
+  assert.equal(rules.anteScaling, 1);
+  assert.equal(rules.baseDiscards, 3);
+  assert.equal(rules.preStakeDiscards, 3);
+  assert.equal(rules.actualDiscards, 2);
+  assert.equal(rules.discardModifier, -1);
+  assert.equal(rules.stakeDiscardPenalty, 1);
+  assert.equal(rules.perishableRounds, 5);
+  assert.equal(rules.rentalRate, 3);
+  assert.equal(rules.eternalStickers, true);
+  assert.equal(rules.perishableStickers, true);
+  assert.equal(rules.rentalStickers, true);
+
+  const economy = balatrobotStickerEconomy(state);
+  assert.equal(economy.rentalCount, 1);
+  assert.equal(economy.rentalUpkeep, 3);
+  assert.equal(economy.expiredPerishableCount, 1);
+  assert.equal(economy.eternalLockedSlots, 1);
+  assert.equal(economy.legalLiquidity, 24);
+  assert.equal(economy.cashAfterNextUpkeep, 1);
+
+  const compact = compactBalatrobotState(state);
+  assert.equal(compact.stakeRules.signature, rules.signature);
+  assert.equal(compact.stickerEconomy.twoBlindUpkeep, 6);
+  assert.equal(compact.jokers.cards[2].isPerishable, true);
+  assert.equal(compact.jokers.cards[2].perishableTally, 0);
+  assert.equal(compact.jokers.cards[2].perishable, 0, "expired Perishable identity must not disappear");
+});
+
+test("expired Perishable Jokers remain physical slot occupants", () => {
+  const state = {
+    ...handState(),
+    state: "SHOP",
+    money: 40,
+    round: { ...handState().round, reroll_cost: 5 },
+    hands: { Pair: { chips: 10, mult: 2, played: 5 } },
+    jokers: area([
+      card({ key: "j_raised_fist", set: "JOKER", perishable: 0, debuff: true }),
+      card({ key: "j_jolly", set: "JOKER" }),
+      card({ key: "j_sly", set: "JOKER" }),
+      card({ key: "j_even_steven", set: "JOKER" }),
+      card({ key: "j_odd_todd", set: "JOKER" }),
+    ], 5),
+    shop: area([], 2),
+    vouchers: area([], 1),
+    packs: area([], 2),
+    blinds: { small: { name: "Small Blind", status: "UPCOMING", score: 300 } },
+  };
+
+  assert.equal(balatrobotShopRerollBudget(state).openSlots, 0);
+});
+
+test("hand-action readiness is preserved, fingerprinted, and absent-field compatible", () => {
+  const legacy = handState();
+  assert.equal(balatrobotHandActionsReady(legacy), null);
+  assert.equal(compactBalatrobotState(legacy).handActionsReady, null);
+  assert.doesNotThrow(() => validateBalatrobotPlan(plan(action("play", { cards: [0, 1] })), legacy));
+
+  const blocked = { ...structuredClone(legacy), hand_actions_ready: false };
+  assert.equal(balatrobotHandActionsReady(blocked), false);
+  assert.equal(compactBalatrobotState(blocked).handActionsReady, false);
+  assert.notEqual(balatrobotStateFingerprint(blocked), balatrobotStateFingerprint(legacy));
+  assert.throws(
+    () => validateBalatrobotPlan(plan(action("play", { cards: [0, 1] })), blocked),
+    /hand actions are not ready/,
+  );
+  assert.throws(
+    () => validateBalatrobotPlan(plan(action("discard", { cards: [2] })), blocked),
+    /hand actions are not ready/,
+  );
+  assert.equal(fallbackBalatrobotAction(blocked), null);
+
+  const ready = { ...blocked, handActionsReady: true };
+  assert.equal(balatrobotHandActionsReady(ready), true, "normalized camelCase readiness takes precedence");
+  assert.doesNotThrow(() => validateBalatrobotPlan(plan(action("play", { cards: [0, 1] })), ready));
 });
 
 test("plan validation preserves metagame, economy, and pivot policy", () => {
@@ -275,6 +408,76 @@ test("shop validation enforces money, indices, and occupied slots before RPC", (
   state.shop.cards[0].cost.buy = 8;
   const result = validateBalatrobotPlan(plan(action("buy", { card: 0 })), state);
   assert.deepEqual(result.actions[0].params, { card: 0 });
+  state.jokers.cards[0].state.debuff = true;
+  assert.throws(
+    () => validateBalatrobotPlan(plan(action("buy", { card: 0 })), state),
+    /buy\.card costs \$8, but only \$5 is available/,
+    "a debuffed Credit Card must not provide its $20 overdraft",
+  );
+
+  state.shop.cards[0].cost.buy = 0;
+  state.jokers = area([
+    card({ key: "j_one", set: "JOKER" }),
+    card({ key: "j_two", set: "JOKER" }),
+    card({ key: "j_three", set: "JOKER" }),
+    card({ key: "j_four", set: "JOKER" }),
+    card({ key: "j_five", set: "JOKER", isPerishable: true, perishableTally: 0 }),
+  ], 5);
+  state.jokers.count = 4;
+  assert.throws(
+    () => validateBalatrobotPlan(plan(action("buy", { card: 0 })), state),
+    /slots are full/,
+    "visible cards remain authoritative when a stale count under-reports occupied Joker slots",
+  );
+});
+
+test("native free shop actions remain legal while cash is negative", () => {
+  const state = {
+    ...handState(),
+    state: "SHOP",
+    money: -1,
+    shop: area([
+      card({ key: "j_jolly", set: "JOKER", buy: 0 }),
+      card({ key: "c_hermit", set: "TAROT", buy: 0 }),
+    ], 2),
+    vouchers: area([card({ key: "v_blank", set: "VOUCHER", buy: 0 })], 1),
+    packs: area([card({ key: "p_arcana", set: "BOOSTER", buy: 0 })], 2),
+    jokers: area([], 5),
+    consumables: area([], 2),
+  };
+  assert.doesNotThrow(() => validateBalatrobotPlan(plan(action("buy", { card: 0 })), state));
+  assert.doesNotThrow(() => validateBalatrobotPlan(plan(action("buy", { voucher: 0 })), state));
+  assert.doesNotThrow(() => validateBalatrobotPlan(plan(action("buy", { pack: 0 })), state));
+  assert.doesNotThrow(() => validateBalatrobotPlan(plan(action("buy_use", { card: 1 })), state));
+
+  state.consumables = area([
+    card({ key: "c_sun", set: "TAROT" }),
+    card({ key: "c_moon", set: "TAROT" }),
+  ], 2);
+  state.consumables.count = 1;
+  assert.throws(
+    () => validateBalatrobotPlan(plan(action("buy", { card: 1 })), state),
+    /consumable slots are full/,
+    "visible consumables remain authoritative when count is stale",
+  );
+
+  const packState = {
+    ...state,
+    state: "SMODS_BOOSTER_OPENED",
+    pack: area([card({ key: "j_jolly", set: "JOKER" })], 1),
+    jokers: area([
+      card({ key: "j_one", set: "JOKER" }),
+      card({ key: "j_two", set: "JOKER" }),
+      card({ key: "j_three", set: "JOKER" }),
+      card({ key: "j_four", set: "JOKER" }),
+      card({ key: "j_five", set: "JOKER" }),
+    ], 5),
+  };
+  packState.jokers.count = 4;
+  assert.throws(
+    () => validateBalatrobotPlan(plan(action("pack", { card: 0 })), packState),
+    /Joker slots are full/,
+  );
 });
 
 test("shop policy leaves build choices open while spending a score-pressure budget", () => {
@@ -302,6 +505,16 @@ test("shop policy leaves build choices open while spending a score-pressure budg
   state.jokers = area([card({ key: "j_blue_joker", set: "JOKER" })], 5);
   state.shop = area([], 2);
   assert.throws(() => validateBalatrobotPlan(plan(action("next_round")), state), /shop survival budget/);
+  assert.doesNotThrow(() => validateBalatrobotPlan(
+    plan(action("next_round")),
+    state,
+    { allowTrustedShopExit: true },
+  ));
+  assert.throws(
+    () => validateBalatrobotPlan(plan(action("next_round")), state),
+    /shop survival budget/,
+    "the scoped safe-exit validation must not weaken ordinary shop plans",
+  );
   assert.doesNotThrow(() => validateBalatrobotPlan(plan(action("reroll")), state));
 });
 
@@ -336,6 +549,47 @@ test("shop purchase identity remains exact without hard-coding the final Joker s
   assert.match(fallback.reason, /dynamic search budget/);
 });
 
+test("shop fallback never auto-buys a Sticker liability", () => {
+  const base = {
+    ...handState(),
+    state: "SHOP",
+    stake: "GOLD",
+    ante_num: 3,
+    money: 20,
+    round: { ...handState().round, reroll_cost: 5 },
+    hands: { Pair: { chips: 10, mult: 2, played: 8 } },
+    jokers: area([], 5),
+    shop: area([card({ key: "j_jolly", set: "JOKER", buy: 1 })], 2),
+    vouchers: area([], 1),
+    packs: area([], 2),
+    blinds: { big: { name: "Big Blind", status: "UPCOMING", score: 4_800 } },
+  };
+  assert.equal(fallbackBalatrobotAction(base).method, "buy");
+  for (const sticker of [
+    { rental: true },
+    { eternal: true },
+    { perishable: 5 },
+    { isPerishable: true, perishableTally: 5 },
+    { is_perishable: true, perishable_tally: 0 },
+    { eternal: true, rental: true },
+  ]) {
+    const offered = card({ key: "j_jolly", set: "JOKER", buy: 1, ...sticker });
+    const fallback = fallbackBalatrobotAction({ ...base, shop: area([offered], 2) });
+    assert.notEqual(fallback.method, "buy", `fallback must not auto-buy ${JSON.stringify(sticker)}`);
+  }
+
+  const upkeepBound = {
+    ...base,
+    money: 5,
+    jokers: area([card({ key: "j_rocket", set: "JOKER", rental: true })], 5),
+  };
+  assert.notEqual(
+    fallbackBalatrobotAction(upkeepBound).method,
+    "buy",
+    "fallback must preserve two Rental payments before buying even a clean scoring Joker",
+  );
+});
+
 test("reroll budget grows with the remaining score target and preserves cash when safe", () => {
   const base = {
     ...handState(),
@@ -366,6 +620,92 @@ test("reroll budget grows with the remaining score target and preserves cash whe
   assert.equal(fallbackBalatrobotAction(safe).method, "next_round");
   assert.equal(fallbackBalatrobotAction(pressured).method, "reroll");
   assert.equal(compactBalatrobotState(pressured).shopReroll.target, 10_000);
+});
+
+test("shop budget reserves two exact Rental payments before funding rerolls", () => {
+  const base = {
+    ...handState(),
+    state: "SHOP",
+    stake: "GOLD",
+    money: 30,
+    round: { ...handState().round, reroll_cost: 5 },
+    hands: { Pair: { chips: 10, mult: 2, played: 8 } },
+    jokers: area([card({ key: "j_jolly", set: "JOKER" })], 5),
+    shop: area([], 2),
+    vouchers: area([], 1),
+    packs: area([], 2),
+    blinds: { boss: { name: "The Wall", status: "UPCOMING", score: 10_000 } },
+  };
+  const clean = balatrobotShopRerollBudget(base);
+  const rented = balatrobotShopRerollBudget({
+    ...base,
+    jokers: area([
+      card({ key: "j_jolly", set: "JOKER", rental: true }),
+      card({ key: "j_abstract", set: "JOKER", rental: true }),
+    ], 5),
+  });
+  assert.equal(rented.rentalCount, 2);
+  assert.equal(rented.rentalUpkeep, 6);
+  assert.equal(rented.operatingReserve, 12);
+  assert.equal(rented.reserve, clean.reserve + 12);
+  assert.ok(rented.budget < clean.budget);
+});
+
+test("Credit Card liquidity is explicit but reserved for strategic survival purchases, not paid rerolls", () => {
+  const state = {
+    ...handState(),
+    state: "SHOP",
+    money: -8,
+    round: { ...handState().round, reroll_cost: 5 },
+    hands: { Pair: { chips: 10, mult: 2, played: 5 } },
+    jokers: area([card({ key: "j_credit_card", set: "JOKER" })], 5),
+    shop: area([], 2), vouchers: area([], 1), packs: area([], 2),
+    blinds: { boss: { name: "The Wall", status: "UPCOMING", score: 10_000 } },
+  };
+  const budget = balatrobotShopRerollBudget(state);
+  assert.equal(budget.cash, 0);
+  assert.equal(budget.legalLiquidity, 12);
+  assert.equal(budget.emergencyCredit, 20);
+  assert.equal(budget.creditReservedForSurvival, true);
+  assert.equal(budget.spendableCash, 0);
+  assert.equal(budget.budget, 0);
+  assert.equal(budget.shouldReroll, false);
+  assert.throws(
+    () => validateBalatrobotPlan(plan(action("reroll")), state),
+    /only \$0 cash is available/,
+  );
+  assert.doesNotThrow(
+    () => validateBalatrobotPlan(plan(action("reroll")), {
+      ...state,
+      round: { ...state.round, reroll_cost: 0 },
+    }),
+    "a native free reroll does not consume Credit Card liquidity",
+  );
+});
+
+test("an explicit free reroll is always used once, but a missing price is not assumed free", () => {
+  const base = {
+    ...handState(),
+    state: "SHOP",
+    money: 0,
+    hands: { Pair: { chips: 10, mult: 2, played: 5 } },
+    jokers: area([], 5),
+    shop: area([], 2), vouchers: area([], 1), packs: area([], 2),
+    blinds: { small: { name: "Small Blind", status: "UPCOMING", score: 50 } },
+  };
+  const free = { ...base, round: { ...handState().round, reroll_cost: 0 } };
+  const freeBudget = balatrobotShopRerollBudget(free);
+  assert.equal(freeBudget.explicitFreeReroll, true);
+  assert.equal(freeBudget.shouldReroll, true);
+  assert.equal(freeBudget.maxRerolls, 1);
+  assert.equal(fallbackBalatrobotAction(free).method, "reroll");
+
+  const unknown = { ...base, round: { ...handState().round } };
+  delete unknown.round.reroll_cost;
+  const unknownBudget = balatrobotShopRerollBudget(unknown);
+  assert.equal(unknownBudget.explicitFreeReroll, false);
+  assert.equal(unknownBudget.shouldReroll, false);
+  assert.equal(fallbackBalatrobotAction(unknown).method, "next_round");
 });
 
 test("shop risk forecast discounts rare hands and honors The Needle's one-hand limit", () => {
@@ -652,11 +992,14 @@ test("sell validation refuses a stale index that names a different Joker", () =>
 });
 
 test("navigation and fallback policies always make legal forward progress", () => {
-  assert.deepEqual(deterministicBalatrobotAction({ state: "MENU" }, { balatrobotDeck: "BLUE", balatrobotStake: "RED" }), {
+  assert.equal(deterministicBalatrobotAction({ state: "MENU" }, { balatrobotDeck: "BLUE", balatrobotStake: "RED" }), null);
+  assert.equal(deterministicBalatrobotAction({ state: "MENU", menu_ready: false }), null);
+  assert.deepEqual(deterministicBalatrobotAction({ state: "MENU", menu_ready: true }, { balatrobotDeck: "BLUE", balatrobotStake: "RED" }), {
     method: "start",
     params: { deck: "BLUE", stake: "RED" },
     reason: "Start the next run locally",
   });
+  assert.equal(compactBalatrobotState({ state: "MENU", menu_ready: true }).menuReady, true);
   assert.equal(deterministicBalatrobotAction({ state: "ROUND_EVAL", won: false }).method, "cash_out");
   assert.equal(deterministicBalatrobotAction({ state: "ROUND_EVAL", won: true }).method, "menu");
   assert.equal(

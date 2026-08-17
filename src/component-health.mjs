@@ -242,6 +242,7 @@ export class ProjectHealthMonitor {
     processProvider = readWindowsComponentSnapshot,
     fetchImpl = fetch,
     credentialDirectory = localAppDataFile(),
+    controlStateProvider = () => null,
     now = () => Date.now(),
     cacheMs = 3_000,
   }) {
@@ -253,6 +254,7 @@ export class ProjectHealthMonitor {
     this.processProvider = processProvider;
     this.fetch = fetchImpl;
     this.credentialDirectory = credentialDirectory;
+    this.controlStateProvider = controlStateProvider;
     this.now = now;
     this.cacheMs = cacheMs;
     this.cachedAt = 0;
@@ -289,12 +291,13 @@ export class ProjectHealthMonitor {
   }
 
   async #read(now) {
-    const [processResult, backendResult, strategicResult, statsResult, overlayResult] = await Promise.allSettled([
+    const [processResult, backendResult, strategicResult, statsResult, overlayResult, controlResult] = await Promise.allSettled([
       this.processProvider(),
       this.routineBackend.status(),
       this.strategicBackend ? this.strategicBackend.status() : Promise.resolve(null),
       Promise.resolve().then(() => this.stats.refresh()),
       this.#overlayHealth(),
+      Promise.resolve().then(() => this.controlStateProvider()),
     ]);
     const snapshotFresh = processResult.status === "fulfilled";
     if (snapshotFresh) {
@@ -310,6 +313,7 @@ export class ProjectHealthMonitor {
     const strategic = strategicResult.status === "fulfilled" ? strategicResult.value : null;
     const telemetry = statsResult.status === "fulfilled" ? statsResult.value : null;
     const overlayReady = overlayResult.status === "fulfilled";
+    const pilotPaused = controlResult.status === "fulfilled" && controlResult.value?.desiredState === "paused";
     const projectToken = normalizedCommand(this.projectRoot);
     const processBy = (predicate) => snapshot.processes.find(predicate) ?? null;
     const listener = (port) => snapshot.listeners.find((item) => item.port === port) ?? null;
@@ -367,6 +371,7 @@ export class ProjectHealthMonitor {
         rpcStall,
       });
     }
+
     const controllerStatus = snapshotState !== "fresh" ? "degraded" : controller
       ? rpcStall || (eventAgeSeconds !== null && eventAgeSeconds > 600) ? "degraded" : "healthy"
       : "offline";
@@ -383,6 +388,13 @@ export class ProjectHealthMonitor {
         summary: "进程存在，但动作超时循环未推进",
         detail: `PID ${controller?.pid ?? "?"} · ${rpcStall.method} / ${rpcStall.fingerprint.slice(0, 12)}… · 最近仍在写入失败事件`,
         rpcStall,
+      });
+    }
+    if (pilotPaused && snapshotState === "fresh" && !controller) {
+      Object.assign(components.at(-1), {
+        status: "idle",
+        summary: "已由后台暂停",
+        detail: "AI 决策与自动输入已暂停；游戏和 BalatroBot RPC 状态仍独立检查。",
       });
     }
 
@@ -477,7 +489,13 @@ export class ProjectHealthMonitor {
       ]),
     );
     const activeCore = components.filter((item) => ["game", "balatrobot", "controller"].includes(item.id));
-    const overallStatus = activeCore.every((item) => item.status === "offline")
+    const isPausedIdle = pilotPaused &&
+      activeCore.find((item) => item.id === "controller")?.status === "idle" &&
+      activeCore.filter((item) => item.id !== "controller").every((item) => item.status === "healthy") &&
+      counts.degraded === 0 && counts.offline === 0;
+    const overallStatus = isPausedIdle
+      ? "idle"
+      : activeCore.every((item) => item.status === "offline")
       ? "idle"
       : activeCore.every((item) => item.status === "healthy") && counts.degraded === 0 && counts.offline === 0
         ? "healthy"
@@ -487,7 +505,13 @@ export class ProjectHealthMonitor {
       checkedAt: new Date(now).toISOString(),
       overall: {
         status: overallStatus,
-        label: overallStatus === "healthy" ? "全部就绪" : overallStatus === "idle" ? "项目待机" : "部分组件需关注",
+        label: overallStatus === "healthy"
+          ? "全部就绪"
+          : isPausedIdle
+            ? "AI 已暂停"
+            : overallStatus === "idle"
+              ? "项目待机"
+              : "部分组件需关注",
         counts,
       },
       components,

@@ -1,13 +1,26 @@
 import { createHash } from "node:crypto";
 
-import { balatrobotStateFingerprint } from "./balatrobot-policy.mjs";
+import { balatrobotStakeRules, balatrobotStateFingerprint } from "./balatrobot-policy.mjs";
 
 // Policy/trajectory versions describe how a state and action were captured.
 // Reward versions are deliberately independent: changing credit assignment
 // must not make an otherwise compatible historical trajectory disappear.
-export const SEMANTIC_POLICY_VERSION = 5;
-export const SEMANTIC_REWARD_VERSION = 6;
+export const SEMANTIC_POLICY_VERSION = 6;
+export const SEMANTIC_REWARD_VERSION = 7;
 const ROUND_COMPLETION_STATES = new Set(["ROUND_EVAL", "SHOP"]);
+const PERISHABLE_EXPIRY_STATES = new Set(["ROUND_EVAL", "SHOP", "GAME_OVER"]);
+const BASE_RENTAL_RATE = 3;
+const STAKE_RULE_VERSION = 1;
+const VANILLA_STAKES = Object.freeze([
+  "WHITE",
+  "RED",
+  "GREEN",
+  "BLACK",
+  "BLUE",
+  "PURPLE",
+  "ORANGE",
+  "GOLD",
+]);
 
 function cards(area) {
   return Array.isArray(area?.cards) ? area.cards : [];
@@ -22,6 +35,172 @@ function clamp(value, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
+function normalizedStakeCode(value) {
+  const raw = String(value ?? "").trim().toUpperCase();
+  if (!raw) return "";
+  const numeric = Number(raw);
+  if (Number.isInteger(numeric) && numeric >= 1 && numeric <= VANILLA_STAKES.length) {
+    return VANILLA_STAKES[numeric - 1];
+  }
+  return raw
+    .replace(/^STAKE[_\s-]+/u, "")
+    .replace(/[_\s-]+(?:STAKE|CHIP)$/u, "")
+    .trim();
+}
+
+function derivedStakeRules(stake) {
+  const code = normalizedStakeCode(stake);
+  const level = VANILLA_STAKES.indexOf(code) + 1;
+  if (level <= 0) return null;
+  const rules = {
+    version: STAKE_RULE_VERSION,
+    known: false,
+    code,
+    level,
+    appliedStakes: VANILLA_STAKES.slice(0, level),
+    smallBlindReward: level >= 2 ? 0 : 3,
+    noSmallBlindReward: level >= 2,
+    scalingTier: level >= 6 ? 3 : level >= 3 ? 2 : 1,
+    anteScaling: null,
+    discardModifier: level >= 5 ? -1 : 0,
+    eternalStickers: level >= 4,
+    perishableStickers: level >= 7,
+    perishableRounds: 5,
+    rentalStickers: level >= 8,
+    rentalRate: BASE_RENTAL_RATE,
+  };
+  rules.signature = stakeRuleSignature(rules);
+  return rules;
+}
+
+function stakeRuleSignature(rules) {
+  return [
+    `stake-rules-v${STAKE_RULE_VERSION}`,
+    `code=${rules.code || "unknown"}`,
+    `applied=${rules.appliedStakes.join(">") || "unknown"}`,
+    `small=${rules.smallBlindReward}`,
+    `scale=${rules.scalingTier}`,
+    `ante=${rules.anteScaling ?? "unknown"}`,
+    `discard=${rules.discardModifier}`,
+    `eternal=${Number(rules.eternalStickers)}`,
+    `perishable=${Number(rules.perishableStickers)}:${rules.perishableRounds}`,
+    `rental=${Number(rules.rentalStickers)}:${rules.rentalRate}`,
+    `upstream=${rules.upstreamSignature || "none"}`,
+  ].join("|");
+}
+
+function normalizedStakeRules(stake, value = null) {
+  const source = value && typeof value === "object" ? value : {};
+  const sourceSignature = String(source.signature ?? (typeof value === "string" ? value : "")).trim();
+  const derived = derivedStakeRules(source.code ?? source.stake ?? stake);
+  if (!sourceSignature && derived) return derived;
+  const code = normalizedStakeCode(source.code ?? stake);
+  const upstreamSignature = String(
+    source.upstreamSignature ?? (/^stake-rules-v\d+\|/u.test(sourceSignature) ? "" : sourceSignature),
+  ).trim();
+  const normalized = {
+    version: finite(source.version, STAKE_RULE_VERSION),
+    known: Object.hasOwn(source, "known")
+      ? Boolean(source.known)
+      : Boolean(sourceSignature && !/^unknown(?::|$)/iu.test(sourceSignature)),
+    code,
+    level: finite(source.level, derived?.level ?? 0),
+    appliedStakes: Array.isArray(source.appliedStakes)
+      ? source.appliedStakes.map(normalizedStakeCode).filter(Boolean)
+      : (derived?.appliedStakes ?? []),
+    smallBlindReward: finite(source.smallBlindReward, derived?.smallBlindReward ?? 0),
+    noSmallBlindReward: Object.hasOwn(source, "noSmallBlindReward")
+      ? Boolean(source.noSmallBlindReward)
+      : Boolean(derived?.noSmallBlindReward),
+    scalingTier: finite(source.scalingTier, derived?.scalingTier ?? 0),
+    anteScaling: source.anteScaling != null && Number.isFinite(Number(source.anteScaling))
+      ? Number(source.anteScaling)
+      : null,
+    discardModifier: finite(source.discardModifier ?? source.discardsDelta, derived?.discardModifier ?? 0),
+    eternalStickers: Object.hasOwn(source, "eternalStickers")
+      ? Boolean(source.eternalStickers)
+      : Boolean(derived?.eternalStickers),
+    perishableStickers: Object.hasOwn(source, "perishableStickers")
+      ? Boolean(source.perishableStickers)
+      : Boolean(derived?.perishableStickers),
+    perishableRounds: finite(source.perishableRounds, derived?.perishableRounds ?? 5),
+    rentalStickers: Object.hasOwn(source, "rentalStickers")
+      ? Boolean(source.rentalStickers)
+      : Boolean(derived?.rentalStickers),
+    rentalRate: finite(source.rentalRate, derived?.rentalRate ?? BASE_RENTAL_RATE),
+    upstreamSignature,
+  };
+  normalized.signature = stakeRuleSignature(normalized);
+  return normalized;
+}
+
+export function semanticStakeRuleCompatibility(leftValue, rightValue) {
+  const left = normalizedStakeRules(leftValue?.stake, leftValue?.stakeRules);
+  const right = normalizedStakeRules(rightValue?.stake, rightValue?.stakeRules);
+  if (left.code && right.code && left.code !== right.code) return "incompatible";
+  if (left.known && right.known) {
+    return left.signature === right.signature ? "exact" : "incompatible";
+  }
+  return "semantic";
+}
+
+function parsedIdentity(value) {
+  const raw = String(value ?? "unknown").trim() || "unknown";
+  const priceAt = raw.lastIndexOf("@");
+  const body = priceAt > 0 ? raw.slice(0, priceAt) : raw;
+  const price = priceAt > 0 ? finite(raw.slice(priceAt + 1)) : null;
+  const [base = "unknown", ...tokens] = body.split("+").filter(Boolean);
+  const perishableToken = tokens.find((token) => token.startsWith("perishable:"));
+  const rawPerishableTtl = perishableToken ? Number(perishableToken.slice("perishable:".length)) : null;
+  const perishableTtl = Number.isFinite(rawPerishableTtl) ? rawPerishableTtl : null;
+  return {
+    raw,
+    base,
+    price,
+    tokens,
+    eternal: tokens.includes("eternal"),
+    rental: tokens.includes("rental"),
+    debuff: tokens.includes("debuff"),
+    hasPerishable: Boolean(perishableToken) && perishableTtl != null,
+    perishableTtl,
+  };
+}
+
+function stickerEconomyFromIdentities(values, fallback = null) {
+  const identities = (Array.isArray(values) ? values : []).map(parsedIdentity);
+  const perishableTtls = identities
+    .map((identity) => identity.perishableTtl)
+    .filter((ttl) => Number.isFinite(ttl) && ttl > 0)
+    .sort((left, right) => left - right);
+  const fallbackValue = fallback && typeof fallback === "object" ? fallback : {};
+  const rentalRate = Math.max(0, finite(fallbackValue.rentalRate, BASE_RENTAL_RATE));
+  const rentalCount = identities.length
+    ? identities.filter((identity) => identity.rental).length
+    : finite(fallbackValue.rentalCount, 0);
+  const eternalLockedSlots = identities.length
+    ? identities.filter((identity) => identity.eternal).length
+    : finite(fallbackValue.eternalLockedSlots, 0);
+  // Current snapshots expose perishable:0 explicitly. Older snapshots that
+  // omitted zero remain usable, but a generic Boss debuff is not mislabeled as
+  // expired here; the transition relabeler can infer that narrow case from a
+  // preceding perishable:1 identity.
+  const inferredExpired = identities.filter((identity) =>
+    identity.hasPerishable && finite(identity.perishableTtl, 0) <= 0
+  ).length;
+  return {
+    rentalCount,
+    rentalRate,
+    rentalUpkeep: rentalCount * rentalRate,
+    perishableTtls: perishableTtls.length
+      ? perishableTtls
+      : (Array.isArray(fallbackValue.perishableTtls) ? fallbackValue.perishableTtls.map((ttl) => finite(ttl, 0)).filter((ttl) => ttl > 0).sort((a, b) => a - b) : []),
+    perishableExpired: identities.length
+      ? inferredExpired
+      : finite(fallbackValue.perishableExpired ?? fallbackValue.expiredPerishableCount, 0),
+    eternalLockedSlots,
+  };
+}
+
 function cardIdentity(card) {
   if (!card || typeof card !== "object") return "unknown";
   const value = card.value && typeof card.value === "object" ? card.value : {};
@@ -34,7 +213,9 @@ function cardIdentity(card) {
     modifier.seal ? `seal:${modifier.seal}` : "",
     modifier.eternal ? "eternal" : "",
     modifier.rental ? "rental" : "",
-    Number.isFinite(Number(modifier.perishable)) ? `perishable:${modifier.perishable}` : "",
+    modifier.perishable != null && modifier.perishable !== false && Number.isFinite(Number(modifier.perishable))
+      ? `perishable:${modifier.perishable}`
+      : "",
     state.debuff ? "debuff" : "",
   ];
   return parts.filter(Boolean).join("+");
@@ -47,8 +228,9 @@ function cardBaseIdentity(card) {
 }
 
 function cardOfferIdentity(card) {
-  const cost = finite(card?.cost?.buy);
-  return `${cardIdentity(card)}@${cost ?? "?"}`;
+  const rawCost = card?.cost?.buy;
+  const cost = rawCost != null && Number.isFinite(Number(rawCost)) ? Number(rawCost) : "?";
+  return `${cardIdentity(card)}@${cost}`;
 }
 
 function activeBlind(state) {
@@ -133,7 +315,7 @@ function pokerTargets(pokerHands) {
 
 // Old trajectories are immutable and intentionally keep their original
 // feature version.  This adapter supplies fields introduced by later policies
-// so v1-v5 trajectories can still participate in semantic retrieval and reward
+// so older trajectories can still participate in semantic retrieval and reward
 // relabelling without rewriting their raw JSON.
 export function semanticNormalizeFeatures(value, { canonicalVersion = false } = {}) {
   if (!value || typeof value !== "object" || typeof value.screen !== "string") return null;
@@ -144,6 +326,7 @@ export function semanticNormalizeFeatures(value, { canonicalVersion = false } = 
   features.money = finite(features.money, 0);
   features.deck = String(features.deck ?? "");
   features.stake = String(features.stake ?? "");
+  features.stakeRules = normalizedStakeRules(features.stake, features.stakeRules);
   features.blind = features.blind && typeof features.blind === "object" ? features.blind : {};
   features.blind = {
     type: String(features.blind.type ?? ""),
@@ -168,6 +351,12 @@ export function semanticNormalizeFeatures(value, { canonicalVersion = false } = 
   ]) {
     features[field] = Array.isArray(features[field]) ? features[field] : [];
   }
+  features.stickerEconomy = stickerEconomyFromIdentities(features.jokers, {
+    ...(features.stickerEconomy && typeof features.stickerEconomy === "object"
+      ? features.stickerEconomy
+      : {}),
+    rentalRate: features.stakeRules.rentalRate,
+  });
   features.collectionSignature = String(features.collectionSignature ?? "");
   features.remainingDeck = features.remainingDeck && typeof features.remainingDeck === "object"
     ? features.remainingDeck
@@ -210,9 +399,11 @@ export function semanticFeatureCompatibility(value) {
   const normalized = semanticNormalizeFeatures(value);
   if (!normalized || !normalized.screen || !Number.isFinite(normalized.ante)) return "incompatible";
   const sourceVersion = finite(value?.version, 1);
-  const hasExactSafetyFields = sourceVersion >= 4 &&
+  const hasExactSafetyFields = sourceVersion >= SEMANTIC_POLICY_VERSION &&
     Object.hasOwn(value, "collectionSignature") &&
     Object.hasOwn(value, "appearedJokers") &&
+    value.stakeRules && typeof value.stakeRules === "object" &&
+    value.stickerEconomy && typeof value.stickerEconomy === "object" &&
     value.strategy && typeof value.strategy === "object";
   return hasExactSafetyFields ? "exact" : "semantic";
 }
@@ -242,6 +433,17 @@ export function semanticStateFeatures(state) {
     .map((joker) => String(joker?.key ?? ""))
     .filter(Boolean)
     .sort();
+  const jokerIdentities = cards(state.jokers).map(cardIdentity);
+  const runtimeStakeRules = balatrobotStakeRules(state);
+  const stakeRules = normalizedStakeRules(state.stake, {
+    ...runtimeStakeRules,
+    code: normalizedStakeCode(runtimeStakeRules.stake ?? state.stake),
+    version: STAKE_RULE_VERSION,
+    known: true,
+  });
+  const stickerEconomy = stickerEconomyFromIdentities(jokerIdentities, {
+    rentalRate: stakeRules.rentalRate,
+  });
   const features = {
     version: SEMANTIC_POLICY_VERSION,
     screen: state.state,
@@ -250,6 +452,8 @@ export function semanticStateFeatures(state) {
     money,
     deck: String(state.deck ?? ""),
     stake: String(state.stake ?? ""),
+    stakeRules,
+    stickerEconomy,
     won: Boolean(state.won),
     blind: {
       type: String(blind?.type ?? ""),
@@ -268,7 +472,7 @@ export function semanticStateFeatures(state) {
       consumables: [finite(state.consumables?.count, cards(state.consumables).length), finite(state.consumables?.limit, 0)],
     },
     hand: cards(state.hand).map(cardIdentity),
-    jokers: cards(state.jokers).map(cardIdentity),
+    jokers: jokerIdentities,
     consumables: cards(state.consumables).map(cardIdentity),
     shop: cards(state.shop).map(cardOfferIdentity),
     voucherOffers: cards(state.vouchers).map(cardOfferIdentity),
@@ -299,6 +503,11 @@ export function semanticStateFeatures(state) {
     ...(features.collectionSignature ? [`collection:${features.collectionSignature}`] : []),
     ...features.appearedJokers.map((value) => `appeared-joker:${value}`),
     ...features.pokerHands.map((hand) => `poker:${hand.name}:L${hand.level}:P${hand.played}`),
+    `stake-rule:${features.stakeRules.signature}`,
+    `rentals:${features.stickerEconomy.rentalCount}:upkeep:${features.stickerEconomy.rentalUpkeep}`,
+    `perishable-ttl:${features.stickerEconomy.perishableTtls.join(",") || "none"}`,
+    `perishable-expired:${features.stickerEconomy.perishableExpired}`,
+    `eternal-locked:${features.stickerEconomy.eternalLockedSlots}`,
     `phase:${features.strategy.phase}`,
     `economy:${features.strategy.economy}`,
     ...features.strategy.jokerKeys.map((value) => `build-joker:${value}`),
@@ -316,7 +525,7 @@ function hashJson(value) {
 
 export function semanticReplayFingerprint(stateOrFeatures) {
   const features = typeof stateOrFeatures?.screen === "string" && "tokens" in stateOrFeatures
-    ? stateOrFeatures
+    ? semanticNormalizeFeatures(stateOrFeatures)
     : semanticStateFeatures(stateOrFeatures);
   return hashJson({
     version: features.version,
@@ -326,6 +535,8 @@ export function semanticReplayFingerprint(stateOrFeatures) {
     money: features.money,
     deck: features.deck,
     stake: features.stake,
+    stakeRules: features.stakeRules,
+    stickerEconomy: features.stickerEconomy,
     blind: features.blind,
     round: features.round,
     slots: features.slots,
@@ -351,7 +562,7 @@ function dominantPokerHand(features) {
 
 export function semanticStateBucket(stateOrFeatures) {
   const features = typeof stateOrFeatures?.screen === "string" && "tokens" in stateOrFeatures
-    ? stateOrFeatures
+    ? semanticNormalizeFeatures(stateOrFeatures)
     : semanticStateFeatures(stateOrFeatures);
   const jokerBuild = [...features.strategy.jokerKeys].sort().join(",") || "none";
   return [
@@ -360,6 +571,10 @@ export function semanticStateBucket(stateOrFeatures) {
     `phase:${features.strategy.phase}`,
     `blind:${features.blind.type || "none"}`,
     `economy:${features.strategy.economy}`,
+    `stake-rules:${features.stakeRules.signature}`,
+    `rentals:${features.stickerEconomy.rentalCount}/${features.stickerEconomy.rentalUpkeep}`,
+    `perishable:${features.stickerEconomy.perishableTtls.join(",") || "none"}/${features.stickerEconomy.perishableExpired}`,
+    `eternal:${features.stickerEconomy.eternalLockedSlots}`,
     `pool:${features.collectionSignature || "unknown"}`,
     `jokers:${jokerBuild}`,
     `poker:${dominantPokerHand(features)}`,
@@ -368,7 +583,7 @@ export function semanticStateBucket(stateOrFeatures) {
 
 export function semanticStateText(stateOrFeatures) {
   const features = typeof stateOrFeatures?.screen === "string" && "tokens" in stateOrFeatures
-    ? stateOrFeatures
+    ? semanticNormalizeFeatures(stateOrFeatures)
     : semanticStateFeatures(stateOrFeatures);
   const poker = features.pokerHands.map((hand) => `${hand.name}:L${hand.level}/P${hand.played}`).join(",") || "base";
   return [
@@ -377,6 +592,10 @@ export function semanticStateText(stateOrFeatures) {
     `score=${features.round.score}/${features.blind.target || "?"}`,
     `hands=${features.round.handsLeft} discards=${features.round.discardsLeft}`,
     `money=${features.money}`,
+    `stakeRules=${features.stakeRules.signature}`,
+    `rentals=${features.stickerEconomy.rentalCount}/upkeep=${features.stickerEconomy.rentalUpkeep}`,
+    `perishable=${features.stickerEconomy.perishableTtls.join(",") || "none"}/expired=${features.stickerEconomy.perishableExpired}`,
+    `eternalLocked=${features.stickerEconomy.eternalLockedSlots}`,
     `jokers=${features.jokers.join(",") || "none"}`,
     `appearedJokers=${features.appearedJokers.join(",") || "none"}`,
     `hand=${features.hand.join(",") || "none"}`,
@@ -401,12 +620,13 @@ function numericSimilarity(left, right, scale) {
 
 export function semanticStateSimilarity(leftStateOrFeatures, rightStateOrFeatures) {
   const left = typeof leftStateOrFeatures?.screen === "string" && "tokens" in leftStateOrFeatures
-    ? leftStateOrFeatures
+    ? semanticNormalizeFeatures(leftStateOrFeatures)
     : semanticStateFeatures(leftStateOrFeatures);
   const right = typeof rightStateOrFeatures?.screen === "string" && "tokens" in rightStateOrFeatures
-    ? rightStateOrFeatures
+    ? semanticNormalizeFeatures(rightStateOrFeatures)
     : semanticStateFeatures(rightStateOrFeatures);
   if (left.screen !== right.screen) return 0;
+  if (semanticStakeRuleCompatibility(left, right) === "incompatible") return 0;
 
   let score = 0;
   let weight = 0;
@@ -415,7 +635,7 @@ export function semanticStateSimilarity(leftStateOrFeatures, rightStateOrFeature
     weight += amount;
   };
   add(left.deck === right.deck ? 1 : 0, 0.025);
-  add(left.stake === right.stake ? 1 : 0, 0.02);
+  add(left.stakeRules.signature === right.stakeRules.signature ? 1 : 0.5, 0.035);
   add(left.blind.type === right.blind.type ? 1 : 0, 0.06);
   add(left.blind.name === right.blind.name ? 1 : 0, 0.025);
   add(left.strategy.phase === right.strategy.phase ? 1 : 0, 0.08);
@@ -436,6 +656,10 @@ export function semanticStateSimilarity(leftStateOrFeatures, rightStateOrFeature
   );
   add(jaccard(left.appearedJokers, right.appearedJokers), 0.07);
   add(jaccard(left.strategy.pokerTargets, right.strategy.pokerTargets), 0.13);
+  add(numericSimilarity(left.stickerEconomy.rentalUpkeep, right.stickerEconomy.rentalUpkeep, 9), 0.035);
+  add(jaccard(left.stickerEconomy.perishableTtls, right.stickerEconomy.perishableTtls), 0.035);
+  add(numericSimilarity(left.stickerEconomy.perishableExpired, right.stickerEconomy.perishableExpired, 3), 0.025);
+  add(numericSimilarity(left.stickerEconomy.eternalLockedSlots, right.stickerEconomy.eternalLockedSlots, 5), 0.025);
 
   if (left.screen === "SELECTING_HAND") {
     add(jaccard(left.hand, right.hand), 0.1);
@@ -536,6 +760,66 @@ export function semanticPlayedHandScoreFromFeatures(beforeValue, action, afterVa
   return sameRound && afterScore > beforeScore ? afterScore - beforeScore : 0;
 }
 
+function ownFinite(value, field) {
+  if (!value || typeof value !== "object" || !Object.hasOwn(value, field) || value[field] == null) return null;
+  const number = Number(value[field]);
+  return Number.isFinite(number) ? number : null;
+}
+
+function hasStickerSnapshot(value) {
+  return Array.isArray(value?.jokers) || (
+    value?.stickerEconomy && typeof value.stickerEconomy === "object"
+  );
+}
+
+function durableStickerIdentity(value) {
+  const identity = parsedIdentity(value);
+  return [
+    identity.base,
+    ...identity.tokens.filter((token) => token !== "debuff" && !token.startsWith("perishable:")),
+  ].join("+");
+}
+
+function stickerGroups(values) {
+  const result = new Map();
+  for (const value of Array.isArray(values) ? values : []) {
+    const identity = parsedIdentity(value);
+    const key = durableStickerIdentity(value);
+    const group = result.get(key) ?? {
+      expiring: 0,
+      explicitExpired: 0,
+      legacyDebuffedWithoutTtl: 0,
+    };
+    if (identity.hasPerishable && identity.perishableTtl === 1) group.expiring += 1;
+    if (identity.hasPerishable && finite(identity.perishableTtl, 0) <= 0) group.explicitExpired += 1;
+    if (!identity.hasPerishable && identity.debuff) group.legacyDebuffedWithoutTtl += 1;
+    result.set(key, group);
+  }
+  return result;
+}
+
+function safelyAttributedPerishableExpiries(beforeValue, afterValue) {
+  if (!Array.isArray(beforeValue?.jokers) || !Array.isArray(afterValue?.jokers)) return 0;
+  const beforeGroups = stickerGroups(beforeValue.jokers);
+  const afterGroups = stickerGroups(afterValue.jokers);
+  const legacyExpiryBoundary = PERISHABLE_EXPIRY_STATES.has(String(afterValue?.screen ?? ""));
+  let expiries = 0;
+  for (const [key, before] of beforeGroups) {
+    if (!before.expiring) continue;
+    const after = afterGroups.get(key);
+    if (!after) continue;
+    const explicitDelta = Math.max(0, after.explicitExpired - before.explicitExpired);
+    // BalatroBot builds before explicit zero-TTL support emitted only debuff
+    // here. Requiring a matching perishable:1 predecessor makes that legacy
+    // inference safe against ordinary Boss debuffs and unrelated Jokers.
+    const legacyDelta = legacyExpiryBoundary
+      ? Math.max(0, after.legacyDebuffedWithoutTtl - before.legacyDebuffedWithoutTtl)
+      : 0;
+    expiries += Math.min(before.expiring, explicitDelta + legacyDelta);
+  }
+  return expiries;
+}
+
 export function semanticTransitionRewardFromFeatures(beforeValue, action, afterValue) {
   const before = semanticNormalizeFeatures(beforeValue);
   const after = semanticNormalizeFeatures(afterValue);
@@ -562,7 +846,21 @@ export function semanticTransitionRewardFromFeatures(beforeValue, action, afterV
   if (action?.method === "discard") reward -= 0.025;
   if (action?.method === "skip") reward -= 0.35;
   if (action?.method === "reroll") reward -= 0.06;
-  if (action?.method === "buy") reward += 0.05;
+
+  // These dense economy labels use only values already persisted in both raw
+  // snapshots, so reward v7 can relabel old trajectories without touching the
+  // immutable source rows. Missing legacy fields contribute zero rather than
+  // manufacturing a cash or sticker change.
+  const beforeMoney = ownFinite(beforeValue, "money");
+  const afterMoney = ownFinite(afterValue, "money");
+  if (beforeMoney != null && afterMoney != null) {
+    reward += clamp((afterMoney - beforeMoney) * 0.035, -0.7, 0.7);
+  }
+  if (hasStickerSnapshot(beforeValue) && hasStickerSnapshot(afterValue)) {
+    const upkeepDelta = after.stickerEconomy.rentalUpkeep - before.stickerEconomy.rentalUpkeep;
+    reward += clamp(-upkeepDelta * 0.1, -0.6, 0.6);
+    reward -= Math.min(3, safelyAttributedPerishableExpiries(beforeValue, afterValue)) * 0.65;
+  }
   return Math.round(clamp(reward, -4, 6) * 1_000) / 1_000;
 }
 

@@ -5,6 +5,7 @@ import {
   balatroCardSuit,
   balatroCards,
   balatroConsumableTargetRule,
+  balatroJokerDebuffed,
   balatroRankNumber,
 } from "./balatro-rules-engine.mjs";
 
@@ -44,7 +45,9 @@ const TAROT = Object.freeze({
   c_wheel_of_fortune: descriptor("The Wheel of Fortune", "random-edition", "strategic", { target: false }),
   c_strength: descriptor("Strength", "rank", "exact"),
   c_hanged_man: descriptor("The Hanged Man", "remove", "strategic", { destructive: true }),
-  c_death: descriptor("Death", "ordered-copy", "exact"),
+  // Death permanently overwrites the left playing card.  Its target contract
+  // is exact, but it must never become an automatic/local-fallback action.
+  c_death: descriptor("Death", "ordered-copy", "exact", { destructive: true }),
   c_temperance: descriptor("Temperance", "money", "exact", { target: false }),
   c_devil: descriptor("The Devil", "enhance-held", "exact"),
   c_tower: descriptor("The Tower", "stone", "strategic", { destructive: true }),
@@ -183,6 +186,14 @@ function combinations(count, minimum, maximum) {
   return result;
 }
 
+// Targeted consumables need alternatives for the strategic model (the best
+// immediate hand is often not the best permanent deck edit), but evaluating
+// every 1..N subset grows very quickly for enlarged hands.  Keep a bounded
+// card pool and a bounded number of solver simulations per consumable.
+const TARGETED_CARD_POOL_LIMIT = 12;
+const TARGETED_EVALUATION_LIMIT = 72;
+const TARGETED_TOP_K = 3;
+
 function packArea(state) {
   return cards(cards(state?.pack).length ? state?.pack : state?.openedPack);
 }
@@ -198,6 +209,24 @@ function cardQuality(card) {
   if (modifier(card, "edition")) value += 220;
   if (modifier(card, "seal")) value += 140;
   return value;
+}
+
+function enhancementOverwritePenalty(card, enhancement) {
+  const current = modifier(card, "enhancement");
+  if (!current || current === String(enhancement ?? "").toUpperCase()) return 0;
+  // Replacing an existing enhancement is an irreversible loss. Editions and
+  // seals coexist with enhancements, so they are intentionally not charged.
+  return 520 + Math.max(0, rank(card)) * 12;
+}
+
+function knownDeckCards(state) {
+  const deck = cards(state?.cards);
+  const hand = cards(state?.hand);
+  return deck.length ? [...deck, ...hand] : hand;
+}
+
+function countKnown(state, getter, value) {
+  return knownDeckCards(state).filter((card) => getter(card) === value).length;
 }
 
 function jokerQuality(joker) {
@@ -288,29 +317,165 @@ function transformTargets(state, key, targets, rule) {
   return stateWithHand(state, hand);
 }
 
-function targetedHeuristic(state, key, targets, rule) {
+function targetedLongTermValue(state, key, targets, rule) {
   const hand = cards(state?.hand);
   if (key === "c_death") {
     const [target, source] = targets;
-    return cardQuality(hand[source]) - cardQuality(hand[target]) + 180;
+    const sourceCard = hand[source];
+    const targetCard = hand[target];
+    const sourceCopies = countKnown(state, (card) => rank(card), rank(sourceCard));
+    const targetCopies = countKnown(state, (card) => rank(card), rank(targetCard));
+    return (cardQuality(sourceCard) - cardQuality(targetCard)) * 1.4
+      + 300 + sourceCopies * 55 - targetCopies * 20;
   }
-  if (key === "c_cryptid") return cardQuality(hand[targets[0]]) * 2 + 500;
+  if (key === "c_cryptid") {
+    const sourceCard = hand[targets[0]];
+    const sourceCopies = countKnown(state, (card) => rank(card), rank(sourceCard));
+    return cardQuality(sourceCard) * 2 + 650 + sourceCopies * 70;
+  }
   if (rule.kind === "remove") {
-    return targets.reduce((sum, index) => sum + 150 - cardQuality(hand[index]), 0);
+    return targets.reduce((sum, index) => sum + 340 - Math.max(0, cardQuality(hand[index])) * 1.25, 0);
   }
-  if (rule.kind === "stone") return targets.reduce((sum, index) => sum + 120 - rank(hand[index]) * 6, 0);
-  if (rule.kind === "edition") return targets.reduce((sum, index) => sum + cardQuality(hand[index]) * 0.4 + 300, 0);
+  if (rule.kind === "stone") {
+    return targets.reduce((sum, index) => {
+      const card = hand[index];
+      return sum + 360 - rank(card) * 20 - enhancementOverwritePenalty(card, "STONE");
+    }, 0);
+  }
+  if (rule.kind === "edition") {
+    return targets.reduce((sum, index) => sum + Math.max(0, cardQuality(hand[index])) * 0.55 + 420, 0);
+  }
   if (rule.kind === "seal") {
     const seal = sealFor(key);
     return targets.reduce((sum, index) => {
-      const quality = cardQuality(hand[index]);
-      return sum + (seal === "RED" || seal === "GOLD" ? quality + 250 : 380 - quality * 0.25);
+      const quality = Math.max(0, cardQuality(hand[index]));
+      return sum + (seal === "RED" || seal === "GOLD" ? quality + 320 : 480 - quality * 0.2);
     }, 0);
   }
-  if (rule.enhancement === "GOLD" || rule.enhancement === "STEEL") {
-    return targets.reduce((sum, index) => sum + 380 - cardQuality(hand[index]) * 0.2, 0);
+  if (rule.kind === "rank") {
+    return targets.reduce((sum, index) => {
+      const card = hand[index];
+      const nextRank = balatroRankNumber(strengthRank(card));
+      const nextCopies = countKnown(state, (item) => rank(item), nextRank);
+      return sum + 250 + nextCopies * 90 + rank(card) * 8;
+    }, 0);
+  }
+  if (rule.kind === "suit") {
+    const suitedCards = countKnown(state, balatroCardSuit, rule.suit);
+    return targets.reduce((sum, index) => {
+      const card = hand[index];
+      return sum + 230 + suitedCards * 22 + rank(card) * 8;
+    }, 0);
+  }
+  if (rule.enhancement === "GLASS") {
+    return targets.reduce((sum, index) => {
+      const card = hand[index];
+      // Glass wants a card which scores often, but editions, seals and an
+      // existing enhancement make its 1-in-4 destruction risk much costlier.
+      const breakRisk = rank(card) * 9
+        + (modifier(card, "edition") ? 420 : 0)
+        + (modifier(card, "seal") ? 220 : 0);
+      return sum + 700 + rank(card) * 32 - breakRisk
+        - enhancementOverwritePenalty(card, "GLASS");
+    }, 0);
+  }
+  if (rule.enhancement === "STEEL") {
+    return targets.reduce((sum, index) => {
+      const card = hand[index];
+      const baronRankBonus = rank(card) >= 13 ? 140 : 0;
+      return sum + 560 + rank(card) * 34 + baronRankBonus
+        - enhancementOverwritePenalty(card, "STEEL");
+    }, 0);
+  }
+  if (rule.enhancement === "GOLD") {
+    return targets.reduce((sum, index) => {
+      const card = hand[index];
+      // A low off-hand card is easier to keep through scoring and collect the
+      // recurring $3 trigger from, so it is a better durable economy target.
+      return sum + 600 + (14 - rank(card)) * 28
+        - enhancementOverwritePenalty(card, "GOLD");
+    }, 0);
+  }
+  if (rule.enhancement) {
+    return targets.reduce((sum, index) => {
+      const card = hand[index];
+      return sum + 300 + rank(card) * 20
+        - enhancementOverwritePenalty(card, rule.enhancement);
+    }, 0);
   }
   return targets.reduce((sum, index) => sum + Math.max(40, cardQuality(hand[index]) * 0.2), 0);
+}
+
+function targetChangesCard(card, key, rule) {
+  if (key === "c_aura") return !modifier(card, "edition");
+  if (rule.kind === "suit") return balatroCardSuit(card) !== rule.suit;
+  if (rule.kind === "edition") return !modifier(card, "edition");
+  if (rule.kind === "seal") return modifier(card, "seal") !== sealFor(key);
+  if (rule.kind === "stone") return modifier(card, "enhancement") !== "STONE";
+  if (rule.enhancement) return modifier(card, "enhancement") !== rule.enhancement;
+  return true;
+}
+
+function playingCardSignature(card) {
+  return [
+    rank(card),
+    balatroCardSuit(card),
+    modifier(card, "enhancement"),
+    modifier(card, "edition"),
+    modifier(card, "seal"),
+  ].join("|");
+}
+
+function targetedIndexPool(state, key, rule) {
+  const hand = cards(state?.hand);
+  let indices = hand.map((_, index) => index);
+  if (key !== "c_death" && key !== "c_cryptid") {
+    indices = indices.filter((index) => targetChangesCard(hand[index], key, rule));
+  }
+  if (indices.length <= TARGETED_CARD_POOL_LIMIT) return indices;
+  if (key === "c_death") {
+    const ranked = indices.toSorted((left, right) =>
+      cardQuality(hand[left]) - cardQuality(hand[right]) || left - right);
+    const lowCount = Math.ceil(TARGETED_CARD_POOL_LIMIT / 2);
+    const selected = new Set([
+      ...ranked.slice(0, lowCount),
+      ...ranked.slice(-(TARGETED_CARD_POOL_LIMIT - lowCount)),
+    ]);
+    return [...selected].toSorted((left, right) => left - right);
+  }
+  return indices
+    .toSorted((left, right) =>
+      targetedLongTermValue(state, key, [right], rule)
+      - targetedLongTermValue(state, key, [left], rule)
+      || left - right)
+    .slice(0, TARGETED_CARD_POOL_LIMIT)
+    .toSorted((left, right) => left - right);
+}
+
+function boundedTargetSets(state, key, rule) {
+  const hand = cards(state?.hand);
+  const pool = targetedIndexPool(state, key, rule);
+  let targetSets;
+  if (key === "c_death") {
+    // Vanilla ignores target request order: it finds the highlighted card with
+    // the greatest screen x and copies it onto the other card.  BalatroBot's
+    // hand.cards is maintained in screen-x order, so only left < right models
+    // a real distinct outcome; reverse permutations would lie to the solver.
+    targetSets = combinations(pool.length, 2, 2).map((targets) => targets.map((target) => pool[target]));
+    targetSets = targetSets.filter(([target, source]) =>
+      playingCardSignature(hand[target]) !== playingCardSignature(hand[source]));
+  } else if (key === "c_cryptid") {
+    targetSets = pool.map((target) => [target]);
+  } else {
+    targetSets = combinations(pool.length, rule.min, Math.min(rule.max, pool.length))
+      .map((targets) => targets.map((target) => pool[target]));
+  }
+  return targetSets
+    .toSorted((left, right) =>
+      targetedLongTermValue(state, key, right, rule)
+      - targetedLongTermValue(state, key, left, rule)
+      || left.join(",").localeCompare(right.join(",")))
+    .slice(0, TARGETED_EVALUATION_LIMIT);
 }
 
 function targetedCandidates(state, card, index, descriptorValue, { evaluateBestPlay, origin }) {
@@ -318,22 +483,7 @@ function targetedCandidates(state, card, index, descriptorValue, { evaluateBestP
   const rule = balatroConsumableTargetRule(card);
   const hand = cards(state?.hand);
   if (!rule.known || !hand.length || rule.max <= 0) return [];
-  let targetSets;
-  if (key === "c_death") {
-    // Vanilla ignores target request order: it finds the highlighted card with
-    // the greatest screen x and copies it onto the other card.  BalatroBot's
-    // hand.cards is maintained in screen-x order, so only left < right models
-    // a real distinct outcome; reverse permutations would lie to the solver.
-    targetSets = combinations(hand.length, 2, 2);
-  }
-  else if (key === "c_cryptid") targetSets = hand.map((_, target) => [target]);
-  else if (key === "c_aura") {
-    targetSets = hand
-      .map((item, target) => ({ item, target }))
-      .filter(({ item }) => !modifier(item, "edition"))
-      .map(({ target }) => [target]);
-  }
-  else targetSets = combinations(hand.length, rule.min, Math.min(rule.max, hand.length));
+  const targetSets = boundedTargetSets(state, key, rule);
   const base = evaluate(evaluateBestPlay, state);
   const options = [];
   for (const targets of targetSets) {
@@ -342,9 +492,13 @@ function targetedCandidates(state, card, index, descriptorValue, { evaluateBestP
     const baseScore = base?.conservativeScore ?? null;
     const projectedScore = projected?.conservativeScore ?? null;
     const scoreGain = baseScore == null || projectedScore == null ? null : projectedScore - baseScore;
-    const heuristic = targetedHeuristic(state, key, targets, rule);
-    const expectedValue = (scoreGain ?? 0) + heuristic;
-    const harmful = scoreGain != null && scoreGain < 0;
+    const longTermValue = targetedLongTermValue(state, key, targets, rule);
+    const overwritesEnhancement = Boolean(rule.enhancement) && targets.some((target) => {
+      const current = modifier(hand[target], "enhancement");
+      return Boolean(current) && current !== rule.enhancement;
+    });
+    const expectedValue = (scoreGain ?? 0) + longTermValue;
+    const harmful = (scoreGain != null && scoreGain < 0) || longTermValue <= 0 || overwritesEnhancement;
     options.push(makeCandidate({
       origin,
       index,
@@ -352,18 +506,19 @@ function targetedCandidates(state, card, index, descriptorValue, { evaluateBestP
       targets,
       descriptorValue,
       expectedValue,
+      longTermValue,
       harmful,
       projected,
       projectedScore,
       scoreGain,
       assessment: key === "c_death"
-        ? `${descriptorValue.label}: copy card ${targets[1]} onto card ${targets[0]}`
-        : `${descriptorValue.label}: simulate ${rule.kind} on [${targets.join(",")}]`,
+        ? `${descriptorValue.label}: copy card ${targets[1]} onto card ${targets[0]}; long-term ${Math.round(longTermValue)}`
+        : `${descriptorValue.label}: simulate ${rule.kind} on [${targets.join(",")}]; long-term ${Math.round(longTermValue)}${overwritesEnhancement ? "; replaces an existing enhancement" : ""}`,
     }));
   }
   return options
     .toSorted((left, right) => right.expectedValue - left.expectedValue || left.id.localeCompare(right.id))
-    .slice(0, key === "c_death" || key === "c_cryptid" ? 3 : 1);
+    .slice(0, TARGETED_TOP_K);
 }
 
 function withPlanetUpgrade(state, descriptorValue) {
@@ -574,6 +729,7 @@ function makeCandidate({
   targets = [],
   descriptorValue,
   expectedValue,
+  longTermValue = null,
   harmful,
   projected = null,
   projectedScore = null,
@@ -611,6 +767,7 @@ function makeCandidate({
       ? `${descriptorValue.label} can permanently destroy or weaken the run`
       : `${descriptorValue.label} consumes a finite run resource`,
     expectedValue: Math.round(finite(expectedValue)),
+    longTermValue: longTermValue == null ? null : Math.round(finite(longTermValue)),
     projectedPlay: projected,
     projectedScore: projectedScore == null ? null : Math.round(projectedScore),
     scoreGain: scoreGain == null ? null : Math.round(scoreGain),
@@ -736,8 +893,9 @@ export function generateBalatroConsumablePackCandidates(state, { evaluateBestPla
 export function generateBalatroConsumableShopUseCandidates(state, { evaluateBestPlay = null, limit = 24 } = {}) {
   if (state?.state !== "SHOP") return [];
   const result = [];
-  const money = Math.max(0, finite(state?.money)) +
-    (cards(state?.jokers).some((joker) => keyOf(joker) === "j_credit_card") ? 20 : 0);
+  const activeCredit = cards(state?.jokers).reduce((total, joker) =>
+    total + (keyOf(joker) === "j_credit_card" && !balatroJokerDebuffed(joker) ? 20 : 0), 0);
+  const money = finite(state?.money) + activeCredit;
   for (const [index, card] of cards(state?.shop).entries()) {
     const set = String(card?.set ?? "").toUpperCase();
     if (!new Set(["TAROT", "PLANET", "SPECTRAL"]).has(set)) continue;

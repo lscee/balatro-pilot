@@ -12,23 +12,25 @@ import {
   semanticStateBucket,
   semanticStateFeatures,
   semanticStateSimilarity,
+  semanticStakeRuleCompatibility,
   semanticStateText,
   semanticTerminalOutcome,
   semanticTransitionReward,
+  semanticTransitionRewardFromFeatures,
   semanticFeatureCompatibility,
   semanticNormalizeFeatures,
   SEMANTIC_REWARD_VERSION,
 } from "../src/semantic-experience.mjs";
 
-function card(key, { set = "DEFAULT", buy = 1 } = {}) {
+function card(key, { set = "DEFAULT", buy = 1, modifier = {}, debuff = false } = {}) {
   const [suit, rank] = key.split("_");
   return {
     key,
     set,
     label: key,
     value: { suit, rank, effect: "" },
-    modifier: {},
-    state: {},
+    modifier,
+    state: { debuff },
     cost: { buy, sell: 1 },
   };
 }
@@ -59,8 +61,8 @@ test("semantic state separates exact safety fingerprints from reusable visible-s
   const first = state();
   const second = state({ seed: "another-seed" });
   const features = semanticStateFeatures(first);
-  assert.equal(SEMANTIC_POLICY_VERSION, 5);
-  assert.equal(SEMANTIC_REWARD_VERSION, 6);
+  assert.equal(SEMANTIC_POLICY_VERSION, 6);
+  assert.equal(SEMANTIC_REWARD_VERSION, 7);
   assert.equal(features.screen, "SELECTING_HAND");
   assert.deepEqual(features.hand, ["H_A", "S_A", "C_2"]);
   assert.equal(semanticReplayFingerprint(first), semanticReplayFingerprint(second));
@@ -74,6 +76,8 @@ test("legacy semantic features normalize without pretending to be exact evidence
   delete legacy.strategy;
   delete legacy.collectionSignature;
   delete legacy.appearedJokers;
+  delete legacy.stakeRules;
+  delete legacy.stickerEconomy;
   const normalized = semanticNormalizeFeatures(legacy, { canonicalVersion: true });
   assert.equal(normalized.version, SEMANTIC_POLICY_VERSION);
   assert.equal(normalized.strategy.phase, "early");
@@ -81,6 +85,54 @@ test("legacy semantic features normalize without pretending to be exact evidence
   assert.equal(semanticFeatureCompatibility(legacy), "semantic");
   assert.equal(semanticFeatureCompatibility(semanticStateFeatures(state())), "exact");
   assert.equal(semanticFeatureCompatibility({ broken: true }), "incompatible");
+});
+
+test("Gold stake rules and sticker liabilities are explicit reusable state", () => {
+  const gold = state({
+    stake: "GOLD",
+    stake_rules: { ante_scaling: 1 },
+    jokers: {
+      count: 3,
+      limit: 5,
+      cards: [
+        card("j_rental", { set: "JOKER", modifier: { rental: true } }),
+        card("j_perishable", { set: "JOKER", modifier: { perishable: 2 } }),
+        card("j_eternal", { set: "JOKER", modifier: { eternal: true } }),
+      ],
+    },
+  });
+  const features = semanticStateFeatures(gold);
+  assert.deepEqual(features.stakeRules.appliedStakes, [
+    "WHITE", "RED", "GREEN", "BLACK", "BLUE", "PURPLE", "ORANGE", "GOLD",
+  ]);
+  assert.equal(features.stakeRules.noSmallBlindReward, true);
+  assert.equal(features.stakeRules.scalingTier, 3);
+  assert.equal(features.stakeRules.anteScaling, 1);
+  assert.match(features.stakeRules.signature, /ante=1/);
+  assert.equal(features.stakeRules.discardModifier, -1);
+  assert.equal(features.stakeRules.eternalStickers, true);
+  assert.equal(features.stakeRules.perishableStickers, true);
+  assert.equal(features.stakeRules.rentalStickers, true);
+  assert.equal(features.stickerEconomy.rentalCount, 1);
+  assert.equal(features.stickerEconomy.rentalUpkeep, 3);
+  assert.deepEqual(features.stickerEconomy.perishableTtls, [2]);
+  assert.equal(features.stickerEconomy.perishableExpired, 0);
+  assert.equal(features.stickerEconomy.eternalLockedSlots, 1);
+  const white = semanticStateFeatures(state({ stake: "WHITE" }));
+  assert.equal(semanticStakeRuleCompatibility(features, white), "incompatible");
+  assert.equal(semanticStateSimilarity(features, white), 0);
+});
+
+test("legacy policy features downgrade to semantic while retaining known stake isolation", () => {
+  const legacyGold = semanticStateFeatures(state({ stake: "GOLD" }));
+  legacyGold.version = 5;
+  delete legacyGold.stakeRules;
+  delete legacyGold.stickerEconomy;
+  const normalized = semanticNormalizeFeatures(legacyGold, { canonicalVersion: true });
+  assert.equal(normalized.stakeRules.code, "GOLD");
+  assert.equal(semanticFeatureCompatibility(legacyGold), "semantic");
+  assert.ok(semanticStateSimilarity(normalized, semanticStateFeatures(state({ stake: "GOLD" }))) > 0.95);
+  assert.equal(semanticStateSimilarity(normalized, semanticStateFeatures(state({ stake: "WHITE" }))), 0);
 });
 
 test("long losing trajectories remain negative while preserving useful ordering", () => {
@@ -165,6 +217,62 @@ test("reward and discounted return propagate whole-run outcomes backwards", () =
     semanticDiscountedReturns([{ id: 3, immediateReward: 0 }], "lost", { ante_num: 2, money: 60 }).get(3) <
       semanticDiscountedReturns([{ id: 3, immediateReward: 0 }], "lost", { ante_num: 2, money: 0 }).get(3),
   );
+});
+
+test("reward v7 uses observed cash and sticker deltas without an unconditional buy bonus", () => {
+  const unchanged = semanticStateFeatures(state());
+  assert.equal(semanticTransitionRewardFromFeatures(unchanged, { method: "buy" }, unchanged), 0);
+
+  const richer = structuredClone(unchanged);
+  richer.money += 2;
+  assert.equal(semanticTransitionRewardFromFeatures(unchanged, { method: "select" }, richer), 0.07);
+
+  const rented = semanticStateFeatures(state({
+    jokers: {
+      count: 1,
+      limit: 5,
+      cards: [card("j_rental", { set: "JOKER", modifier: { rental: true } })],
+    },
+  }));
+  assert.equal(semanticTransitionRewardFromFeatures(unchanged, { method: "select" }, rented), -0.3);
+
+  const expiring = semanticStateFeatures(state({
+    jokers: {
+      count: 1,
+      limit: 5,
+      cards: [card("j_short", { set: "JOKER", modifier: { perishable: 1 } })],
+    },
+  }));
+  const expired = semanticStateFeatures(state({
+    jokers: {
+      count: 1,
+      limit: 5,
+      cards: [card("j_short", { set: "JOKER", modifier: { perishable: 0 }, debuff: true })],
+    },
+  }));
+  assert.equal(semanticTransitionRewardFromFeatures(expiring, { method: "select" }, expired), -0.65);
+
+  const bossDebuffed = semanticStateFeatures(state({
+    jokers: {
+      count: 1,
+      limit: 5,
+      cards: [card("j_joker", { set: "JOKER", debuff: true })],
+    },
+  }));
+  const plain = semanticStateFeatures(state({
+    jokers: { count: 1, limit: 5, cards: [card("j_joker", { set: "JOKER" })] },
+  }));
+  assert.equal(semanticTransitionRewardFromFeatures(plain, { method: "select" }, bossDebuffed), 0);
+
+  const legacyExpired = structuredClone(expired);
+  legacyExpired.screen = "ROUND_EVAL";
+  legacyExpired.jokers = ["j_short+debuff"];
+  delete legacyExpired.stickerEconomy;
+  assert.equal(semanticTransitionRewardFromFeatures(expiring, { method: "select" }, legacyExpired), 0.15);
+
+  const legacyBossDebuff = structuredClone(legacyExpired);
+  legacyBossDebuff.screen = "SELECTING_HAND";
+  assert.equal(semanticTransitionRewardFromFeatures(expiring, { method: "select" }, legacyBossDebuff), 0);
 });
 
 test("high-score learning distinguishes a million-point hand from merely clearing a blind", () => {

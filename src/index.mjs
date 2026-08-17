@@ -25,6 +25,7 @@ import { RunLog } from "./run-log.mjs";
 import { SemanticRagStore } from "./semantic-rag.mjs";
 import { RoundStrategyContext } from "./round-strategy.mjs";
 import { StrategicCheckpointStore } from "./strategic-checkpoints.mjs";
+import { createPilotPauseMonitor } from "./pilot-control.mjs";
 import { WindowsBridge } from "./windows-bridge.mjs";
 
 const sourceDir = path.dirname(fileURLToPath(import.meta.url));
@@ -391,7 +392,7 @@ async function click(config, values) {
   });
 }
 
-async function runVision(config, { dryRun, steps }) {
+async function runVision(config, { dryRun, steps, signal: externalSignal }) {
   const maxSteps = steps === undefined ? (config.maxSteps ?? Number.POSITIVE_INFINITY) : Number(steps);
   if (maxSteps !== Number.POSITIVE_INFINITY && (!Number.isInteger(maxSteps) || maxSteps < 1 || maxSteps > 10_000)) {
     throw new Error("--steps must be an integer between 1 and 10000");
@@ -404,6 +405,9 @@ async function runVision(config, { dryRun, steps }) {
   const log = new RunLog(projectRoot, dryRun ? "dry-run" : "run");
   let cumulativeUsage = mergeUsage();
   const abortController = new AbortController();
+  const relayAbort = () => abortController.abort(externalSignal?.reason);
+  externalSignal?.addEventListener("abort", relayAbort, { once: true });
+  if (externalSignal?.aborted) relayAbort();
   const onSigint = () => abortController.abort();
   process.once("SIGINT", onSigint);
   console.log(`Run log: ${log.dir}`);
@@ -770,6 +774,7 @@ async function runVision(config, { dryRun, steps }) {
       if (Number.isFinite(maxSteps)) console.log(`Reached maxSteps=${maxSteps}; stopped safely.`);
     });
   } finally {
+    externalSignal?.removeEventListener("abort", relayAbort);
     process.removeListener("SIGINT", onSigint);
     log.event("summary", { usage: cumulativeUsage });
     console.log(`\nCumulative API usage: ${conciseUsage(cumulativeUsage)}`);
@@ -850,10 +855,13 @@ async function botDoctor(config) {
 }
 
 async function run(config, options) {
-  if (config.controlBackend === "vision") {
-    console.log("Control backend: vision (forced by config)");
-    return runVision(config, options);
-  }
+  const pauseMonitor = createPilotPauseMonitor(projectRoot);
+  const runOptions = { ...options, signal: pauseMonitor.signal };
+  try {
+    if (config.controlBackend === "vision") {
+      console.log("Control backend: vision (forced by config)");
+      return await runVision(config, runOptions);
+    }
 
   const client = new BalatrobotClient({ baseUrl: config.balatrobotUrl, timeoutMs: config.balatrobotTimeoutMs });
   try {
@@ -878,7 +886,7 @@ async function run(config, options) {
     }
     if (error instanceof BalatrobotNetworkError && causeCode === "ECONNREFUSED") {
       console.warn(`[warn] No BalatroBot service is listening; falling back to the existing vision controller.`);
-      return runVision(config, options);
+      return await runVision(config, runOptions);
     }
     throw new Error(
       `BalatroBot responded but its startup probe failed: ${error.message}. ` +
@@ -939,12 +947,22 @@ async function run(config, options) {
       experienceStore,
       profileReader,
       overlayController,
-      dryRun: options.dryRun,
+      dryRun: runOptions.dryRun,
       maxSteps,
+      signal: pauseMonitor.signal,
     });
   } finally {
     await overlayController?.close();
     experienceStore?.close();
+  }
+  } catch (error) {
+    if (pauseMonitor.signal.aborted && pauseMonitor.signal.reason?.code === "PILOT_PAUSED") {
+      console.log("Balatro Pilot paused by dashboard control.");
+      return;
+    }
+    throw error;
+  } finally {
+    pauseMonitor.close();
   }
 }
 

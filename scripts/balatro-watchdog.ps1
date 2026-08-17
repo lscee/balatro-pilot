@@ -13,7 +13,11 @@ param(
   [int]$CyclePlanLimit = 12,
   [Alias("DryRun")]
   [switch]$CheckOnly,
-  [switch]$ForceRestart
+  [switch]$ForceRestart,
+  [ValidateSet("", "status", "pause", "start")]
+  [string]$ControlAction = "",
+  [int]$ExpectedRevision = -1,
+  [switch]$Json
 )
 
 Set-StrictMode -Version Latest
@@ -26,10 +30,12 @@ $resolvedProject = [System.IO.Path]::GetFullPath($ProjectRoot)
 $stateDirectory = Join-Path $env:LOCALAPPDATA "BalatroPilot"
 $watchdogLog = Join-Path $stateDirectory "watchdog.log"
 $statePath = Join-Path $stateDirectory "watchdog-state.json"
+$controlPath = Join-Path $stateDirectory "controller-control.json"
 $runnerPath = Join-Path $resolvedProject "scripts\run-balatro-pilot.ps1"
 $launchPath = Join-Path $resolvedProject "src\launch.mjs"
 $indexPath = Join-Path $resolvedProject "src\index.mjs"
 $runsPath = Join-Path $resolvedProject "runs"
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 if (-not (Test-Path -LiteralPath $stateDirectory)) {
   New-Item -ItemType Directory -Path $stateDirectory -Force | Out-Null
@@ -42,18 +48,66 @@ function Write-WatchdogLog {
   Write-Output $line
 }
 
+function Read-ControlState {
+  $fallback = [pscustomobject]@{
+    desiredState = "running"
+    revision = 0
+    updatedAt = [DateTime]::UtcNow.ToString("o")
+    operationError = $null
+  }
+  if (-not (Test-Path -LiteralPath $controlPath -PathType Leaf)) { return $fallback }
+  try {
+    $loaded = Get-Content -LiteralPath $controlPath -Raw | ConvertFrom-Json -ErrorAction Stop
+    if ([string]$loaded.desiredState -notin @("running", "paused")) { return $fallback }
+    return [pscustomobject]@{
+      desiredState = [string]$loaded.desiredState
+      revision = [math]::Max(0, [int]$loaded.revision)
+      updatedAt = if ([string]::IsNullOrWhiteSpace([string]$loaded.updatedAt)) { $fallback.updatedAt } else { [string]$loaded.updatedAt }
+      operationError = if ($null -eq $loaded.operationError) { $null } else { [string]$loaded.operationError }
+    }
+  } catch {
+    return $fallback
+  }
+}
+
+function Write-ControlState {
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet("running", "paused")][string]$DesiredState,
+    [Parameter(Mandatory = $true)][int]$Revision,
+    [AllowNull()][string]$OperationError
+  )
+  $value = [ordered]@{
+    desiredState = $DesiredState
+    revision = $Revision
+    updatedAt = [DateTime]::UtcNow.ToString("o")
+    operationError = $OperationError
+  }
+  $temporary = Join-Path $stateDirectory ("controller-control.{0}.tmp" -f ([Guid]::NewGuid().ToString("N")))
+  try {
+    [System.IO.File]::WriteAllText($temporary, ($value | ConvertTo-Json), $utf8NoBom)
+    Move-Item -LiteralPath $temporary -Destination $controlPath -Force
+  } finally {
+    if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+  }
+  return [pscustomobject]$value
+}
+
 function Get-PilotProcesses {
-  $paths = @($runnerPath, $launchPath, $indexPath)
   return @(
     Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+      $name = [string]$_.Name
       $commandLine = [string]$_.CommandLine
       if ([string]::IsNullOrWhiteSpace($commandLine)) { return $false }
-      foreach ($path in $paths) {
-        if ($commandLine.IndexOf($path, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-          return $true
-        }
-      }
-      return $false
+      $runnerPattern = '(?i)(?:^|\s)-File\s+"?' + [regex]::Escape($runnerPath) + '"?(?=\s|$)'
+      $doctorPattern = '(?i)(?:^|\s)-(?:ApiDoctor|StrategicApiDoctor|VisionApiDoctor)(?=\s|$)'
+      if (
+        $name -in @("powershell.exe", "pwsh.exe") -and
+        $commandLine -match $runnerPattern -and
+        $commandLine -notmatch $doctorPattern
+      ) { return $true }
+      $launchPattern = '(?i)(?:^|\s)"?' + [regex]::Escape($launchPath) + '"?\s+run(?:\s|$)'
+      $indexPattern = '(?i)(?:^|\s)"?' + [regex]::Escape($indexPath) + '"?\s+run(?:\s|$)'
+      return $name -eq "node.exe" -and ($commandLine -match $launchPattern -or $commandLine -match $indexPattern)
     }
   )
 }
@@ -297,15 +351,57 @@ function Stop-PilotProcesses {
     $current = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.ProcessId)" -ErrorAction SilentlyContinue
     if ($null -eq $current) { continue }
     $commandLine = [string]$current.CommandLine
-    if (
-      $commandLine.IndexOf($runnerPath, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
-      $commandLine.IndexOf($launchPath, [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
-      $commandLine.IndexOf($indexPath, [StringComparison]::OrdinalIgnoreCase) -lt 0
-    ) {
-      continue
-    }
-    & taskkill.exe /PID $current.ProcessId /T /F 2>&1 | Out-Null
+    $name = [string]$current.Name
+    $runnerPattern = '(?i)(?:^|\s)-File\s+"?' + [regex]::Escape($runnerPath) + '"?(?=\s|$)'
+    $doctorPattern = '(?i)(?:^|\s)-(?:ApiDoctor|StrategicApiDoctor|VisionApiDoctor)(?=\s|$)'
+    $launchPattern = '(?i)(?:^|\s)"?' + [regex]::Escape($launchPath) + '"?\s+run(?:\s|$)'
+    $indexPattern = '(?i)(?:^|\s)"?' + [regex]::Escape($indexPath) + '"?\s+run(?:\s|$)'
+    $isExactRunner =
+      $name -in @("powershell.exe", "pwsh.exe") -and
+      $commandLine -match $runnerPattern -and
+      $commandLine -notmatch $doctorPattern
+    $isExactController = $name -eq "node.exe" -and ($commandLine -match $launchPattern -or $commandLine -match $indexPattern)
+    if (-not $isExactRunner -and -not $isExactController) { continue }
+    Stop-Process -Id $current.ProcessId -Force -ErrorAction SilentlyContinue
   }
+}
+
+function Wait-PilotStopped {
+  param([int]$TimeoutMilliseconds = 8000)
+  $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+  do {
+    $remaining = @(Get-PilotProcesses)
+    if ($remaining.Count -eq 0) { return $true }
+    Start-Sleep -Milliseconds 200
+  } while ([DateTime]::UtcNow -lt $deadline)
+  return $false
+}
+
+function Get-ControlStatus {
+  param([AllowNull()][string]$ErrorCode = $null)
+  $control = Read-ControlState
+  $processes = @(Get-PilotProcesses)
+  $nodeProcess = $processes | Where-Object {
+    ([string]$_.CommandLine).IndexOf($indexPath, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+    ([string]$_.CommandLine).IndexOf($launchPath, [StringComparison]::OrdinalIgnoreCase) -ge 0
+  } | Sort-Object CreationDate | Select-Object -First 1
+  $controllerPid = if ($null -ne $nodeProcess) { [int]$nodeProcess.ProcessId } elseif ($processes.Count -gt 0) { [int]$processes[0].ProcessId } else { $null }
+  $effectiveState = if ($processes.Count -gt 0) { "running" } elseif ($control.desiredState -eq "paused") { "paused" } else { "stopped" }
+  return [pscustomobject]@{
+    desiredState = [string]$control.desiredState
+    effectiveState = $effectiveState
+    revision = [int]$control.revision
+    updatedAt = [string]$control.updatedAt
+    operationError = $control.operationError
+    controllerPid = $controllerPid
+    errorCode = $ErrorCode
+  }
+}
+
+function Write-ControlResult {
+  param([Parameter(Mandatory = $true)]$Status)
+  if ($Json) { Write-Output ($Status | ConvertTo-Json -Compress) }
+  else { Write-Output $Status }
 }
 
 function Start-PilotProcess {
@@ -350,7 +446,8 @@ function Start-PilotProcess {
     "-CredentialPath", ('"{0}"' -f $CredentialPath),
     "-DeepSeekCredentialPath", ('"{0}"' -f $DeepSeekCredentialPath),
     "-RoutineCredentialPath", ('"{0}"' -f $RoutineCredentialPath),
-    "-StrategicCredentialPath", ('"{0}"' -f $StrategicCredentialPath)
+    "-StrategicCredentialPath", ('"{0}"' -f $StrategicCredentialPath),
+    "-ControllerOnly"
   )
   $startParameters = @{
     FilePath = $powerShellPath
@@ -368,7 +465,7 @@ function Start-PilotProcess {
     startedAt = [DateTime]::UtcNow.ToString("o")
     stdoutPath = $stdoutPath
     stderrPath = $stderrPath
-  } | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding UTF8
+  } | ConvertTo-Json | ForEach-Object { [System.IO.File]::WriteAllText($statePath, $_, $utf8NoBom) }
 
   Start-Sleep -Milliseconds 1200
   if ($null -eq (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
@@ -383,15 +480,98 @@ $lockTaken = $false
 try {
   $lockTaken = $mutex.WaitOne(0)
   if (-not $lockTaken) {
+    if (-not [string]::IsNullOrWhiteSpace($ControlAction)) {
+      $busy = Get-ControlStatus -ErrorCode "CONTROL_BUSY"
+      $busy.operationError = "Another control operation is already running."
+      Write-ControlResult -Status $busy
+      exit 5
+    }
     Write-WatchdogLog "Another watchdog check is already running; skipped."
     exit 0
+  }
+
+  if (-not [string]::IsNullOrWhiteSpace($ControlAction)) {
+    $currentControl = Read-ControlState
+    if ($ExpectedRevision -ge 0 -and $ExpectedRevision -ne [int]$currentControl.revision) {
+      $conflict = Get-ControlStatus -ErrorCode "REVISION_CONFLICT"
+      $conflict.operationError = "The controller state changed; refresh before trying again."
+      Write-ControlResult -Status $conflict
+      exit 4
+    }
+
+    if ($ControlAction -eq "status") {
+      Write-ControlResult -Status (Get-ControlStatus)
+      exit 0
+    }
+
+    if ($ControlAction -eq "pause") {
+      if ($currentControl.desiredState -ne "paused") {
+        $currentControl = Write-ControlState -DesiredState "paused" -Revision ([int]$currentControl.revision + 1) -OperationError $null
+      }
+      if (-not (Wait-PilotStopped -TimeoutMilliseconds 8000)) {
+        $remaining = @(Get-PilotProcesses)
+        if ($remaining.Count -gt 0) { Stop-PilotProcesses -Processes $remaining }
+        [void](Wait-PilotStopped -TimeoutMilliseconds 2500)
+      }
+      $pausedStatus = Get-ControlStatus
+      if ($pausedStatus.effectiveState -ne "paused") {
+        $currentControl = Write-ControlState -DesiredState "paused" -Revision ([int]$currentControl.revision) -OperationError "The controller could not be stopped safely."
+        $pausedStatus = Get-ControlStatus -ErrorCode "CONTROL_OPERATION_FAILED"
+        Write-ControlResult -Status $pausedStatus
+        exit 2
+      }
+      Write-ControlResult -Status $pausedStatus
+      exit 0
+    }
+
+    if ($ControlAction -eq "start") {
+      $processes = @(Get-PilotProcesses)
+      if ($processes.Count -gt 0) {
+        if ($currentControl.desiredState -ne "running") {
+          [void](Write-ControlState -DesiredState "running" -Revision ([int]$currentControl.revision + 1) -OperationError $null)
+        }
+        Write-ControlResult -Status (Get-ControlStatus)
+        exit 0
+      }
+      if ($null -eq (Get-Process -Name "Balatro" -ErrorAction SilentlyContinue)) {
+        $failed = Write-ControlState -DesiredState $currentControl.desiredState -Revision ([int]$currentControl.revision) -OperationError "Balatro.exe is not running."
+        Write-ControlResult -Status (Get-ControlStatus -ErrorCode "CONTROL_OPERATION_FAILED")
+        exit 2
+      }
+      if ($null -eq (Get-NetTCPConnection -State Listen -LocalPort 12346 -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        $failed = Write-ControlState -DesiredState $currentControl.desiredState -Revision ([int]$currentControl.revision) -OperationError "BalatroBot JSON-RPC is not listening."
+        Write-ControlResult -Status (Get-ControlStatus -ErrorCode "CONTROL_OPERATION_FAILED")
+        exit 2
+      }
+      $nextRevision = if ($currentControl.desiredState -eq "running") { [int]$currentControl.revision } else { [int]$currentControl.revision + 1 }
+      [void](Write-ControlState -DesiredState "running" -Revision $nextRevision -OperationError $null)
+      try {
+        $started = Start-PilotProcess
+      } catch {
+        [void](Write-ControlState -DesiredState "running" -Revision $nextRevision -OperationError "The controller failed to start.")
+        Write-ControlResult -Status (Get-ControlStatus -ErrorCode "CONTROL_OPERATION_FAILED")
+        exit 2
+      }
+      Write-ControlResult -Status (Get-ControlStatus)
+      exit 0
+    }
   }
 
   if ($CheckOnly -and $ForceRestart) {
     throw "CheckOnly and ForceRestart cannot be used together"
   }
 
+  $controlState = Read-ControlState
   $processes = @(Get-PilotProcesses)
+  if ($controlState.desiredState -eq "paused") {
+    if ($processes.Count -gt 0) {
+      if (-not (Wait-PilotStopped -TimeoutMilliseconds 8000)) {
+        Stop-PilotProcesses -Processes @(Get-PilotProcesses)
+      }
+    }
+    Write-WatchdogLog "Paused: controller remains stopped by dashboard control."
+    exit 0
+  }
   if ($ForceRestart) {
     $reason = "the scheduled diagnosis and verified repair completed"
   } elseif ($processes.Count -eq 0) {
@@ -424,7 +604,13 @@ try {
   Write-WatchdogLog "Restarted Balatro Pilot as PID $($started.Id) because $reason."
   exit 0
 } catch {
-  Write-WatchdogLog "ERROR: $($_.Exception.Message)"
+  if (-not [string]::IsNullOrWhiteSpace($ControlAction)) {
+    $control = Read-ControlState
+    [void](Write-ControlState -DesiredState $control.desiredState -Revision ([int]$control.revision) -OperationError "Pilot control operation failed.")
+    Write-ControlResult -Status (Get-ControlStatus -ErrorCode "CONTROL_OPERATION_FAILED")
+  } else {
+    Write-WatchdogLog "ERROR: $($_.Exception.Message)"
+  }
   exit 2
 } finally {
   if ($lockTaken) {
