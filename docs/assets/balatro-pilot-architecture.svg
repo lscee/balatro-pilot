@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1120" viewBox="0 0 1800 1120" role="img" aria-labelledby="title desc">
-  <title id="title">Balatro Pilot current architecture</title>
-  <desc id="desc">A layered architecture map showing the game runtime, deterministic decision kernel, advisory model plane, semantic experience plane, operations, and observability.</desc>
+  <title id="title">Balatro Pilot 当前架构</title>
+  <desc id="desc">分层架构图，展示游戏运行时、确定性决策内核、建议模型层、语义经验层、运维控制与可观测性。</desc>
   <defs>
     <linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#07111f"/>
@@ -52,7 +52,7 @@
       .title { font-size: 42px; font-weight: 720; fill: #f4f8ff; letter-spacing: .3px; }
       .subtitle { font-size: 17px; fill: #9fb4cd; letter-spacing: .25px; }
       .zone-title { font-size: 20px; font-weight: 700; fill: #f5f8ff; }
-      .zone-kicker { font-size: 11px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; }
+      .zone-kicker { font-size: 11px; font-weight: 700; letter-spacing: 1.1px; }
       .card-title { font-size: 16px; font-weight: 690; fill: #f6f9ff; }
       .body { font-size: 13px; fill: #b7c6d9; }
       .tiny { font-size: 11px; fill: #8fa4bd; }
@@ -72,18 +72,18 @@
 
   <g class="sans">
     <text x="70" y="72" class="title">Balatro Pilot · 当前架构</text>
-    <text x="70" y="103" class="subtitle">Exact-state autonomy with deterministic safety, advisory models, and versioned semantic experience</text>
+    <text x="70" y="103" class="subtitle">精确状态自治 · 确定性安全 · 建议型模型 · 版本化语义经验</text>
     <g transform="translate(1430 50)">
       <rect width="300" height="54" rx="27" fill="#0d1d2e" stroke="#6b8baa" stroke-opacity=".32"/>
       <circle cx="27" cy="27" r="7" fill="#45e0b7" filter="url(#glowCyan)"/>
-      <text x="46" y="24" class="tiny">CURRENT BASELINE</text>
-      <text x="46" y="42" class="pill">Policy v6 · Reward v7 · Ante 8 win</text>
+      <text x="46" y="24" class="tiny">当前基线</text>
+      <text x="46" y="42" class="pill">策略 v6 · 奖励 v7 · 第 8 底注胜利</text>
     </g>
 
     <!-- Game runtime -->
     <g>
       <rect x="70" y="160" width="410" height="390" rx="26" fill="url(#game)" stroke="#45c7d8" stroke-opacity=".46" class="zone"/>
-      <text x="100" y="196" class="zone-kicker" fill="#52d6e7">GAME RUNTIME</text>
+      <text x="100" y="196" class="zone-kicker" fill="#52d6e7">游戏运行时</text>
       <text x="100" y="226" class="zone-title">游戏与原生状态边界</text>
 
       <rect x="100" y="254" width="350" height="92" rx="16" class="inner"/>
@@ -94,7 +94,7 @@
 
       <rect x="100" y="362" width="350" height="112" rx="16" class="inner"/>
       <text x="122" y="391" class="card-title">Lovely + Steamodded + BalatroBot</text>
-      <text x="122" y="417" class="body">固定指纹的 Lua 端点与 GameState 包装</text>
+      <text x="122" y="417" class="body">固定指纹的 Lua 端点与 GameState 封装</text>
       <text x="122" y="440" class="tiny">play · discard · buy/use · cash_out · start</text>
       <g transform="translate(122 450)">
         <rect width="105" height="22" rx="11" fill="#16394a"/><text x="13" y="15" class="pill">JSON-RPC 12346</text>
@@ -102,99 +102,99 @@
       </g>
 
       <rect x="100" y="490" width="350" height="38" rx="12" fill="#102536" stroke="#45c7d8" stroke-opacity=".25"/>
-      <text x="122" y="514" class="body">Profile / collection / Stake 与 Sticker 真值</text>
+      <text x="122" y="514" class="body">档案 / 收藏 / 赌注与贴纸真值</text>
     </g>
 
     <!-- Operations -->
     <g>
       <rect x="70" y="585" width="410" height="355" rx="26" fill="url(#ops)" stroke="#46d5a8" stroke-opacity=".42" class="zone"/>
-      <text x="100" y="621" class="zone-kicker" fill="#54d6ad">OPERATIONS</text>
+      <text x="100" y="621" class="zone-kicker" fill="#54d6ad">运维控制</text>
       <text x="100" y="651" class="zone-title">运行、暂停与故障恢复</text>
 
       <rect x="100" y="681" width="350" height="72" rx="16" class="inner"/>
-      <text x="122" y="710" class="card-title">Launcher / Watchdog</text>
-      <text x="122" y="735" class="body">受管启动 · 精确进程识别 · pause sentinel</text>
+      <text x="122" y="710" class="card-title">启动器 / 看门狗</text>
+      <text x="122" y="735" class="body">受管启动 · 精确进程识别 · 暂停标记</text>
 
       <rect x="100" y="769" width="350" height="72" rx="16" class="inner"/>
-      <text x="122" y="798" class="card-title">PilotControlManager</text>
-      <text x="122" y="823" class="body">一键暂停/启动 AI，不停止游戏与 RPC</text>
+      <text x="122" y="798" class="card-title">PilotControlManager · 控制管理器</text>
+      <text x="122" y="823" class="body">一键暂停/启动自动控制，不停止游戏与 RPC</text>
 
       <rect x="100" y="857" width="350" height="57" rx="16" class="inner"/>
-      <text x="122" y="883" class="card-title">Windows safety bridge</text>
-      <text x="122" y="902" class="tiny">F8 / Ctrl+C · focus wait · unlock overlay fallback</text>
+      <text x="122" y="883" class="card-title">Windows 安全桥接</text>
+      <text x="122" y="902" class="tiny">F8 / Ctrl+C · 焦点等待 · 解锁浮层回退</text>
     </g>
 
     <!-- Decision kernel -->
     <g>
       <rect x="545" y="160" width="710" height="650" rx="30" fill="url(#kernel)" stroke="#57cfe2" stroke-opacity=".52" stroke-width="1.4" class="zone"/>
-      <text x="580" y="198" class="zone-kicker" fill="#5ed7e8">DETERMINISTIC CORE</text>
+      <text x="580" y="198" class="zone-kicker" fill="#5ed7e8">确定性内核</text>
       <text x="580" y="230" class="zone-title">决策内核 · 本地可信边界</text>
       <g transform="translate(1035 184)">
         <rect width="178" height="28" rx="14" fill="#14364a" stroke="#55d4e5" stroke-opacity=".3"/>
-        <text x="17" y="19" class="pill">candidate IDs only</text>
+        <text x="17" y="19" class="pill">仅接收候选 ID</text>
       </g>
 
       <rect x="580" y="260" width="640" height="100" rx="18" class="inner"/>
-      <text x="606" y="289" class="card-title">Exact State Envelope</text>
-      <text x="606" y="315" class="body">BalatrobotClient · compact state · fresh fingerprint · readiness gates</text>
+      <text x="606" y="289" class="card-title">精确状态封装</text>
+      <text x="606" y="315" class="body">BalatrobotClient · 紧凑状态 · 最新指纹 · 就绪门禁</text>
       <g transform="translate(606 330)">
-        <rect width="122" height="21" rx="10.5" fill="#152d43"/><text x="13" y="15" class="pill">Stake / Stickers</text>
-        <rect x="132" width="128" height="21" rx="10.5" fill="#152d43"/><text x="145" y="15" class="pill">Hand / Shop / Pack</text>
-        <rect x="270" width="130" height="21" rx="10.5" fill="#152d43"/><text x="283" y="15" class="pill">Profile / Deck goal</text>
-        <rect x="410" width="180" height="21" rx="10.5" fill="#152d43"/><text x="423" y="15" class="pill">Menu &amp; hand-action ready</text>
+        <rect width="122" height="21" rx="10.5" fill="#152d43"/><text x="13" y="15" class="pill">赌注 / 贴纸</text>
+        <rect x="132" width="128" height="21" rx="10.5" fill="#152d43"/><text x="145" y="15" class="pill">手牌 / 商店 / 卡包</text>
+        <rect x="270" width="130" height="21" rx="10.5" fill="#152d43"/><text x="283" y="15" class="pill">档案 / 牌组目标</text>
+        <rect x="410" width="180" height="21" rx="10.5" fill="#152d43"/><text x="423" y="15" class="pill">菜单与手牌动作就绪</text>
       </g>
 
-      <text x="580" y="398" class="tiny">LOCAL CANDIDATE FABRIC</text>
+      <text x="580" y="398" class="tiny">本地候选生成</text>
       <rect x="580" y="414" width="194" height="142" rx="18" class="inner"/>
       <circle cx="606" cy="442" r="7" fill="#52d6e7"/>
-      <text x="623" y="447" class="card-title">Rules Engine</text>
-      <text x="606" y="478" class="body">牌型、Boss、Joker</text>
-      <text x="606" y="499" class="body">Tarot / Planet / Spectral</text>
-      <text x="606" y="526" class="tiny">纯本地规则 · fail closed</text>
+      <text x="623" y="447" class="card-title">规则引擎</text>
+      <text x="606" y="478" class="body">牌型、首领盲注、小丑牌</text>
+      <text x="606" y="499" class="body">塔罗牌 / 星球牌 / 幻灵牌</text>
+      <text x="606" y="526" class="tiny">纯本地规则 · 失败即拒绝</text>
 
       <rect x="802" y="414" width="194" height="142" rx="18" class="inner"/>
       <circle cx="828" cy="442" r="7" fill="#52d6e7"/>
-      <text x="845" y="447" class="card-title">Solver</text>
+      <text x="845" y="447" class="card-title">求解器</text>
       <text x="828" y="478" class="body">出牌与整轮生存</text>
-      <text x="828" y="499" class="body">商店 NPV / 租金预算</text>
+      <text x="828" y="499" class="body">商店净现值 / 租金预算</text>
       <text x="828" y="526" class="tiny">生成有限合法候选</text>
 
       <rect x="1024" y="414" width="196" height="142" rx="18" class="inner"/>
       <circle cx="1050" cy="442" r="7" fill="#52d6e7"/>
-      <text x="1067" y="447" class="card-title">Policy Validator</text>
+      <text x="1067" y="447" class="card-title">策略校验器</text>
       <text x="1050" y="478" class="body">余额、槽位、参数</text>
       <text x="1050" y="499" class="body">战略门禁与候选一致性</text>
       <text x="1050" y="526" class="tiny">模型不能直接构造 RPC</text>
 
       <rect x="580" y="586" width="640" height="112" rx="18" fill="#0c1b2b" stroke="#5ed7e8" stroke-opacity=".30"/>
-      <text x="606" y="616" class="card-title">Balatrobot Runner · Single Writer</text>
-      <text x="606" y="644" class="body">路由候选 → 执行前 fresh-state 复验 → 串行 RPC → 结果对账</text>
-      <text x="606" y="670" class="tiny">uncertain outcome isolation · strategic checkpoint · circuit breaker · post-win menu</text>
+      <text x="606" y="616" class="card-title">Balatrobot 运行器 · 唯一写入者</text>
+      <text x="606" y="644" class="body">路由候选 → 执行前最新状态复验 → 串行 RPC → 结果对账</text>
+      <text x="606" y="670" class="tiny">不确定结果隔离 · 战略检查点 · 熔断器 · 胜后回菜单</text>
 
       <rect x="580" y="724" width="200" height="50" rx="15" class="inner"/>
-      <text x="600" y="748" class="card-title">Consumable memory</text>
-      <text x="600" y="766" class="tiny">runtime card id · blind age</text>
+      <text x="600" y="748" class="card-title">消耗牌记忆</text>
+      <text x="600" y="766" class="tiny">运行时卡牌 ID · 持有盲注数</text>
       <rect x="800" y="724" width="200" height="50" rx="15" class="inner"/>
-      <text x="820" y="748" class="card-title">Strategy checkpoint</text>
-      <text x="820" y="766" class="tiny">safe continuation only</text>
+      <text x="820" y="748" class="card-title">战略检查点</text>
+      <text x="820" y="766" class="tiny">仅允许安全续接</text>
       <rect x="1020" y="724" width="200" height="50" rx="15" class="inner"/>
-      <text x="1040" y="748" class="card-title">Run knowledge</text>
-      <text x="1040" y="766" class="tiny">collection · appeared cards</text>
+      <text x="1040" y="748" class="card-title">本局知识</text>
+      <text x="1040" y="766" class="tiny">收藏 · 已出现卡牌</text>
     </g>
 
     <!-- Model plane -->
     <g>
       <rect x="1320" y="160" width="410" height="370" rx="26" fill="url(#model)" stroke="#b794f6" stroke-opacity=".48" class="zone"/>
-      <text x="1350" y="196" class="zone-kicker" fill="#bda0fa">ADVISORY MODEL PLANE</text>
+      <text x="1350" y="196" class="zone-kicker" fill="#bda0fa">建议模型层</text>
       <text x="1350" y="226" class="zone-title">排序与战略建议 · 不可信输入</text>
 
       <rect x="1350" y="254" width="350" height="80" rx="16" class="inner"/>
-      <text x="1372" y="283" class="card-title">Routine Router</text>
+      <text x="1372" y="283" class="card-title">高频模型路由</text>
       <text x="1372" y="309" class="body">高频候选排序 · 热切换与故障回退</text>
 
       <rect x="1350" y="350" width="350" height="80" rx="16" class="inner"/>
-      <text x="1372" y="379" class="card-title">Strategic Router</text>
-      <text x="1372" y="405" class="body">商店、Boss、构筑、破坏性动作审批</text>
+      <text x="1372" y="379" class="card-title">战略模型路由</text>
+      <text x="1372" y="405" class="body">商店、首领盲注、构筑、破坏性动作审批</text>
 
       <g transform="translate(1350 450)">
         <rect width="104" height="42" rx="14" fill="#251d42" stroke="#a98bef" stroke-opacity=".35"/>
@@ -204,56 +204,56 @@
         <rect x="234" width="116" height="42" rx="14" fill="#251d42" stroke="#a98bef" stroke-opacity=".35"/>
         <text x="270" y="26" class="pill">Ollama</text>
       </g>
-      <text x="1350" y="514" class="tiny">Vision fallback is isolated behind the same validator.</text>
+      <text x="1350" y="514" class="tiny">视觉回退仍受同一校验器约束。</text>
     </g>
 
     <!-- Experience plane -->
     <g>
       <rect x="1320" y="565" width="410" height="375" rx="26" fill="url(#memory)" stroke="#f2b666" stroke-opacity=".46" class="zone"/>
-      <text x="1350" y="601" class="zone-kicker" fill="#f7bd6b">EXPERIENCE PLANE</text>
+      <text x="1350" y="601" class="zone-kicker" fill="#f7bd6b">经验层</text>
       <text x="1350" y="631" class="zone-title">版本化轨迹、奖励与语义先验</text>
 
       <rect x="1350" y="660" width="350" height="76" rx="16" class="inner"/>
       <text x="1372" y="688" class="card-title">SemanticRagStore · SQLite WAL</text>
-      <text x="1372" y="714" class="body">不可变 episode / transition · 严格续接</text>
+      <text x="1372" y="714" class="body">不可变对局 / 状态转移 · 严格续接</text>
 
       <rect x="1350" y="752" width="168" height="116" rx="16" class="inner"/>
-      <text x="1372" y="781" class="card-title">Reward v7</text>
+      <text x="1372" y="781" class="card-title">奖励 v7</text>
       <text x="1372" y="807" class="body">终局锚 + 稠密信号</text>
       <text x="1372" y="830" class="tiny">现金 / 租金 / 易腐</text>
       <text x="1372" y="850" class="tiny">离线增量重标</text>
 
       <rect x="1532" y="752" width="168" height="116" rx="16" class="inner"/>
-      <text x="1554" y="781" class="card-title">Policy v6</text>
-      <text x="1554" y="807" class="body">RAG context</text>
-      <text x="1554" y="830" class="body">Decision prior</text>
+      <text x="1554" y="781" class="card-title">策略 v6</text>
+      <text x="1554" y="807" class="body">RAG 上下文</text>
+      <text x="1554" y="830" class="body">决策先验</text>
       <text x="1554" y="850" class="tiny">只校准现有候选</text>
 
       <rect x="1350" y="884" width="350" height="34" rx="12" fill="#2d281f" stroke="#f3ba69" stroke-opacity=".25"/>
-      <text x="1372" y="906" class="tiny">Stake / rule hard isolation · one episode = one vote</text>
+      <text x="1372" y="906" class="tiny">赌注 / 规则硬隔离 · 每局一票</text>
     </g>
 
     <!-- Observability -->
     <g>
       <rect x="545" y="845" width="710" height="190" rx="26" fill="#101d2d" stroke="#80a6cb" stroke-opacity=".36" class="zone"/>
-      <text x="580" y="881" class="zone-kicker" fill="#8fb3d7">OBSERVABILITY</text>
+      <text x="580" y="881" class="zone-kicker" fill="#8fb3d7">可观测性</text>
       <text x="580" y="910" class="zone-title">事件、健康状态与直播视图</text>
       <rect x="580" y="934" width="195" height="70" rx="16" class="inner"/>
-      <text x="602" y="962" class="card-title">RunLog</text>
-      <text x="602" y="986" class="tiny">events.ndjson · screenshots</text>
+      <text x="602" y="962" class="card-title">RunLog · 运行日志</text>
+      <text x="602" y="986" class="tiny">events.ndjson · 截图</text>
       <rect x="800" y="934" width="195" height="70" rx="16" class="inner"/>
-      <text x="822" y="962" class="card-title">Dashboard · 4312</text>
-      <text x="822" y="986" class="tiny">stats · health · backend control</text>
+      <text x="822" y="962" class="card-title">仪表盘 · 4312</text>
+      <text x="822" y="986" class="tiny">统计 · 健康 · 后端控制</text>
       <rect x="1020" y="934" width="200" height="70" rx="16" class="inner"/>
-      <text x="1042" y="962" class="card-title">OBS Overlay · 4313</text>
-      <text x="1042" y="986" class="tiny">cards · strategy · theme</text>
+      <text x="1042" y="962" class="card-title">OBS 叠加层 · 4313</text>
+      <text x="1042" y="986" class="tiny">卡牌 · 策略 · 主题</text>
     </g>
 
     <!-- Architectural connections (not a process flow) -->
     <path d="M480 315 C520 315 520 315 545 315" fill="none" stroke="#52d6e7" stroke-width="3" marker-end="url(#arrowCyan)"/>
-    <text x="488" y="300" class="wire-label" fill="#79deeb">exact state</text>
+    <text x="488" y="300" class="wire-label" fill="#79deeb">精确状态</text>
     <path d="M545 650 C515 650 510 450 480 450" fill="none" stroke="#52d6e7" stroke-width="3" marker-end="url(#arrowCyan)"/>
-    <text x="487" y="576" class="wire-label" fill="#79deeb" transform="rotate(-90 487 576)">validated RPC</text>
+    <text x="487" y="576" class="wire-label" fill="#79deeb" transform="rotate(-90 487 576)">已校验 RPC</text>
 
     <path d="M1255 348 C1285 348 1289 304 1320 304" fill="none" stroke="#b794f6" stroke-width="2.5" stroke-dasharray="8 7" marker-start="url(#arrowPurple)" marker-end="url(#arrowPurple)"/>
 
@@ -261,18 +261,18 @@
     <path d="M1320 824 C1286 824 1289 746 1255 746" fill="none" stroke="#f7bd6b" stroke-width="2.5" stroke-dasharray="8 7" marker-end="url(#arrowAmber)"/>
 
     <path d="M480 775 C515 775 515 749 545 749" fill="none" stroke="#54d6ad" stroke-width="2.5" marker-end="url(#arrowCyan)"/>
-    <text x="487" y="758" class="wire-label" fill="#72ddbd">control state</text>
+    <text x="487" y="758" class="wire-label" fill="#72ddbd">控制状态</text>
 
     <path d="M900 810 L900 845" fill="none" stroke="#8fb3d7" stroke-width="2.5" marker-end="url(#arrowCyan)"/>
-    <text x="914" y="834" class="wire-label" fill="#9db8d3">events</text>
+    <text x="914" y="834" class="wire-label" fill="#9db8d3">事件</text>
 
     <!-- Legend -->
     <g transform="translate(70 1055)">
-      <circle cx="8" cy="0" r="5" fill="#52d6e7"/><text x="22" y="5" class="tiny">deterministic / exact</text>
-      <circle cx="180" cy="0" r="5" fill="#b794f6"/><text x="194" y="5" class="tiny">model advisory</text>
-      <circle cx="327" cy="0" r="5" fill="#f7bd6b"/><text x="341" y="5" class="tiny">versioned experience</text>
-      <circle cx="505" cy="0" r="5" fill="#54d6ad"/><text x="519" y="5" class="tiny">operations</text>
+      <circle cx="8" cy="0" r="5" fill="#52d6e7"/><text x="22" y="5" class="tiny">确定性 / 精确</text>
+      <circle cx="180" cy="0" r="5" fill="#b794f6"/><text x="194" y="5" class="tiny">模型建议</text>
+      <circle cx="327" cy="0" r="5" fill="#f7bd6b"/><text x="341" y="5" class="tiny">版本化经验</text>
+      <circle cx="505" cy="0" r="5" fill="#54d6ad"/><text x="519" y="5" class="tiny">运维控制</text>
     </g>
-    <text x="1730" y="1060" text-anchor="end" class="tiny">Repository truth · 2026-08-17</text>
+    <text x="1730" y="1060" text-anchor="end" class="tiny">仓库真值 · 2026-08-17</text>
   </g>
 </svg>
