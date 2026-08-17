@@ -17,31 +17,11 @@ Balatro Pilot 是一个面向 Windows Steam 版《Balatro》的自动游玩与�
 
 ## 架构
 
-```mermaid
-flowchart LR
-  game["Balatro"] --> mod["Lovely + Steamodded + BalatroBot Mod"]
-  mod --> rpc["本机 JSON-RPC 精确状态"]
-  rpc --> state["GameState 适配与状态版本"]
-  state --> rules["规则引擎与候选求解器"]
-  rules --> routine["高频路由"]
-  routine --> local["本地 Ollama"]
-  routine --> routineApi["高频出牌 API Key"]
-  rules --> checkpoint["战略检查点"]
-  checkpoint --> strategyApi["战略 API Key"]
-  local --> validate["候选 ID 与本地合法性验证"]
-  routineApi --> validate
-  strategyApi --> validate
-  validate --> writer["单写者 RPC 执行与结果对账"]
-  writer --> mod
-  writer --> events["结构化事件"]
-  events --> trajectory["不可变原始轨迹库"]
-  trajectory --> rewards["跨版本 Reward v6 离线标签"]
-  rewards --> prior["跨种子决策桶与动作先验"]
-  prior -. "有界校准现有候选" .-> rules
-  events --> dashboard["Dashboard 与 Health Check"]
-  events --> overlay["OBS 牌组与策略 Overlay"]
-  vision["可选视觉兼容回退"] --> validate
-```
+![Balatro Pilot 当前架构](docs/assets/balatro-pilot-architecture.svg)
+
+架构以“游戏真值、确定性决策内核、模型建议、版本化经验、运维观测”五个边界组织。模型只能选择本地合法候选，Runner 是唯一游戏写者，Reward v7 与 Semantic Prior 只能校准候选排序。
+
+详见 [系统架构](docs/architecture.md) 与 [Reward v7 奖励机制](docs/reward-v7.md)。
 
 模型供应商协议、密钥映射、路由构建与动态切换代码集中在 [`src/models`](src/models)：
 
@@ -199,6 +179,8 @@ OBS 推荐把游戏、牌组 Overlay 和策略 Overlay 分别作为三个源拼�
 ## 自学习数据
 
 学习数据库默认位于 `data/semantic-experience.sqlite`。这不是修改模型权重的训练，而是“记录轨迹 → 离线重算奖励 → 按抽象局面聚合 → 校准当前合法候选”的安全经验学习。
+
+当前实现为 Semantic Policy v6 / Reward v7；完整公式、终局锚点、迁移和先验消费规则见 [Reward v7 奖励机制](docs/reward-v7.md)。
 
 - 原始 transition 与奖励标签分层保存。调整奖励公式时只生成新标签，不覆盖旧 transition，因此 v1–v5 的兼容历史都能继续使用；episode 元数据可在严格确认同一局续接时更新。
 - 失败局统一提供负面证据，不会再因为局中推进奖励而被误标成成功经验；高分和后期失败仍在负面样本内部保留质量排序。
