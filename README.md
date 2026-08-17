@@ -189,6 +189,28 @@ Health Check 只检查本地进程、端口、文件和本地服务，不会为�
 
 OBS 推荐把游戏、牌组 Overlay 和策略 Overlay 分别作为三个源拼接，浏览器源保持透明背景。布局可按直播画布缩放；当前页面会自动裁切和换行。
 
+### 运行界面示例
+
+下面是训练中的真实组合画面：左侧与中央保留 Balatro 原始游戏状态，底部牌组 Overlay 汇总当前 Joker、消耗牌与效果，右侧策略 Overlay 同步展示当前动作、完整思路和本局构筑计划。策略文字会随精确状态实时更新，并不是预先录制的固定脚本。
+
+#### Boss 盲注出牌：针对 The Club 选择已验证的黑桃同花
+
+![The Club Boss 下选择黑桃同花，底部展示四张 Joker 构筑，右侧同步 AI 决策](docs/assets/screenshots/boss-club-strategy.png)
+
+The Club 会削弱所有梅花牌。系统读取 Boss 限制后，由本地求解器先枚举并验证可执行的黑桃同花，再让模型在合法候选中排序。底部同步展示 Scholar、Wrathful Joker、Abstract Joker 与 Raised Fist 的当前协同；真正发送 RPC 前，Runner 仍会复验最新状态和指纹，避免执行过期方案。
+
+#### 商店与小丑包：在生存压力与经济约束下扩充构筑
+
+![Buffoon 小丑包决策，结合现金、槽位、下一盲注和当前 Joker 评估选择](docs/assets/screenshots/shop-buffoon-strategy.png)
+
+在商店阶段，战略路由会同时考虑剩余现金、Joker 槽位、现有牌型、下一盲注与 Boss 压力。右侧说明本次购买理由和长期路线，底部牌组区用于核对购买前后的持有状态，而不是看见高价值牌就无条件购买。
+
+#### 秘术包：把塔罗选择纳入整局资源计划
+
+![Arcana 秘术包决策，右侧展示塔罗选择理由、牌组协同和后续目标](docs/assets/screenshots/arcana-build-strategy.png)
+
+塔罗牌选择会结合当前手牌、Joker 协同、主打牌型、现金储备和后续转型条件。Overlay 同时保留“当前协同、经济与商店、转型条件、出牌与弃牌、下一目标”，便于直播观察和赛后复盘；卡包选项本身也必须来自本地合法候选。
+
 ## Reward v7 奖励机制
 
 Reward v7 不会微调或更改模型权重。它把已确认生效的游戏动作保存为不可变 transition，待对局终结后离线计算奖励标签，再通过 RAG 上下文和有界 Semantic Prior 校准当前**本地合法候选**的排序。当前版本为 Semantic Policy v6 / Reward v7，默认折扣因子 `γ = 0.97`。
