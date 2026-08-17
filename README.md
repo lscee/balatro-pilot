@@ -17,7 +17,7 @@ Balatro Pilot 是一个面向 Windows Steam 版《Balatro》的自动游玩与�
 
 ## 当前实测表现
 
-> 核算于 2026-08-17，对局轨迹截至 2026-08-15。数据来自本地精确对局轨迹，仅计入已结束的 `won` / `lost` 对局；进行中与未续接的中断局已排除，控制器重启产生的同局分段按 Reward v7 归并。这是全历史实测快照，不是游戏、牌组或模型的理论上限；当前 Semantic Policy v6 尚无白注完整样本。
+> 核算于 2026-08-17，对局轨迹截至 2026-08-15。数据来自本地精确对局轨迹，仅计入已结束的 `won` / `lost` 对局；进行中与未续接的中断局已排除，控制器重启产生的同局分段按 Reward v7 归并。这是全历史实测快照，不是游戏、牌组或模型的理论上限。白注均值使用跨版本的 canonical 样本；Semantic Policy v6 本身尚未产生可单独统计的白注完成局。
 
 | 指标 | 实测值 |
 | --- | ---: |
@@ -189,13 +189,140 @@ Health Check 只检查本地进程、端口、文件和本地服务，不会为�
 
 OBS 推荐把游戏、牌组 Overlay 和策略 Overlay 分别作为三个源拼接，浏览器源保持透明背景。布局可按直播画布缩放；当前页面会自动裁切和换行。
 
+## Reward v7 奖励机制
+
+Reward v7 不会微调或更改模型权重。它把已确认生效的游戏动作保存为不可变 transition，待对局终结后离线计算奖励标签，再通过 RAG 上下文和有界 Semantic Prior 校准当前**本地合法候选**的排序。当前版本为 Semantic Policy v6 / Reward v7，默认折扣因子 `γ = 0.97`。
+
+主目标始终是确认赢下 Ante 8。Blind 推进、单手得分、现金和 Gold Sticker 变化只是稠密排序信号；它们不能把最终失败的轨迹变成正样本。
+
+### 即时奖励
+
+对一次已确认生效的 transition $s_t,a_t,s_{t+1}$，定义：
+
+- $A_t$：Ante；$R_t$：全局 Round 编号；
+- $P_t=\operatorname{clip}(score_t/target_t,0,3)$：当前 Blind 的完成进度；
+- $H_t$：本次 `play` 实际新增的筹码；
+- $M_t$：现金；$U_t$：所有 Rental Joker 每个 Blind 的总维护费；
+- $X_t$：本次 transition 可安全归因的 Perishable 过期张数。
+
+各项先相加，再裁剪到 `[-4, 6]` 并保留三位小数：
+
+$$
+r_t=\operatorname{round}_3\!\left(\operatorname{clip}\left(
+r_{progress}+r_{hand}+r_{action}+r_{cash}+r_{rental}+r_{perishable},-4,6
+\right)\right)
+$$
+
+推进奖励：
+
+$$
+r_{progress}=1.25\max(0,A_{t+1}-A_t)+0.45\max(0,R_{t+1}-R_t)
+$$
+
+若动作前处于 `SELECTING_HAND`，再加 `1.5(P_{t+1}-P_t)`；且只在这个分支中，若动作后进入 `ROUND_EVAL` 或 `SHOP`，再加 `0.8`。Ante 和 Round 只奖励正向推进，状态回退不会制造负奖励。
+
+单手得分在 $H_t>0$ 时贡献：
+
+$$
+r_{hand}=\operatorname{clip}\left(0.18\left[\log_{10}(\max(100,H_t))-2\right],0,0.9\right)
+$$
+
+这是封顶 `0.9` 的平滑小信号，不会让单次爆分压过整局成败。动作的固定成本为：
+
+| 动作 | 即时项 |
+| --- | ---: |
+| `discard` | `-0.025` |
+| `skip` | `-0.35` |
+| `reroll` | `-0.06` |
+| `buy` | 无固定奖励 |
+
+Reward v7 已移除旧版“购买即 `+0.05`”的无条件奖励。购买价值由之后的现金、Sticker、局面推进和终局结果表达。
+
+现金与 Gold Sticker 经济项：
+
+$$
+r_{cash}=\operatorname{clip}\left(0.035(M_{t+1}-M_t),-0.7,0.7\right)
+$$
+
+$$
+r_{rental}=\operatorname{clip}\left(-0.1(U_{t+1}-U_t),-0.6,0.6\right)
+$$
+
+$$
+r_{perishable}=-0.65\min(3,X_t)
+$$
+
+Gold Stake 的基础 Rental rate 为每 Blind `$3`，所以新增一张普通 Rental Joker 通常产生 `-0.3`；移除同等负债则产生对应正值。只有前后原始快照都显式保存相关字段时才计算这些项；旧轨迹缺字段时贡献 `0`，不会伪造变化。
+
+### 高分 Bonus 与终局锚点
+
+令 $S$ 为整局实际观测到的最高**单手得分**：
+
+$$
+B(S)=1.25\max(0,\log_{10}S-3)
++0.75[S\ge10^4]+1.5[S\ge10^5]+3.5[S\ge10^6]
+$$
+
+$S=0$ 时 $B(S)=0$。在 `10,000`、`100,000`、`1,000,000` 三个里程碑上，Bonus 分别为 `2.0`、`4.75`、`9.5`。
+
+胜局终局值：
+
+$$
+T_{win}=10+0.3\min(12,Ante)+B(S)
+$$
+
+Ante 8 普通胜局的基础终局值是 `12.4`，再叠加高分 Bonus。
+
+败局中，定义未花现金惩罚 $Q=\min(3,\max(0,money)/20)$ 和提前崩溃惩罚 $E=0.75\max(0,5-Ante)$：
+
+$$
+T_{loss}=\min\left(-0.5,-10+0.3\min(12,Ante)+\min(8,B(S))-Q-E\right)
+$$
+
+因此败局终局值永远不高于 `-0.5`。更深的 Ante 和更高的单手分只能让失败“没那么差”，不能把败局洗成正样本；败局的高分贡献封顶 `8`。
+
+胜负不依赖裸 `GAME_OVER.won` 字段。默认胜后回菜单时，只有原生 `ROUND_EVAL && won=true` 胜利 checkpoint 能首次确认胜局；迁移旧数据时，无法证明的历史假胜只在新 Reward 标签中更正，不篡改原 episode。
+
+### 整局回报传播
+
+Reward v7 将稠密信号和不可消失的终局锚点分开传播。从后向前计算局部未来值：
+
+$$
+L_t=\operatorname{clip}(0.12r_t+0.97L_{t+1},-0.9,0.9)
+$$
+
+对含 $N>1$ 个 transition 的轨迹，第 $i$ 个动作的终局权重为：
+
+$$
+w_i=0.5+0.5\frac{i}{N-1}
+$$
+
+单 transition 时 $w=1$。最终回报为：
+
+$$
+G_i=T\cdot w_i+dL_i,\qquad
+d=\begin{cases}0.18,& loss\\1,& win\end{cases}
+$$
+
+败局回报强制 `G_i ≤ -0.05`，胜局回报强制 `G_i ≥ +0.05`，最后裁剪到 `[-24, 30]` 并保留三位小数。最早动作仍承担 50% 的终局成败，最后动作承担 100%，因此长局不会因为 `γⁿ` 太小而忘记最终结果。
+
+### 奖励如何影响下一次决策
+
+- RAG 只读取已完成、兼容且拥有 Reward v7 标签的历史；要求 screen 相同，并对已知 Stake / 累计规则签名做硬隔离。
+- Semantic Prior 在抽象 decision/action bucket 内聚合，同一 canonical episode 每个 bucket 最多一票。历史回报先映射为 $x=\tanh(G/4)$，败局再强制 $x\le0$。
+- 加权有效样本数为 $n_{eff}=(\sum w)^2/\sum w^2$，置信半径为 $1.28\sqrt{(\sigma_w^2+0.25)/n_{eff}}$。默认至少需要 3 个独立 episode、$n_{eff}\ge2.25$，且整个置信区间必须严格位于零的同一侧，才会生成非零 signal。
+- 令 $N$ 为该候选 action bucket 的独立 canonical episode 数，经验混合权重为 $\min(0.3,0.1\log_2(N+1))$，最多 `30%`。它只能重排 solver 已生成的候选；不能创建动作、修改 RPC 参数、跳过 validator，或绕过商店/Boss 的战略审批。
+- 精确状态自动重放默认关闭；历史证据当前是建议和校准信号，不会直接代打。
+
+完整公式、迁移兼容性和 Prior 置信区间的计算细节见 [Reward v7 奖励机制](docs/reward-v7.md)。
+
 ## 自学习数据
 
 学习数据库默认位于 `data/semantic-experience.sqlite`。这不是修改模型权重的训练，而是“记录轨迹 → 离线重算奖励 → 按抽象局面聚合 → 校准当前合法候选”的安全经验学习。
 
-当前实现为 Semantic Policy v6 / Reward v7；完整公式、终局锚点、迁移和先验消费规则见 [Reward v7 奖励机制](docs/reward-v7.md)。
+当前实现为 Semantic Policy v6 / Reward v7；上一节给出 README 内可独立阅读的公式与安全边界，更完整的维护说明见 [Reward v7 奖励机制](docs/reward-v7.md)。
 
-- 原始 transition 与奖励标签分层保存。调整奖励公式时只生成新标签，不覆盖旧 transition，因此 v1–v5 的兼容历史都能继续使用；episode 元数据可在严格确认同一局续接时更新。
+- 原始 transition 与奖励标签分层保存。调整奖励公式时只生成新标签，不覆盖旧 transition，因此 v1–v5 的兼容历史都能继续使用。运行时若唯一、严格匹配到同一局，会复用该 episode 并更新对局元数据，但既有 transition 仍保持追加式、不覆写；对已经形成的历史分裂段，Reward v7 只通过 `credit_episode_id` 关联，原 episode 与 transition 均不改写。
 - 失败局统一提供负面证据，不会再因为局中推进奖励而被误标成成功经验；高分和后期失败仍在负面样本内部保留质量排序。
 - 决策按阶段、Boss、经济压力、构筑角色、手牌形状和语义动作聚合，不包含随机 seed 或精确牌序。每局最多一票，至少 3 个独立 episode 且置信区间足够明确时才影响排序。
 - 经验混合权重默认最多 30%，只能重排本地已经生成的候选；它不能发明动作、绕过本地 validator，也不能替商店购买/出售/重掷跳过战略模型审批。
@@ -244,55 +371,6 @@ npm run package:mod
 ZIP 顶层为 `balatrobot/`，包含上游 MIT 许可证和版本来源说明，不包含存档、日志、API Key、Lovely 或 Steamodded。
 
 上游 BalatroBot `v1.5.2` 固定提交中的 `balatrobot.json` 仍标记 `1.5.1`，这是上游元数据滞后；本项目以提交号、安装标记和完整运行时指纹核验实际版本。
-
-## 常见问题
-
-### BalatroBot 指纹不匹配
-
-完全退出游戏，重新运行 `install-balatrobot.ps1`。不要同时安装两套 Lovely、Steamodded 或 BalatroBot。
-
-### API 401/403
-
-确认路由 Provider 与对应 Key 属于同一平台，重新运行 `store-model-keys.ps1`。不要把 Kimi Code Key 填到 Moonshot 开放平台地址，反之亦然。
-
-### API 很慢但仍在生成
-
-战略路由默认允许最长 300 秒。控制器不会在 40 秒强制中断，也不会因为等待而盲目重放动作。高频路由应选择低延迟模型或本地 Ollama。
-
-### 本地模型不可用或显存不足
-
-在 Dashboard 切换到云端高频后端；本地模型会卸载并释放显存。直播使用 CPU 编码可减少 GPU 编码占用，但模型显存仍需单独预留。
-
-### Dashboard Health 一直检查
-
-先访问 `/api/health` 和 `/api/components`。新版探针使用轻量端口扫描、请求超时、single-flight 和上次成功快照，不会因为一次 PowerShell 探针超时就误报全部离线。旧标签页可按 Ctrl+F5。
-
-### 游戏或控制器停止
-
-检查：
-
-- `runs/*/events.ndjson`
-- `runs/web-services/*.stderr.log`
-- `%APPDATA%\Balatro\Mods\lovely\log\`
-- `%LOCALAPPDATA%\BalatroPilot\`
-
-不要在未定位根因时循环重启。
-
-## 测试与发布
-
-```powershell
-npm test
-npm run check
-```
-
-提交前确认：
-
-```powershell
-git status --short
-git diff --cached
-```
-
-仓库必须只包含源码、文档、固定补丁和测试。不得强制添加 `config.json`、`runs/`、`data/`、`.env` 或 `*.dpapi`。
 
 ## 许可证
 
